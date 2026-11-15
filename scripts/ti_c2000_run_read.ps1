@@ -227,7 +227,12 @@ if ($spec.mode -eq 'ReadOnly') {
         $fwExpect = if ($null -ne $ExpectFwId) { [string]$ExpectFwId } else { [string]$s.state.fwId }
 
         # 3. is it running right now
-        $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates @($RateVar, 'gMsTick', 'usMainLoop', 'gRunMs')
+        # Filter empties: with no -RateVar the first element is '', and that produced a
+        # request for "VARS " with no name, which the service answers with an E line.
+        # The liveness verdict then read as "no readable counter" instead of naming the
+        # real result (2026-11-15).
+        $aliveCands = @(@($RateVar) + @('gMsTick', 'usMainLoop', 'gRunMs') | Where-Object { $_ })
+        $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates $aliveCands
 
         Info2 'PREFLIGHT: 读之前必须确认的事'
         Info2 ('  LOCATION : {0}' -f $(if ($loc.code -eq 'LOCATION_UNKNOWN') { 'UNKNOWN - ' + $loc.text } else { '{0} (PC = {1}, region {2})' -f $loc.kind, $loc.pc, $loc.region }))

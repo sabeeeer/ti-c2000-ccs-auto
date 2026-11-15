@@ -28,16 +28,20 @@ function dssLinkIsUp(session) {
     try { session.target.isHalted(); return true; } catch (e) { return false; }
 }
 
-// Error -1138 is the core refusing to enter debug mode; TI's own advice is to power-cycle
-// the board. Retrying pushes the probe into -1041 then -150 and can leave debug state it
-// cannot remove, so the next session starts worse. The exception message does NOT contain
-// "-1138" (GEL prints that to stdout); it says "Target reset failed. Error: -1". Match
-// both, or this never fires.
+// Error -1138 (the core refusing to enter debug mode) is the only failure that must not be
+// retried: each attempt pushes the probe into -1041 then -150 and can leave debug state it
+// cannot remove, so the next session starts worse.
+//
+// What this must NOT match: "Target reset failed. Error: -1". That is the ordinary,
+// recoverable shape of a refused reset - the GEL's real reason (-1138 among them) goes to
+// stdout and never reaches the Java exception, so the exception cannot tell them apart.
+// An earlier version matched it anyway, which turned every recoverable reset failure into
+// a fatal stop: the halt fallback below was skipped and 16 loads that had succeeded earlier
+// on 2026-11-15 became zero. Judge -1138 in the parent process, which reads the whole log.
 function dssBoardRefusedDebug(msg) {
     var s = "" + msg;
     return (s.indexOf("-1138") >= 0)
-        || (s.indexOf("Device refused to allow debug mode") >= 0)
-        || (s.indexOf("Target reset failed") >= 0);
+        || (s.indexOf("Device refused to allow debug mode") >= 0);
 }
 
 // 5 attempts, growing wait: -150 means the previous DSP process may still be releasing the
@@ -63,10 +67,13 @@ function dssResetVerified(session, log) {
     try { session.target.reset(); log("DSS: reset"); return true; }
     catch (e1) {
         log("DSS: reset failed (" + e1 + ")");
-        if (dssBoardRefusedDebug(e1)) { log("DSS: board refused debug mode - not retrying"); return false; }
+        // Always try halt first. A refused reset is normally recoverable, and halt is what
+        // the loader needs anyway - this is the path that loaded successfully sixteen times
+        // on 2026-11-15 while an over-strict -1138 check later turned it into a hard stop.
+        // Only when the link itself is dead does this fall through to reconnecting.
         if (dssLinkIsUp(session)) {
-            try { session.target.halt(); log("DSS: halted (link alive, reset skipped)"); return true; }
-            catch (e2) { log("DSS: halt skipped: " + e2); }
+            try { session.target.halt(); log("DSS: halted (reset refused, link alive) - continuing"); return true; }
+            catch (e2) { log("DSS: halt also failed: " + e2); }
         }
         log("DSS: link lost after connect, reconnecting");
         try { session.target.disconnect(); } catch (e0) { }

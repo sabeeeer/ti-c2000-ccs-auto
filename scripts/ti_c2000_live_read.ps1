@@ -55,6 +55,32 @@ $ErrorActionPreference = 'Continue'
 function Out2($m) { Write-Output $m }
 function Info2($m) { if (-not $Quiet) { Write-Output $m } }
 
+# Compare a firmware flag with the value the caller expects. In C "true" and 1 are the same
+# statement and a flag may surface either way, so normalise both spellings instead of
+# string-comparing them. An empty expectation means "do not check equality", which is what
+# -FrozenValue "" asks for.
+#
+# This must be defined before the frozen-window check that calls it: an earlier edit added
+# the call but not the function, so -FrozenBufferReady failed with "Test-FlagEquals is not
+# recognized" on the board (2026-11-15).
+function Test-FlagEquals {
+    param([string]$Actual, [string]$Expected)
+    $a = ([string]$Actual).Trim()
+    $e = ([string]$Expected).Trim()
+    if (-not $e) { return $true }
+    if ($a -ieq $e) { return $true }
+    $truthy = @('true', '1')
+    $falsy = @('false', '0')
+    $al = $a.ToLower()
+    $el = $e.ToLower()
+    $an = if ($truthy -contains $al) { 'T' } elseif ($falsy -contains $al) { 'F' } else { $al }
+    $en = if ($truthy -contains $el) { 'T' } elseif ($falsy -contains $el) { 'F' } else { $el }
+    if ($an -eq $en) { return $true }
+    $na = 0.0; $ne = 0.0
+    if ([double]::TryParse($a, [ref]$na) -and [double]::TryParse($e, [ref]$ne)) { return ($na -eq $ne) }
+    return $false
+}
+
 if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) {
     Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
 }
@@ -144,7 +170,11 @@ function Send-Request([string]$Text, [int]$TimeoutMs) {
     return $null
 }
 function ConvertFrom-Response([string]$raw) {
-    $o = [ordered]@{ halted = $false; end = $false; vars = [ordered]@{}; arr = [ordered]@{}; errors = @() }
+    # arr must be a plain hashtable, NOT [ordered]@{}: OrderedDictionary exposes both an
+    # [object key] and an [int index] overload, so `$arr[[int]$n] = v` silently takes the
+    # positional one and throws "index out of range" for every sample. That dropped all
+    # 400 values and surfaced as COUNT_MISMATCH "got 0 values, expected 400" (2026-11-15).
+    $o = [ordered]@{ halted = $false; end = $false; vars = [ordered]@{}; arr = @{}; errors = @() }
     foreach ($line in ($raw -split "`r?`n")) {
         if ($line -match '^HALTED ([01])\s*$') { $o.halted = ($Matches[1] -eq '1') }
         elseif ($line -match '^V (\S+) (.*)$') { $o.vars[$Matches[1]] = $Matches[2].Trim() }

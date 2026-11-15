@@ -65,6 +65,11 @@ while ($true) {
             }
             $lines += 'END'
             [IO.File]::WriteAllText($res, ($lines -join "`n"))
+            # The real service consumes the command after answering. Without this the stub
+            # keeps answering the SAME cmd.txt every 20 ms, so once the client clears res.txt
+            # for its next request it immediately reads the PREVIOUS answer - and the preflight
+            # check sees a stale value (2026-11-15: gFwId read as empty for that reason).
+            Remove-Item -LiteralPath $cmd -Force -ErrorAction SilentlyContinue
         }
     }
     Start-Sleep -Milliseconds 20
@@ -78,7 +83,10 @@ while ($true) {
         if (Test-Path $ready) { Remove-Item $ready -Force -ErrorAction SilentlyContinue }
         $waited = 0
         while (-not (Test-Path $ready) -and $waited -lt 8000) { Start-Sleep -Milliseconds 100; $waited += 100 }
-        Start-Sleep -Milliseconds 250
+        # The stub writes its marker from inside the serving loop, but the first request
+        # still needs a moment to land on a polling cycle; 250 ms was occasionally short
+        # and run_read then reported TARGET_NOT_CONNECTED before PREFLIGHT even printed.
+        Start-Sleep -Milliseconds 600
         try {
             $argv = @('-NoProfile', '-File', $read, '-ProjectPath', $proj, '-Variables', 'gMsTick',
                 '-Mode', 'ReadOnly', '-Rounds', '2', '-IntervalMs', '200', '-NoProbeCheck')

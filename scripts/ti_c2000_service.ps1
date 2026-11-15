@@ -256,6 +256,29 @@ if (-not $ConfirmLoad) {
     exit 4
 }
 
+# ---- stale-artefact guard ----------------------------------------------------
+# build.ps1 keeps its product in %TEMP% unless -Stage is given, while -Start loads
+# <project>\Debug\*.out. So "-Start -ConfirmLoad" without -Build can load a build that
+# predates the current sources, and the failure looks like broken firmware: measured
+# 2026-11-15, a 20:23 .out was loaded at 21:48 while the sources had been edited at
+# 21:42, and every read of the new DMA symbols failed with "identifier not found".
+# Warn loudly instead of letting a stale image look like a code bug.
+if (-not $Build) {
+    $staged = @(Get-ChildItem -LiteralPath (Join-Path $ProjectPath 'Debug') -Filter '*.out' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+    if ($staged) {
+        $newestSrc = @(Get-ChildItem -LiteralPath $ProjectPath -Recurse -File -Include *.c, *.h, *.cmd -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\ti\\|\\Debug\\|\\Tools\\' } |
+            Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+        if ($newestSrc -and ($newestSrc.LastWriteTime -gt $staged.LastWriteTime.AddSeconds(2))) {
+            Out2 ('WARN    : {0} is OLDER than {1} - this download would put an outdated image on the target' -f $staged.Name, $newestSrc.Name)
+            Out2 ('WARN    : .out {0}   vs   source {1}' -f $staged.LastWriteTime.ToString('MM-dd HH:mm:ss'), $newestSrc.LastWriteTime.ToString('MM-dd HH:mm:ss'))
+            Out2 'WARN    : reads of symbols added since that build will fail with "identifier not found"'
+            Out2 'HINT    : add -Build (compiles and stages), or run ti_c2000_build.ps1 -Stage first'
+        }
+    }
+}
+
 $projName = Split-Path -Leaf $ProjectPath
 $projectFile = Join-Path $ProjectPath '.project'
 if (Test-Path -LiteralPath $projectFile) {

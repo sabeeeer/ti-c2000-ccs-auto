@@ -52,7 +52,10 @@ param(
     [switch]$Stage,
     [switch]$NoStage,
     [switch]$IgnoreExclusions,
-    [switch]$KeepLaunches
+    [switch]$KeepLaunches,
+    # Linker entry symbol. Empty = use the linker default (_c_int00), which is what every
+    # load that actually ran on the board was built with. See the note in the link section.
+    [string]$EntryPoint   = ""
 )
 
 $ErrorActionPreference = 'Continue'   # native compiler stderr must not abort the loop
@@ -626,13 +629,22 @@ if ($compileErrors.Count -eq 0) {
     $lflags = @("-v$siliconVer", '-g', '--display_error_number', '--diag_warning=225', '--diag_wrap=off', '-z',
                "-m$OutputDir\$projName.map", "--stack_size=$stackSz", '--warn_sections',
                "-i$cgRoot\lib", "-i$cgRoot\include", '--reread_libs', $romModel)
-    # ENTRY_POINT: CCS passes -e from .cproject. Without it the linker falls back to
-    # _c_int00, so the skill's .out had a different entry point than the CCS build of the
-    # same sources (measured 2026-11-15: .cproject said code_start, ofd2000 reported
-    # 0x000088E2 inside .text). Debug loads masked it, because the debugger sets the PC
-    # itself, but a Flash boot vector does not.
-    $entryPoint = Get-OptionValue 'linkerID.ENTRY_POINT'
-    if ($entryPoint) { $lflags += @('-e', $entryPoint) }
+    # ENTRY_POINT from .cproject: NOT passed unless the caller asks for it.
+    #
+    # History that matters here: adding `-e code_start` (the value .cproject declares) was
+    # the ONLY build change made after the last successful download on 2026-11-15
+    # (LOAD #27 at 20:20:08, built with the linker default _c_int00), and after it every
+    # single -Start failed. Sixteen loads had succeeded with _c_int00 that same day.
+    # So mirroring that one option is not safe for this project: the user's CCS
+    # configuration may apply it to a different build configuration than the RAM one this
+    # script builds. -EntryPoint code_start reproduces the old behaviour if you verify it.
+    $declaredEntry = Get-OptionValue 'linkerID.ENTRY_POINT'
+    if ($EntryPoint) {
+        $lflags += @('-e', $EntryPoint)
+        Info ('LINK    : entry point overridden to {0} (declared in .cproject: {1})' -f $EntryPoint, $(if ($declaredEntry) { $declaredEntry } else { 'none' }))
+    } elseif ($declaredEntry) {
+        Info ('LINK    : .cproject declares ENTRY_POINT={0}; NOT applied (use -EntryPoint {0} to force it)' -f $declaredEntry)
+    }
     # XML_LINK_INFO is a build artefact CCS always produces; harmless, but keeping it means
     # a project script that reads it still works.
     $xmlInfo = Get-OptionValue 'linkerID.XML_LINK_INFO'
