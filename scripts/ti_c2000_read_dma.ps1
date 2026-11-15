@@ -198,7 +198,7 @@ if ($spec.mode -eq 'ReadOnly') {
     try {
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
-        $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -AllowUnverified:$AllowUnverified
+        $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -OutFile $OutFile -CcsRoot $CcsRoot -AllowUnverified:$AllowUnverified
         Info2 ('JUDGE   : ' + $ram.text)
         if (-not $ram.ok) {
             if ($ram.code -eq 'TARGET_NOT_CONNECTED') {

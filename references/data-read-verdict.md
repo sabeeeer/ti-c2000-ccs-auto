@@ -40,7 +40,7 @@ JTAG 不参与实时采样，只搬历史数据。**不做固件侧缓冲就直�
 | 启动窗口 | 仅在本次单会话刚加载并运行后，按实际预热时间检查计数器；`run_read`/`read_dma` 都适用。计数器已在递增但首值超过窗口 → 镜像不是刚加载的那一份 | `STALE_PROGRAM` |
 | 速率（可选，当前人工核对） | 若该计数器确为毫秒计时，按主机时间间隔估算约 1000 /s（容差由工程确定）；当前通用脚本只查递增，**不自动核对速率** | `HEARTBEAT_RATE` |
 | 至少一个心跳可用 | 指定的应用计数器必须可读；不能从任意递增列自动推断它是心跳 | `NO_HEARTBEAT` |
-| 目标在应答且在 RAM（前置） | 探针被枚举、会话进程活着、`sha256` 一致都成立**仍不够**：`.out` 符号表求值在 JTAG 断开时照样返回地址（实测 `V main 35469`）。**读 `PC`**：读不到 = 链路断；`PC` < 0x080000 = 正在执行 RAM 代码；`PC` ≥ 0x080000 = 在跑 Flash | `TARGET_NOT_CONNECTED`（环境故障，无开关可绕过）/ `NOT_RAM_IMAGE` |
+| 目标在应答且执行本镜像（前置） | 探针被枚举、会话进程活着、`sha256` 一致都成立**仍不够**：`.out` 符号表求值在 JTAG 断开时照样返回地址（实测 `V main 35469`）。**读 `PC`，判断它是否落在本镜像自己的代码段内**（段表取自 `.map` 或 `ofd2000`，不硬编码 Flash 基址）：读不到 = 链路断；落在段内 = 正在执行这份镜像；落在段外 = 在跑 Flash 或别的镜像。无布局可用时退化为设备地址表并明示 `fallback` | `TARGET_NOT_CONNECTED`（环境故障，无开关可绕过）/ `NOT_RAM_IMAGE` |
 | 单行数据 | 一行无法建立"推进过"的证据；除显式 `-AllowNoHeartbeat` 外一律失败 | `NO_LIVENESS_INTERVAL` |
 
 以上四个分类（`HEARTBEAT_FAIL` / `STALE_PROGRAM` / `NO_HEARTBEAT` / `NO_LIVENESS_INTERVAL`）以及范围判据的 `VALUE_OUT_OF_RANGE`，都由 `ti_c2000_check_read.ps1` 实际输出 `FAILURE:` 行；脚本整体失败时另给一条最终 `RESULT: FAIL`，退出码 1。

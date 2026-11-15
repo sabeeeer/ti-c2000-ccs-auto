@@ -40,6 +40,7 @@ REASON: ... Could not read 0x0000AC48@Data: target is not connected
 - 修复/绕过：`-Stop` 然后 `-Start -ConfirmLoad`（换一个 LOAD 号）。旧会话不能自愈。
 - 判据改动（2026-11-15）：第 ④ 道证明改为**直接读 `PC`**（寄存器，必须连接才应答），一次读取同时给出"链路是否活着"和"是否在 RAM 执行"：`PC` 读不到 → `TARGET_NOT_CONNECTED`（exit 4，**无开关**，`-AllowUnverified` 的语义只是"镜像可能是别的版本"）；`PC` ≥ 0x080000 → `NOT_RAM_IMAGE`。原来的 `main` 符号判据降级为交叉核对并打印在括号里，**因为它断线也算成功**。
 - `service -Status` 现在默认枚举探针（`-NoProbeCheck` 可跳过），避免"RUNNING 却是死的"。
+- 同日把第 ④ 道判据通用化：不再写死 `PC < 0x080000`，改为**用镜像自己的段表**判断 PC 是否落在本镜像的代码段内（段表来自 `<out>.map` 或 `ofd2000 --section_info`），换器件、改 boot 配置、改链接脚本都跟着镜像走；两者都拿不到时退化为设备地址表并**在输出里明示 fallback**。实测输出：`executing this image: PC = 0x00008A9A inside .text.2 (0x00008800..0x00008AC1, layout from ofd2000)`。
 
 ## 回归方式
 

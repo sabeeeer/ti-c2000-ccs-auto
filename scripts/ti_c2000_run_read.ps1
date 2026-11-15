@@ -186,7 +186,7 @@ if ($spec.mode -eq 'ReadOnly') {
         # cmd.txt/res.txt pair: an enumerated probe plus a live pid does not prove the
         # target answers, and symbol evaluation would succeed even with the link down.
         # No switch bypasses this one - it is an environment fault, not an unverified image.
-        $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -AllowUnverified:$AllowUnverified
+        $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -OutFile $OutFile -CcsRoot $CcsRoot -AllowUnverified:$AllowUnverified
         Info2 ('JUDGE   : ' + $ram.text)
         if (-not $ram.ok) {
             if ($ram.code -eq 'TARGET_NOT_CONNECTED') {

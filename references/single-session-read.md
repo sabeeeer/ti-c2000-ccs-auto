@@ -19,7 +19,7 @@
 |---|---|---|
 | **单步运行（默认运行模式）** | `ti_c2000_service.ps1 -Start [-Build] -ConfirmLoad` | 探针在线；`-Build` 只在启动时编译一次；**缺 `-ConfirmLoad` 直接 exit 4，不下载**；`-Status` / `-Stop` 管会话；`state.json` 记 `runMode=SingleStep` |
 | **连续运行（显式运行模式）** | `ti_c2000_iterate.ps1 -UserApproved -Expect ...` | 用户明确要求；每轮停会话 → 构建下载（`-RunMode Iterate`）→ ReadOnly 读 → 判据；最多 `-MaxLoads` 次；无 `-UserApproved` 即 `ITERATE_NOT_APPROVED` exit 4 |
-| **低速读 · `-Mode ReadOnly`（默认）** | `ti_c2000_run_read.ps1` | 不需要 DMA；默认 0.5 s × 10 轮；**零下载**，缺会话直接 `NO_SESSION` exit 4；读之前过四道证明：探针在线（`-NoProbeCheck` 可跳）+ 会话存活 + sha256 一致 + `PC` 可读且 < 0x080000（一次寄存器读同时判"在线"与"在 RAM"） |
+| **低速读 · `-Mode ReadOnly`（默认）** | `ti_c2000_run_read.ps1` | 不需要 DMA；默认 0.5 s × 10 轮；**零下载**，缺会话直接 `NO_SESSION` exit 4；读之前过四道证明：探针在线（`-NoProbeCheck` 可跳）+ 会话存活 + sha256 一致 + `PC` 落在本镜像代码段内（段表来自 `.map`/`ofd2000`，不硬编码地址；无布局时退化为设备地址表并明示） |
 | **低速读 · `-Mode LoadRead`** | `ti_c2000_run_read.ps1 -Mode LoadRead -ConfirmLoad` | 停常驻会话 → 下载一次 → 读；`-MaxLoads/-Expect` 可循环；`-Standalone` 是它的别名 |
 | **高速 DMA 读** | `ti_c2000_read_dma.ps1 -FrozenBufferReady` | 固件已配 ADC + DMA（+ ping-pong）并置冻结标志/序号；附着同一会话，两种 `-Mode` 与低速读一致 |
 | **会话协议客户端** | `ti_c2000_live_read.ps1` | 由上面两个入口内部调用，不直接使用；只读，从不下载 |
@@ -39,7 +39,7 @@
 | `ReadOnly` 但 Windows 没枚举到探针 | `NO_PROBE` exit 3 |
 | `ReadOnly` 时没有存活会话 | `NO_SESSION` exit 4 |
 | `ReadOnly` 但目标不应答（`PC` 读不到，JTAG 断了） | `TARGET_NOT_CONNECTED` exit 4（无开关可绕过） |
-| `PC` ≥ 0x080000（应答了，但在跑 Flash） | `NOT_RAM_IMAGE` exit 4 |
+| `PC` 落在本镜像代码段之外（在跑 Flash 或别的镜像） | `NOT_RAM_IMAGE` exit 4 |
 | 会话存在但 `sha256(out)` 与 state 不符 | `STALE_SERVICE` exit 2 |
 | 入口符号 `main`（裸符号名）/ `_c_int00` ≥ 0x080000（跑的是 Flash 镜像） | `NOT_RAM_IMAGE` exit 4 |
 | 入口符号读不到（无法证明 RAM） | `RAM_UNVERIFIED` exit 4（`-AllowUnverified` 才放行，并写日志） |

@@ -427,13 +427,122 @@ function Assert-ProbeOnline {
     exit 2
 }
 
+<#
+Get-ImageCodeRanges -- where does THIS .out put its code?
+
+The obvious criterion is "PC < 0x080000", but that hard-codes one family's memory map:
+it breaks for a part whose Flash starts elsewhere (28335 keeps its Flash at 0x300000), for
+a build configured to boot from Flash, and for any future device. The image already knows
+its own layout, so ask the image:
+
+    * prefer <out>.map next to the .out (plain text, instant)
+    * otherwise ask ofd2000 --section_info from the compiler -CcsRoot points at
+    * if neither works return $null and let the caller fall back to the address test
+
+Only page-0 (code) sections that are actually allocated are kept. The .debug_* sections
+must be dropped explicitly: ofd2000 lists them at 0x00000000 with alloc=N, so a naive
+range test matches a live PC of 0x86DB into .debug_info - measured 2026-11-15.
+
+Returns @{ entry; ranges = @(@{name;start;end}); source = 'map'|'ofd2000' } or $null.
+#>
+$script:SectionMapCache = @{}
+
+function Get-ImageCodeRanges {
+    param(
+        [Parameter(Mandatory)][string]$OutFile,
+        [string]$CcsRoot = ''
+    )
+    if (-not (Test-Path -LiteralPath $OutFile)) { return $null }
+    if ($script:SectionMapCache.ContainsKey($OutFile)) { return $script:SectionMapCache[$OutFile] }
+
+    $ranges = @()
+    $entry = $null
+    $source = ''
+
+    $mapFile = [IO.Path]::ChangeExtension($OutFile, '.map')
+    if (Test-Path -LiteralPath $mapFile) {
+        $inAlloc = $false
+        foreach ($line in [IO.File]::ReadAllLines($mapFile)) {
+            if ($line -match 'SECTION ALLOCATION MAP') { $inAlloc = $true; continue }
+            if (-not $inAlloc) { continue }
+            $m = [regex]::Match($line, '^\s*(\S+)\s+(\d)\s+([0-9a-fA-F]{8})\s+([0-9a-fA-F]{8})')
+            if (-not $m.Success) { continue }
+            $name = $m.Groups[1].Value
+            if ($name -match '^\$|^\.debug' -or $m.Groups[2].Value -ne '0') { continue }
+            $start = [Convert]::ToInt64($m.Groups[3].Value, 16)
+            $size = [Convert]::ToInt64($m.Groups[4].Value, 16)
+            if ($size -le 0) { continue }
+            $ranges += [pscustomobject]@{ name = $name; start = $start; end = $start + $size }
+        }
+        if ($ranges.Count -gt 0) { $source = 'map' }
+    }
+
+    if ($ranges.Count -eq 0 -and $CcsRoot) {
+        $ofd = $null
+        $croot = Join-Path $CcsRoot 'tools\compiler'
+        if (Test-Path $croot) {
+            $ofd = @(Get-ChildItem $croot -Directory -Filter 'ti-cgt-c2000*' -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'bin\ofd2000.exe' } |
+                Where-Object { Test-Path $_ }) | Select-Object -First 1
+        }
+        if ($ofd) {
+            $out = @(& $ofd $OutFile --section_info 2>&1) | ForEach-Object { [string]$_ }
+            foreach ($line in $out) {
+                if ($line -match 'Entry Point:\s+(0x[0-9a-fA-F]+)') { $entry = [Convert]::ToInt64($Matches[1].Substring(2), 16) }
+                $m = [regex]::Match($line, '^\s*(\d+)\s+(\S+)\s+(\d+)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+\d+\s+([YN])\s*$')
+                if (-not $m.Success) { continue }
+                $name = $m.Groups[2].Value
+                if ($name -match '^\$|^\.debug') { continue }
+                if ([int]$m.Groups[3].Value -ne 0) { continue }
+                if ($m.Groups[7].Value -ne 'Y') { continue }
+                $start = [Convert]::ToInt64($m.Groups[5].Value.Substring(2), 16)
+                $size = [Convert]::ToInt64($m.Groups[6].Value.Substring(2), 16)
+                if ($size -le 0) { continue }
+                $ranges += [pscustomobject]@{ name = $name; start = $start; end = $start + $size }
+            }
+            if ($ranges.Count -gt 0) { $source = 'ofd2000' }
+        }
+    }
+
+    if ($ranges.Count -eq 0) { $script:SectionMapCache[$OutFile] = $null; return $null }
+    $result = [ordered]@{ entry = $entry; ranges = @($ranges | Sort-Object start); source = $source }
+    $script:SectionMapCache[$OutFile] = $result
+    return $result
+}
+
+<#
+Test-RamImageEvidence -- proof 4: is the target executing THIS image right now?
+
+One register read answers two questions that used to be asked separately:
+
+    PC unreadable  -> TARGET_NOT_CONNECTED  (environment fault, no switch)
+    PC inside the image's own code sections -> executing this image   (pass)
+    PC outside them -> something else is running (Flash, another build) -> NOT_RAM_IMAGE
+
+"Inside the image's code sections" comes from Get-ImageCodeRanges, so the check follows
+the linker layout instead of a hard-coded Flash base. When no layout can be read it falls
+back to "PC below the C28x Flash base" and says so, so the weaker answer is never silent.
+
+The entry symbol (bare `main`, never `&main` which fails on C28x) is still read in the same
+round trip and printed as a cross-check, but it does NOT decide: symbol lookup is answered
+from the .out and succeeds even with the JTAG link down (V main 35469 measured while every
+byte read failed with "target is not connected").
+
+-AllowUnverified skips the image verdict only, never the connection verdict.
+#>
 function Test-RamImageEvidence {
+
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
+        # the image whose layout decides "is the PC inside our code"; omit and the check
+        # falls back to the device-table address test
+        [string]$OutFile = '',
+        [string]$CcsRoot = '',
         [switch]$AllowUnverified
     )
 
-    $r = [ordered]@{ ok = $false; verified = $false; pc = ''; symbol = ''; address = ''; text = ''; code = '' }
+    $r = [ordered]@{ ok = $false; verified = $false; pc = ''; symbol = ''; address = ''; section = ''; text = ''; code = '' }
 
     # one round trip: the register (needs a live link) and the symbol (does not)
     $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC', 'main', '_main', '_c_int00')
@@ -478,14 +587,33 @@ function Test-RamImageEvidence {
     if ($symbolName) { $r.symbol = $symbolName; $r.address = ('0x{0:X8}' -f $symbolAddr) }
     $symText = if ($symbolName) { (' (entry {0} = {1})' -f $symbolName, $r.address) } else { '' }
 
-    if ($pcValue -lt $script:C28xFlashBase) {
-        $r.ok = $true
-        $r.text = ('running from RAM: PC = {0} < 0x080000{1}' -f $r.pc, $symText)
+    # which section is the core actually in?
+    $map = $null
+    if ($OutFile) { $map = Get-ImageCodeRanges -OutFile $OutFile -CcsRoot $CcsRoot }
+    if ($map) {
+        $hit = @($map.ranges | Where-Object { $pcValue -ge $_.start -and $pcValue -lt $_.end }) | Select-Object -First 1
+        if ($hit) {
+            $r.ok = $true
+            $r.section = $hit.name
+            $r.text = ('executing this image: PC = {0} inside {1} (0x{2:X8}..0x{3:X8}, layout from {4}){5}' -f `
+                    $r.pc, $hit.name, $hit.start, $hit.end, $map.source, $symText)
+            return $r
+        }
+        $r.ok = $false
+        $r.text = ('PC = {0} is outside every code section of this image ({1}) - something else is running{2}' -f `
+                $r.pc, (($map.ranges | ForEach-Object { $_.name }) -join ', '), $symText)
+        if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
         return $r
     }
 
+    # no layout available: device-table fallback, and the text says so - never silent
+    if ($pcValue -lt $script:C28xFlashBase) {
+        $r.ok = $true
+        $r.text = ('PC = {0} is below the C28x Flash base 0x080000 (device-table fallback: no image layout available){1}' -f $r.pc, $symText)
+        return $r
+    }
     $r.ok = $false
-    $r.text = ('PC = {0} is in Flash (>= 0x080000) - the core is not executing our RAM image{1}' -f $r.pc, $symText)
+    $r.text = ('PC = {0} is at or above the C28x Flash base 0x080000 (device-table fallback: no image layout available){1}' -f $r.pc, $symText)
     if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
     return $r
 }
