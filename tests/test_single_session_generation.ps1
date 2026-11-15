@@ -9,9 +9,10 @@ $dssDir = Join-Path $ccs 'ccs_base/scripting/bin'
 New-Item -ItemType Directory -Force -Path $scripts, $project, $dssDir, (Join-Path $project 'Debug'), (Join-Path $project 'targetConfigs') | Out-Null
 
 try {
-    # copy the whole scripts folder: listing files by hand means every new helper
-    # (ti_c2000_readmode.ps1 arrived that way) silently breaks the fixture
-    Copy-Item (Join-Path $root 'scripts/*.ps1') $scripts -Force
+    # copy the whole scripts folder, not just *.ps1: listing files by hand means every new
+    # helper silently breaks the fixture, and the DSS bootstrap is a .js file injected at
+    # run time (ti_c2000_dss_boot.js), so a .ps1-only copy fails with "could not find file"
+    Copy-Item (Join-Path $root 'scripts/*') $scripts -Recurse -Force
     # the readers dot-source the mode library, so ti_c2000_debug.ps1 must be a stub
     # AFTER the copy or it would overwrite the real one
     Remove-Item (Join-Path $scripts 'ti_c2000_debug.ps1') -Force -ErrorAction SilentlyContinue
@@ -47,7 +48,9 @@ exit /b 1
         $output = @(& pwsh @args 2>&1)
         if ($LASTEXITCODE -eq 0 -or -not (Test-Path $capture)) { throw "$mode fake DSS did not capture a script: $($output -join '; ')" }
         $js = Get-Content -LiteralPath $capture -Raw
-        if ($js -notmatch 'DemoImage\.out' -or @([regex]::Matches($js, 'session\.memory\.loadProgram\(OUT\)')).Count -ne 1 -or
+        # "loads exactly once per session" is now expressed by the shared call: the concrete
+    # loadProgram lives inside ti_c2000_dss_boot.js, so count the call that reaches it.
+    if ($js -notmatch 'DemoImage\.out' -or @([regex]::Matches($js, 'dssLoadWithRetry\(session, OUT')).Count -ne 1 -or
             $js -notmatch 'session\.target\.runAsynch\(\)' -or $js -notmatch 'session\.target\.isHalted\(\)') {
             throw "$mode script lacks the resolved .out, one load, run, or running-state check"
         }

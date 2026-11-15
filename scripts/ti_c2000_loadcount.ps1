@@ -59,6 +59,41 @@ function Get-LoadCount {
     return $o
 }
 
+<#
+Write-JsonAtomic -- write a JSON file so a concurrent reader never sees half of it.
+
+state.json and load-count.json are read by other processes: a read attaches while -Stop
+moves the lock, two readers race, check_project_entry inspects state while a session
+starts. A plain WriteAllText truncates the file first, so a reader inside that window gets
+an empty or partial document, ConvertFrom-Json throws, the helper returns $null, and the
+caller concludes "no session" - a transient race reported as a hard fact.
+
+Write to a sibling temp file and rename over the target: rename on the same volume is
+atomic, so a reader sees either the whole old file or the whole new one.
+
+Lives here because this file is the bottom of the dot-source chain (readmode.ps1 sources
+it, everything else sources readmode.ps1), so every caller can use it.
+#>
+function Write-JsonAtomic {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Object,
+        [int]$Depth = 6
+    )
+    $text = $Object | ConvertTo-Json -Depth $Depth
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = $Path + '.tmp'
+    [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding($false)))
+    try {
+        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    } catch {
+        # rename blocked (an open handle): fall back to a direct write, which is what the
+        # old code did anyway, but at least the temp file is cleaned up
+        [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding($false)))
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
 function Add-LoadRecord {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
@@ -88,7 +123,7 @@ function Add-LoadRecord {
     try {
         $dir = Split-Path -Parent (Get-LoadCountPath -ProjectPath $ProjectPath)
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        [IO.File]::WriteAllText((Get-LoadCountPath -ProjectPath $ProjectPath), ($out2 | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($true)))
+        Write-JsonAtomic -Path (Get-LoadCountPath -ProjectPath $ProjectPath) -Object $out2
     } catch {
         # counting is bookkeeping, not a reason to fail a load that already ran
     }

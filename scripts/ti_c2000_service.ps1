@@ -393,95 +393,26 @@ session.options.setBoolean("PoliteRealtimeMode", true);
 // returned cleanly and the very next reset() failed with "target is not connected", after
 // which every load attempt operated on a dead link. So verify with an operation that must
 // touch the target (isHalted) and retry the whole connect when it throws.
-function linkIsUp() {
-    try { session.target.isHalted(); return true; } catch (eV) { return false; }
+//__BOOT__
+// connect / reset / load / run come from ti_c2000_dss_boot.js, shared with the two
+// one-shot readers. Writing error.txt here (not inside the shared code) keeps each
+// entry point's wording its own.
+if (!dssConnectVerified(session, print)) {
+    writeText(WORK + "/error.txt", "CONNECT_FAILED the link never became usable");
+    throw "connect failed";
 }
-// Error -1138 ("Device refused to allow debug mode") is the core refusing to enter debug
-// state at all, and TI's own advice is to power-cycle the board. Retrying makes it worse,
-// not better: each attempt pushes the probe into -1041 then -150, and the last one cannot
-// even remove its debug state, so the NEXT session starts from a worse place
-// (measured 2026-11-15 across six stop/start cycles).
-function boardRefusedDebug(msg) {
-    var s = "" + msg;
-    // The exception object does NOT carry -1138: GEL prints that to stdout, while the
-    // Java message only says "Target reset failed. Error: -1" (measured 2026-11-15).
-    // So match the message's own wording too, otherwise this check never fires.
-    return (s.indexOf("-1138") >= 0)
-        || (s.indexOf("Device refused to allow debug mode") >= 0)
-        || (s.indexOf("Target reset failed") >= 0);
+if (!dssResetVerified(session, print)) {
+    writeText(WORK + "/error.txt", "RESET_FAILED the target refused reset");
+    throw "reset failed";
 }
-var connected = false;
-for (var i = 1; i <= 5 && !connected; i++) {
-    try {
-        session.target.connect();
-        if (linkIsUp()) { connected = true; break; }
-        print("CONNECT_RETRY " + i + ": connect returned but the target does not answer");
-        try { session.target.disconnect(); } catch (eX) { }
-    } catch (e) {
-        var msg = "" + e;
-        print("CONNECT_RETRY " + i + ": " + msg);
-        // "Error -150" is the FTDI/USB layer failing to configure the port, not a logic
-        // error: the previous DSP process may still be releasing the USB handle. It needs
-        // a longer settle than a normal retry, and the wait grows each attempt.
-    }
-    sleepMs(1000 + 500 * i);
+if (!dssLoadWithRetry(session, OUT, print)) {
+    writeText(WORK + "/error.txt", "LOAD_FAILED memory.loadProgram failed after 3 attempts");
+    throw "load failed";
 }
-if (!connected) { writeText(WORK + "/error.txt", "CONNECT_FAILED"); throw "connect failed"; }
-print("DSS: connected");
-
-try { session.target.reset(); print("DSS: reset"); }
-catch (e1) {
-    // A reset that reports "target is not connected" right after a successful connect
-    // means the link dropped: fall back to halt only when the link is alive, otherwise
-    // reconnect and try once more (2026-11-15).
-    print("DSS: reset failed (" + e1 + ")");
-    if (boardRefusedDebug(e1)) {
-        // No retry, no load attempt: the target will not accept debug mode until the
-        // board is power-cycled. Stop here and let the caller say so plainly.
-        writeText(WORK + "/error.txt", "BOARD_REFUSED_DEBUG " + e1);
-        throw "board refused debug mode";
-    }
-    if (linkIsUp()) {
-        try { session.target.halt(); print("DSS: halted (link alive, reset skipped)"); } catch (e2) { print("DSS: halt skipped: " + e2); }
-    } else {
-        print("DSS: link lost after connect, reconnecting");
-        try { session.target.disconnect(); } catch (e0) { }
-        sleepMs(900);
-        var recovered = false;
-        for (var r = 1; r <= 3 && !recovered; r++) {
-            try { session.target.connect(); if (linkIsUp()) { session.target.reset(); recovered = true; print("DSS: reset after reconnect (try " + r + ")"); } }
-            catch (e3r) { print("DSS: reconnect " + r + " failed: " + e3r); sleepMs(900 * r); }
-        }
-        if (!recovered) { writeText(WORK + "/error.txt", "RESET_FAILED " + e1); throw "reset failed"; }
-    }
+if (!dssRunVerified(session, print, 300)) {
+    writeText(WORK + "/error.txt", "TARGET_HALTED_AFTER_RUN");
+    throw "halted after run";
 }
-var loaded = false;
-try { session.memory.loadProgram(OUT); loaded = true; }
-catch (e3a) {
-    // Recovery attempts. A previous session that could not clear its debug state leaves
-    // breakpoint opcodes in RAM, and the next load fails; halt + reset sometimes clears
-    // it and sometimes does not (2026-11-15: one start needed a second whole process).
-    // So try three times with growing waits before giving up.
-    print("DSS: load failed, attempt 1: " + e3a);
-    for (var attempt = 2; attempt <= 3 && !loaded; attempt++) {
-        try { session.target.halt(); } catch (eH) { }
-        try { session.target.reset(); } catch (eR) { }
-        sleepMs(500 * attempt);
-        try { session.memory.loadProgram(OUT); loaded = true; print("DSS: loaded on attempt " + attempt); }
-        catch (eN) {
-            print("DSS: load failed, attempt " + attempt + ": " + eN);
-            // -1138 mid-retry means the core has stopped accepting debug mode: further
-            // attempts only damage the probe state
-            if (boardRefusedDebug(eN)) { writeText(WORK + "/error.txt", "BOARD_REFUSED_DEBUG " + eN); throw "board refused debug mode"; }
-            if (attempt === 3) { writeText(WORK + "/error.txt", "LOAD_FAILED " + eN); throw "load failed"; }
-        }
-    }
-}
-if (!loaded) { writeText(WORK + "/error.txt", "LOAD_FAILED unknown"); throw "load failed"; }
-print("DSS: loaded");
-session.target.runAsynch();
-sleepMs(300);
-if (session.target.isHalted()) { writeText(WORK + "/error.txt", "TARGET_HALTED_AFTER_RUN"); throw "halted after run"; }
 writeText(WORK + "/ready.txt", "ready");
 print("SERVICE: READY");
 
@@ -559,6 +490,9 @@ writeText(WORK + "/stopped.txt", "stopped");
 print("SERVICE: STOPPED");
 '@
 $js = $js.Replace('__WORK__', $workJs).Replace('__CCXML__', $ccxmlJs).Replace('__OUT__', $outJs).Replace('__CORE__', $coreJs)
+$bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))
+if ($js.Contains('//__BOOT__')) { $js = $js.Replace('//__BOOT__', $bootJs) }
+else { Write-Output 'FAILURE: DSS_BOOT_MISSING'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: the DSS template has no //__BOOT__ placeholder, so connect/reset/load would run unshared code'; exit 2 }
 [IO.File]::WriteAllText($jsPath, $js, [Text.Encoding]::ASCII)
 
 Info2 "PROJECT : $ProjectPath"
@@ -631,7 +565,7 @@ $state = [ordered]@{
     loadIndex = 0
     runMode   = $runSpec.mode
 }
-[IO.File]::WriteAllText($stateFile, ($state | ConvertTo-Json), (New-Object Text.UTF8Encoding($true)))
+Write-JsonAtomic -Path $stateFile -Object $state
 
 # the image is on the target now: this is a real download, so the shared counter
 # moves (kept in readout\, outside .service, -Stop never resets it)
@@ -653,7 +587,7 @@ try {
 if ($fwIdSeen) { $state.fwId = $fwIdSeen; Info2 ('IMAGE   : gFwId = {0} (recorded; later reads compare against it)' -f $fwIdSeen) }
 else { $state.fwId = ''; Info2 'IMAGE   : no gFwId in this build - identity cannot be re-checked later (add "volatile unsigned long gFwId" to enable it)' }
 
-[IO.File]::WriteAllText($stateFile, ($state | ConvertTo-Json), (New-Object Text.UTF8Encoding($true)))
+Write-JsonAtomic -Path $stateFile -Object $state
 Exit-TargetLock -ProjectPath $ProjectPath
 
 Info2 ('SERVICE : RUNNING (pid {0})' -f $cmdPid)

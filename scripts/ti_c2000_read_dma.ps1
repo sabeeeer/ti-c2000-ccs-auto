@@ -386,24 +386,21 @@ var session = server.openSession(CORE);
 session.options.setBoolean("AllowInterruptsWhenHalted", true);
 session.options.setBoolean("PoliteRealtimeMode", true);
 
-var connected = false;
-for (var i = 1; i <= 3 && !connected; i++) {
-    try { session.target.connect(); connected = true; }
-    catch (e) { print("CONNECT_RETRY: " + e); sleepMs(1000); }
+//__BOOT__
+// connect / reset / load / run come from ti_c2000_dss_boot.js, shared by all three
+// entry points (this file used to carry its own copy, which drifted).
+if (!dssConnectVerified(session, print)) {
+    print("FAILURE: CONNECT_FAILED"); print("REASON: target.connect did not produce a usable link after 5 attempts"); print("RESULT: FAIL"); throw "connect failed";
 }
-if (!connected) { print("FAILURE: CONNECT_FAILED"); print("RESULT: FAIL"); throw "connect failed"; }
-print("DSS: connected");
-
-try { session.target.reset(); print("DSS: reset"); }
-catch (e1) {
-    print("DSS: reset failed (" + e1 + "), fallback halt");
-    try { session.target.halt(); print("DSS: halted (load only)"); } catch (e2) { print("DSS: halt skipped: " + e2); }
+if (!dssResetVerified(session, print)) {
+    print("FAILURE: RESET_FAILED"); print("REASON: the target refused reset - see HINT in the parent process"); print("RESULT: FAIL"); throw "reset failed";
 }
-
-try { session.memory.loadProgram(OUT); }
-catch (e3) { print("FAILURE: LOAD_FAILED"); print("REASON: " + e3); print("RESULT: FAIL"); throw "load failed"; }
-print("DSS: loaded");
-session.target.runAsynch();
+if (!dssLoadWithRetry(session, OUT, print)) {
+    print("FAILURE: LOAD_FAILED"); print("REASON: memory.loadProgram failed after 3 attempts"); print("RESULT: FAIL"); throw "load failed";
+}
+if (!dssRunVerified(session, print, WARMUP)) {
+    print("FAILURE: TARGET_HALTED_AFTER_RUN"); print("RESULT: FAIL"); throw "target halted after run";
+}
 print("DSS: running");
 sleepMs(300);
 if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_AFTER_RUN"); print("RESULT: FAIL"); throw "target halted after run"; }
@@ -555,6 +552,9 @@ session.target.disconnect();
 print("DSS: disconnected");
 print("RESULT: OK");
 "@
+$bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))
+if ($js.Contains('//__BOOT__')) { $js = $js.Replace('//__BOOT__', $bootJs) }
+else { Write-Output 'FAILURE: DSS_BOOT_MISSING'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: the DSS template has no //__BOOT__ placeholder, so connect/reset/load would run unshared code'; exit 2 }
 [IO.File]::WriteAllText($jsPath, $js, [Text.Encoding]::ASCII)
 Info2 "JS      : $jsPath"
 

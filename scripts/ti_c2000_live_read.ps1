@@ -73,6 +73,7 @@ $heartbeats = @($HeartbeatExpr -split ',' | ForEach-Object { $_.Trim() } | Where
 # the rate variable is read the same way as a heartbeat (own tolerant request), so the
 # counter the caller wants timed does not have to appear in -Variables as well
 if ($RateVar -and $heartbeats -notcontains $RateVar) { $heartbeats += $RateVar }
+if ($env:TI_C2000_DEBUG_HEARTBEAT) { [IO.File]::AppendAllText((Join-Path $env:TEMP 'c2000-fw-dbg.log'), ('HEARTBEATS hb=[' + ($heartbeats -join ',') + '] names=[' + ($names -join ',') + '] expect=[' + $ExpectFwId + ']' + [Environment]::NewLine)) }
 
 $svcDir = Join-Path $ProjectPath 'readout\.service'
 $stateFile = Join-Path $svcDir 'state.json'
@@ -97,8 +98,11 @@ if (-not $alive) {
 }
 $svcPid = [int]$state.pid
 
-# the session may still hold an image that was replaced on disk since it started
-if (Test-Path -LiteralPath $state.out) {
+# the session may still hold an image that was replaced on disk since it started.
+# Guard the field itself: a state.json written by an older version (or trimmed by hand)
+# may have no "out", and Test-Path -LiteralPath $null throws a parameter-binding error that
+# would abort the read for a purely bookkeeping reason (measured 2026-11-15).
+if ($state.out -and (Test-Path -LiteralPath $state.out)) {
     $nowSha = (Get-FileHash -LiteralPath $state.out -Algorithm SHA256).Hash
     if ($nowSha -ne $state.outSha256) {
         Out2 'FAILURE: STALE_SERVICE'; Out2 'RESULT: FAIL'
@@ -108,8 +112,29 @@ if (Test-Path -LiteralPath $state.out) {
 }
 
 function Send-Request([string]$Text, [int]$TimeoutMs) {
-    if (Test-Path -LiteralPath $resFile) { Remove-Item -LiteralPath $resFile -Force -ErrorAction SilentlyContinue }
-    [IO.File]::WriteAllText($cmdFile, $Text, [Text.Encoding]::ASCII)
+    # Clear the previous reply, and prove it is gone. A single Remove-Item with
+    # -ErrorAction SilentlyContinue can leave the old res.txt in place (a scanner or the
+    # service still holding the handle), and then the wait below returns the PREVIOUS
+    # response - the caller parses a stale answer and reports a bogus result while the
+    # request was never sent. Retry, and treat "cannot clear" as a timeout instead.
+    for ($c = 0; $c -lt 10 -and (Test-Path -LiteralPath $resFile); $c++) {
+        Remove-Item -LiteralPath $resFile -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $resFile)) { break }
+        Start-Sleep -Milliseconds 30
+    }
+    if (Test-Path -LiteralPath $resFile) { return $null }
+    # Write the request through a temp file and rename: the service polls cmd.txt with
+    # readText(), and a direct WriteAllText truncates it first, so the service can read an
+    # empty or half-written command and answer "E unknown command" - which the caller then
+    # reports as VALUE_READ_FAILED on perfectly good data. The service already writes its
+    # replies atomically; this makes the other direction symmetric.
+    $tmpCmd = $cmdFile + '.tmp'
+    [IO.File]::WriteAllText($tmpCmd, $Text, [Text.Encoding]::ASCII)
+    try { Move-Item -LiteralPath $tmpCmd -Destination $cmdFile -Force -ErrorAction Stop }
+    catch {
+        [IO.File]::WriteAllText($cmdFile, $Text, [Text.Encoding]::ASCII)
+        Remove-Item -LiteralPath $tmpCmd -Force -ErrorAction SilentlyContinue
+    }
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
         if (Test-Path -LiteralPath $resFile) { return (Get-Content -LiteralPath $resFile -Raw) }
@@ -324,6 +349,7 @@ for ($r = 1; $r -le $Rounds; $r++) {
     # "is this the build I think" evidence that needs neither the memory map nor the probe.
     if ($r -eq 1 -and $null -ne $ExpectFwId) {
         $fr = Request-Soft ('VARS ' + $FwIdVar)
+        if ($env:TI_C2000_DEBUG_HEARTBEAT) { [IO.File]::AppendAllText((Join-Path $env:TEMP 'c2000-fw-dbg.log'), ('FW r=' + $r + ' expect=[' + $ExpectFwId + '] frNull=' + ($null -eq $fr) + ' v=[' + $(if ($fr) { $fr.vars[$FwIdVar] } else { '' }) + ']' + [Environment]::NewLine)) }
         if ($fr -and $fr.errors.Count -eq 0) { $fwRaw = [string]$fr.vars[$FwIdVar] }
     }
     $now = Get-Date

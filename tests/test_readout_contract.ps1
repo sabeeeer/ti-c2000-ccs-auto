@@ -50,14 +50,15 @@ Test-Contains $runRead 'function Publish-Readout' 'run_read: verdict publisher d
 Test-Contains $runRead 'function Clear-StaleReadout' 'run_read: stale-data cleaner defined'
 Test-Contains $runRead "Publish-Readout 'FAIL'" 'run_read: failure path publishes FAIL'
 $publishIndex = $runRead.IndexOf('function Publish-Readout')
-$dssIndex = $runRead.IndexOf('session.memory.loadProgram')
+# the load call now lives in ti_c2000_dss_boot.js, so anchor on where the DSS session is opened
+$dssIndex = $runRead.IndexOf('server.openSession')
 if ($publishIndex -lt 0 -or $dssIndex -lt 0 -or $publishIndex -gt $dssIndex) {
     $problems.Add('run_read: verdict publisher must be defined before the DSS session starts')
 }
 Test-Contains $readDma 'function Fail-Readout' 'read_dma: failed-read publisher defined'
 Test-Contains $readDma 'Fail-Readout \$failCode' 'read_dma: DSS failure path publishes FAIL'
 $failIndex = $readDma.IndexOf('function Fail-Readout')
-$dmaIndex = $readDma.IndexOf('session.memory.loadProgram')
+$dmaIndex = $readDma.IndexOf('server.openSession')
 if ($failIndex -lt 0 -or $dmaIndex -lt 0 -or $failIndex -gt $dmaIndex) {
     $problems.Add('read_dma: failed-read publisher must be defined before the DSS session starts')
 }

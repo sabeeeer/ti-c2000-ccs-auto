@@ -174,7 +174,7 @@ function Set-IterateMarker {
         expect   = @($Expect)
         started  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     }
-    try { [IO.File]::WriteAllText($p, ($o | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch { }
+    try { Write-JsonAtomic -Path $p -Object $o } catch { }
 }
 
 function Clear-IterateMarker {

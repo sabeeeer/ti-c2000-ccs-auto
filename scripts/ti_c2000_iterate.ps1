@@ -237,7 +237,7 @@ try {
             $stateFile = Join-Path $ProjectPath 'readout\.service\state.json'
             $obj = Get-Content -LiteralPath $stateFile -Raw -Encoding utf8 | ConvertFrom-Json
             $obj.runMode = 'SingleStep'
-            [IO.File]::WriteAllText($stateFile, ($obj | ConvertTo-Json), (New-Object Text.UTF8Encoding($true)))
+            Write-JsonAtomic -Path $stateFile -Object $obj
         } catch { }
     }
 }
