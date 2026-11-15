@@ -372,8 +372,29 @@ function Get-SessionExpressions {
     $svcDir = Join-Path $ProjectPath 'readout\.service'
     $cmdFile = Join-Path $svcDir 'cmd.txt'
     $resFile = Join-Path $svcDir 'res.txt'
-    Remove-Item -LiteralPath $resFile -Force -ErrorAction SilentlyContinue
-    try { [IO.File]::WriteAllText($cmdFile, 'VARS ' + ($Exprs -join '|'), [Text.Encoding]::ASCII) } catch { return $null }
+    # The same two hazards as ti_c2000_live_read.ps1 Send-Request, and the same fixes:
+    #   * one Remove-Item can leave the previous res.txt behind (a scanner or the service
+    #     holding the handle), and then the wait below returns the PREVIOUS answer while
+    #     the request was never sent - the caller reads a stale value and believes it;
+    #   * a direct WriteAllText lets the service read a half-written command and answer
+    #     "E unknown command", which surfaces as a value read failure on good data.
+    # Keep both implementations in step: tests/test_dss_boot_shared.ps1 checks that each
+    # one clears with a retry loop and writes through a temp file.
+    for ($c = 0; $c -lt 10 -and (Test-Path -LiteralPath $resFile); $c++) {
+        Remove-Item -LiteralPath $resFile -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $resFile)) { break }
+        Start-Sleep -Milliseconds 30
+    }
+    if (Test-Path -LiteralPath $resFile) { return $null }
+    $req = 'VARS ' + ($Exprs -join '|')
+    $tmpCmd = $cmdFile + '.tmp'
+    try {
+        [IO.File]::WriteAllText($tmpCmd, $req, [Text.Encoding]::ASCII)
+        Move-Item -LiteralPath $tmpCmd -Destination $cmdFile -Force -ErrorAction Stop
+    } catch {
+        try { [IO.File]::WriteAllText($cmdFile, $req, [Text.Encoding]::ASCII) } catch { return $null }
+        Remove-Item -LiteralPath $tmpCmd -Force -ErrorAction SilentlyContinue
+    }
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
         if (Test-Path -LiteralPath $resFile) { break }

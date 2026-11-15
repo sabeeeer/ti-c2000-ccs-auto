@@ -477,15 +477,11 @@ while (running) {
     }
     writeText(WORK + "/res.txt", out.join("\n"));
 }
-// belt and braces: the STOP branch already halted, but halt again right before the
-// disconnect so the "halt -> disconnect" shape holds at every disconnect site (a reader
-// that greps for it should not have to follow control flow)
-try { if (!session.target.isHalted()) { session.target.halt(); sleepMs(100); } } catch (eH2) { }
-try { session.target.disconnect(); } catch (eD) { }
-// terminate the scripting session itself, not just the target connection: without this
-// the DSS engine keeps state that makes the NEXT loadProgram fail on the first attempt
-// (measured 2026-11-15: every stop was followed by exactly one failed start)
-try { session.terminate(); } catch (eT) { print("DSS: terminate failed: " + eT); }
+// belt and braces: the STOP branch already halted, but dssShutdown halts again if needed,
+// then disconnects and terminates. Terminating the scripting session (not just the link)
+// matters: without it the DSS engine keeps state that makes the NEXT loadProgram fail on
+// the first attempt (measured 2026-11-15: every stop was followed by one failed start).
+dssShutdown(session, print);
 writeText(WORK + "/stopped.txt", "stopped");
 print("SERVICE: STOPPED");
 '@

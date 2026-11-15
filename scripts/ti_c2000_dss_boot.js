@@ -117,6 +117,6 @@ function dssRunVerified(session, log, settleMs) {
 // Halt, wait, disconnect, terminate: the order that keeps the next session loadable.
 function dssShutdown(session, log) {
     try { if (!session.target.isHalted()) { session.target.halt(); dssSleepMs(150); } } catch (eh) { log("DSS: halt before disconnect failed: " + eh); }
-    try { session.target.disconnect(); } catch (ed) { log("DSS: disconnect failed: " + ed); }
+    try { session.target.disconnect(); log("DSS: disconnected"); } catch (ed) { log("DSS: disconnect failed: " + ed); }
     try { session.terminate(); } catch (et) { log("DSS: terminate failed: " + et); }
 }

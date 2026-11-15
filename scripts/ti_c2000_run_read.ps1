@@ -208,7 +208,7 @@ if ($spec.mode -eq 'ReadOnly') {
         $cnt = Get-LoadCount -ProjectPath $ProjectPath
 
         # 1. RAM or Flash (region names from this project's .map)
-        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile
+        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile -MapFile $MapFile
         if ($loc.code -eq 'TARGET_NOT_CONNECTED') {
             Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
             Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
@@ -514,11 +514,8 @@ if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_DURING_READ"); pr
 // memory, and it fails while the core is free-running - the next load then dies with
 // "Failed to remove the debug state from the target before disconnecting" (measured
 // 2026-11-15 on the service path; a one-shot reader leaves the same debris behind).
-print("DSS: target still running before disconnect");
-try { session.target.halt(); } catch (eHalt) { print("DSS: halt before disconnect failed: " + eHalt); }
-sleepMs(150);
-session.target.disconnect();
-print("DSS: disconnected");
+// halt -> settle -> disconnect -> terminate, shared with the other two entry points
+dssShutdown(session, print);
 print("RESULT: OK");
 "@
 $bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))

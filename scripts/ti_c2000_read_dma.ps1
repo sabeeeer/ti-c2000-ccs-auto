@@ -204,7 +204,7 @@ if ($spec.mode -eq 'ReadOnly') {
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
         # Report where the core runs; refuse only when the caller demands RAM.
         # A frozen buffer read in Flash is a legitimate mode, but it must be labelled.
-        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile
+        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile -MapFile $MapFile
         if ($loc.code -eq 'TARGET_NOT_CONNECTED') {
             Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
             Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
@@ -398,12 +398,13 @@ if (!dssResetVerified(session, print)) {
 if (!dssLoadWithRetry(session, OUT, print)) {
     print("FAILURE: LOAD_FAILED"); print("REASON: memory.loadProgram failed after 3 attempts"); print("RESULT: FAIL"); throw "load failed";
 }
-if (!dssRunVerified(session, print, WARMUP)) {
+// 300 ms is the settle time the shared helper needs; this template has no -WarmupMs
+// parameter, and referring to one that does not exist threw a Rhino ReferenceError
+// before a single byte was read (found 2026-11-15 by reviewing every call site).
+if (!dssRunVerified(session, print, 300)) {
     print("FAILURE: TARGET_HALTED_AFTER_RUN"); print("RESULT: FAIL"); throw "target halted after run";
 }
 print("DSS: running");
-sleepMs(300);
-if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_AFTER_RUN"); print("RESULT: FAIL"); throw "target halted after run"; }
 var hbNames = [];
 var hbBefore = {};
 for (var h = 0; h < HB_CANDS.length; h++) {
@@ -545,11 +546,8 @@ for (var h2 = 0; h2 < hbNames.length; h2++) {
 // memory, and it fails while the core is free-running - the next load then dies with
 // "Failed to remove the debug state from the target before disconnecting" (measured
 // 2026-11-15 on the service path; a one-shot reader leaves the same debris behind).
-print("DSS: target still running before disconnect");
-try { session.target.halt(); } catch (eHalt) { print("DSS: halt before disconnect failed: " + eHalt); }
-sleepMs(150);
-session.target.disconnect();
-print("DSS: disconnected");
+// halt -> settle -> disconnect -> terminate, shared with the other two entry points
+dssShutdown(session, print);
 print("RESULT: OK");
 "@
 $bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))

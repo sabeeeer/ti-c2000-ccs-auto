@@ -251,6 +251,17 @@ if ($ArrayName) {
 
     $preFlag = [string]$pre.vars[$FrozenFlag]
     $postFlag = [string]$post.vars[$FrozenFlag]
+    # The expected value was declared and documented but never read: a flag that sits at 0
+    # does not change while the window is copied, so "did it change?" passed on a buffer
+    # that was never frozen and the copy could mix old and new samples. Equality is what
+    # proves "frozen"; stability alone only proves "constant" (found 2026-11-15 by
+    # tools/audit_dead_params.ps1).
+    if ($FrozenFlag -and -not (Test-FlagEquals $preFlag $FrozenValue)) {
+        Out2 'FAILURE: BUFFER_NOT_FROZEN'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: {0} = {1}, expected {2} - the buffer is not in its frozen state, so a copy taken now could mix old and new samples' -f $FrozenFlag, $preFlag, $FrozenValue)
+        Out2 'HINT    : wait until the firmware freezes the buffer, or pass -FrozenValue "" to only require that it does not change'
+        exit 1
+    }
     if ($FrozenFlag -and $preFlag -ne $postFlag) {
         Out2 'FAILURE: BUF_CHANGED'; Out2 'RESULT: FAIL'
         Out2 ('REASON: {0} changed while copying ({1} -> {2})' -f $FrozenFlag, $preFlag, $postFlag); exit 1

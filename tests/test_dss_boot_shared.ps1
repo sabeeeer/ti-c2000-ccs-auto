@@ -42,6 +42,64 @@ foreach ($e in $entries) {
     if ($t -match 'session\.memory\.loadProgram') { $problems.Add("$e calls session.memory.loadProgram directly - that belongs in dssLoadWithRetry") }
 }
 
+# 3b. the two implementations of the cmd.txt/res.txt exchange must stay in step. They live
+# in different files (readmode for the preflight helpers, live_read for sampling), and on
+# 2026-11-15 one of them was fixed while the other kept returning the previous response.
+$ioChecks = @(
+    @{ file = 'ti_c2000_readmode.ps1'; what = 'Get-SessionExpressions' },
+    @{ file = 'ti_c2000_live_read.ps1'; what = 'Send-Request' }
+)
+foreach ($io in $ioChecks) {
+    $p = Join-Path $scripts $io.file
+    if (-not (Test-Path -LiteralPath $p)) { $problems.Add("$($io.file) is missing"); continue }
+    $t = [IO.File]::ReadAllText($p)
+    if ($t -notmatch 'for \(\$c = 0; \$c -lt 10') {
+        $problems.Add("$($io.what) in $($io.file) must retry clearing res.txt; a single Remove-Item can leave the previous response and the caller then parses a stale answer")
+    }
+    if ($t -notmatch "Move-Item -LiteralPath \`$tmp") {
+        $problems.Add("$($io.what) in $($io.file) must write cmd.txt through a temp file; a direct WriteAllText lets the service read half a command")
+    }
+}
+
+# 4. every constant a DSS template uses must be defined in it. A template is JavaScript
+# inside a here-string: PowerShell cannot type-check it, so a leftover reference (WARMUP,
+# after the boot sequence moved out) only fails inside Rhino on the board. The audit runs
+# its own self-test first, so "clean" here means a detector that has been proven to fire.
+$audit = Join-Path $root 'tools\audit_js_identifiers.ps1'
+if (Test-Path -LiteralPath $audit) {
+    $selfOut = @(& pwsh -NoProfile -File $audit -SelfTest 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $problems.Add('the JS identifier detector failed its own self-test: ' + (($selfOut | ForEach-Object { [string]$_ }) -join '; '))
+    } else {
+        $auditOut = @(& pwsh -NoProfile -File $audit 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($l in $auditOut) { if ([string]$l -match '^REASON:') { $problems.Add([string]$l) } }
+            if (-not @($auditOut | Where-Object { [string]$_ -match '^REASON:' }).Count) {
+                $problems.Add('the JS identifier audit failed without a reason: ' + (($auditOut | ForEach-Object { [string]$_ }) -join '; '))
+            }
+        }
+    }
+} else {
+    $problems.Add('tools\audit_js_identifiers.ps1 is missing, so undefined identifiers in DSS templates go unnoticed')
+}
+
+# 5. a parameter nothing reads is a documented promise the code cannot keep. -FrozenValue
+# was declared on live_read, documented, forwarded by read_dma, and never used, so the DMA
+# freezing criterion only ever checked "the flag did not change" - which an always-0 flag
+# satisfies while the buffer is still being written.
+$deadAudit = Join-Path $root 'tools\audit_dead_params.ps1'
+if (Test-Path -LiteralPath $deadAudit) {
+    $deadOut = @(& pwsh -NoProfile -File $deadAudit 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        foreach ($l in $deadOut) { if ([string]$l -match '^REASON:') { $problems.Add([string]$l) } }
+        if (-not @($deadOut | Where-Object { [string]$_ -match '^REASON:' }).Count) {
+            $problems.Add('the dead-parameter audit failed without a reason: ' + (($deadOut | ForEach-Object { [string]$_ }) -join '; '))
+        }
+    }
+} else {
+    $problems.Add('tools\audit_dead_params.ps1 is missing, so parameters nobody reads go unnoticed')
+}
+
 if ($problems.Count -gt 0) {
     Write-Output 'FAILURE: DSS_BOOT_NOT_SHARED'
     foreach ($p in $problems) { Write-Output ('VIOLATION: ' + $p) }
