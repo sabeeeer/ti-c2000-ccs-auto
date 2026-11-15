@@ -515,7 +515,13 @@ for (var r = 1; r <= ROUNDS; r++) {
 }
 
 if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_DURING_READ"); print("RESULT: FAIL"); throw "target halted during read"; }
+// Halt first: disconnect() has to strip the breakpoint opcodes DSS patched into program
+// memory, and it fails while the core is free-running - the next load then dies with
+// "Failed to remove the debug state from the target before disconnecting" (measured
+// 2026-11-15 on the service path; a one-shot reader leaves the same debris behind).
 print("DSS: target still running before disconnect");
+try { session.target.halt(); } catch (eHalt) { print("DSS: halt before disconnect failed: " + eHalt); }
+sleepMs(150);
 session.target.disconnect();
 print("DSS: disconnected");
 print("RESULT: OK");

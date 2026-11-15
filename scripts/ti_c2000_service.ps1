@@ -398,19 +398,23 @@ catch (e1) {
     print("DSS: reset failed (" + e1 + "), fallback halt");
     try { session.target.halt(); print("DSS: halted"); } catch (e2) { print("DSS: halt skipped: " + e2); }
 }
-try { session.memory.loadProgram(OUT); }
+var loaded = false;
+try { session.memory.loadProgram(OUT); loaded = true; }
 catch (e3a) {
-    // One recovery attempt. A previous session that could not clear its debug state
-    // leaves breakpoint opcodes in RAM, and the next load then fails immediately; a
-    // halt + reset + retry clears it without a human replugging the board (2026-11-15).
-    print("DSS: load failed, retrying after halt+reset: " + e3a);
-    try { session.target.halt(); } catch (e3b) { }
-    try { session.target.reset(); } catch (e3c) { }
-    sleepMs(400);
-    try { session.memory.loadProgram(OUT); }
-    catch (e3d) { writeText(WORK + "/error.txt", "LOAD_FAILED " + e3d); throw "load failed"; }
-    print("DSS: loaded after recovery reset");
+    // Recovery attempts. A previous session that could not clear its debug state leaves
+    // breakpoint opcodes in RAM, and the next load fails; halt + reset sometimes clears
+    // it and sometimes does not (2026-11-15: one start needed a second whole process).
+    // So try three times with growing waits before giving up.
+    print("DSS: load failed, attempt 1: " + e3a);
+    for (var attempt = 2; attempt <= 3 && !loaded; attempt++) {
+        try { session.target.halt(); } catch (eH) { }
+        try { session.target.reset(); } catch (eR) { }
+        sleepMs(500 * attempt);
+        try { session.memory.loadProgram(OUT); loaded = true; print("DSS: loaded on attempt " + attempt); }
+        catch (eN) { print("DSS: load failed, attempt " + attempt + ": " + eN); if (attempt === 3) { writeText(WORK + "/error.txt", "LOAD_FAILED " + eN); throw "load failed"; } }
+    }
 }
+if (!loaded) { writeText(WORK + "/error.txt", "LOAD_FAILED unknown"); throw "load failed"; }
 print("DSS: loaded");
 session.target.runAsynch();
 sleepMs(300);
@@ -479,7 +483,15 @@ while (running) {
     }
     writeText(WORK + "/res.txt", out.join("\n"));
 }
+// belt and braces: the STOP branch already halted, but halt again right before the
+// disconnect so the "halt -> disconnect" shape holds at every disconnect site (a reader
+// that greps for it should not have to follow control flow)
+try { if (!session.target.isHalted()) { session.target.halt(); sleepMs(100); } } catch (eH2) { }
 try { session.target.disconnect(); } catch (eD) { }
+// terminate the scripting session itself, not just the target connection: without this
+// the DSS engine keeps state that makes the NEXT loadProgram fail on the first attempt
+// (measured 2026-11-15: every stop was followed by exactly one failed start)
+try { session.terminate(); } catch (eT) { print("DSS: terminate failed: " + eT); }
 writeText(WORK + "/stopped.txt", "stopped");
 print("SERVICE: STOPPED");
 '@
@@ -516,7 +528,14 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
     & cmd.exe /d /c "taskkill /PID $cmdPid /T /F" 2>&1 | Out-Null
     Exit-TargetLock -ProjectPath $ProjectPath
     foreach ($line in $tail) { Out2 ([string]$line) }
-    Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason); exit 1
+    Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
+    if ($failReason -match 'Load failed|Failed to remove the debug state') {
+        # measured 2026-11-15: the first load after an unclean disconnect can fail even
+        # with three in-process retries, and the very next whole -Start then succeeds
+        Out2 'HINT    : the target still holds debug state from an earlier session - run -Start again (a fresh DSS process usually clears it)'
+        Out2 'HINT    : if it fails twice in a row, power-cycle the board (unplug USB, wait 3 s, plug back in) and start again'
+    }
+    exit 1
 }
 
 $state = [ordered]@{

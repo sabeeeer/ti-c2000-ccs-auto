@@ -544,7 +544,13 @@ for (var h2 = 0; h2 < hbNames.length; h2++) {
         print("FAILURE: HEARTBEAT_NOT_ADVANCING"); print("RESULT: FAIL"); throw "application heartbeat did not advance";
     }
 }
+// Halt first: disconnect() has to strip the breakpoint opcodes DSS patched into program
+// memory, and it fails while the core is free-running - the next load then dies with
+// "Failed to remove the debug state from the target before disconnecting" (measured
+// 2026-11-15 on the service path; a one-shot reader leaves the same debris behind).
 print("DSS: target still running before disconnect");
+try { session.target.halt(); } catch (eHalt) { print("DSS: halt before disconnect failed: " + eHalt); }
+sleepMs(150);
 session.target.disconnect();
 print("DSS: disconnected");
 print("RESULT: OK");
