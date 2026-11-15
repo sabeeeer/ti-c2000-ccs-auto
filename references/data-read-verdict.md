@@ -21,6 +21,51 @@
 
 JTAG 不参与实时采样，只搬历史数据。**不做固件侧缓冲就直接读寄存器，高速数据一定是错的。**
 
+## 0.5 固件契约：与芯片 / boot / 探针都无关的判据
+
+前面那些判据里，凡是用"地址"说话的都带着设备假设：`PC < 0x080000` 假设 C28x 的 Flash 从这里开始（28335 就在 0x300000），段表假设 `.out` 里有可读的布局，读 `PC` 假设探针支持寄存器读。芯片一换、boot 一改、探针一换，这些假设就失效。
+
+**固件自己声明的三样东西不需要任何假设，只需要"能读内存"这一项能力**：
+
+```c
+/* 1. 身份：改固件就 +1，读数对不上 = 烧错了镜像 */
+#define FW_ID  0x00010001UL
+volatile unsigned long gFwId = FW_ID;
+
+/* 2. 中断存活：1 ms 定时器中断里 ++（多数工程的 gMsTick 已经是这个） */
+volatile unsigned long gMsTick;      /* 已在 A0 里 gMsTick++ */
+
+/* 3. 主循环存活：后台 for(;;) 里 ++（多数工程的 usMainLoop 已经是这个） */
+volatile unsigned long usMainLoop;   /* 已在 main 的 for(;;) 里 usMainLoop++ */
+```
+
+对应的判据：
+
+```powershell
+pwsh -NoProfile -File scripts/ti_c2000_run_read.ps1 -ProjectPath <工程> `
+  -Variables gMsTick -Mode ReadOnly -Rounds 4 -IntervalMs 300 `
+  -ExpectFwId 0x00010001 `
+  -RateVar gMsTick -ExpectedRatePerSec 1000 -RateTolerancePct 20
+```
+
+| 检查 | 通过条件 | 失败分类 |
+|---|---|---|
+| 身份 | 读回 `gFwId` 等于 `-ExpectFwId` | `FW_ID_MISMATCH` / `FW_ID_UNREADABLE` |
+| 中断在跑 | `gMsTick` 跨轮递增 | `HEARTBEAT_FAIL` |
+| 主循环在跑 | `usMainLoop` 跨轮递增 | `HEARTBEAT_FAIL` |
+| 速率 | `Δ值 / Δ主机时间` 落在 `±RateTolerancePct` | `HEARTBEAT_RATE` |
+
+**为什么这比地址判据强**：
+
+- 换器件（28335 / 28379D / 将来任何 C28x）：同一套判据，只要那几个变量还在；
+- 改 boot 配置（RAM / Flash / 自定义引导）：判据不问代码从哪来，只问它是不是在按声明运行；
+- 换探针（XDS100 / XDS110 / 其他）：只要它能读内存；
+- 不需要 `-CcsRoot`、不需要 `.map`、不需要 `ofd2000`、不需要读 `PC`。
+
+**两个计数器要一起看**：只有中断在跑、主循环卡死时，`gMsTick` 仍然递增。要求"至少一个递增"证明有东西在跑，但**两个都递增**才说明中断与主循环都在服务——这是地址判据给不出的信息。
+
+**代价**：固件里必须真的存在这几个变量。没有就退回地址判据（`PC` + 段表），并在输出里说明用了哪种。
+
 ## 1. 四级判据
 
 ### 判据 1：固件身份（静态）
@@ -28,7 +73,7 @@ JTAG 不参与实时采样，只搬历史数据。**不做固件侧缓冲就直�
 | 检查 | 通过条件 | 失败分类 |
 |---|---|---|
 | `.out` 与加载记录一致 | SHA256 等于 `Debug/.ti_c2000_loaded.json` 记录值；只证明主机文件与上次本脚本记录一致 | `SYMBOL_MISMATCH` |
-| 固件指纹（可选） | `gFwId`（固件内 `const` 常量）等于预期值 | `FW_ID_MISMATCH` |
+| 固件指纹（**推荐**） | 固件里 `volatile unsigned long gFwId = FW_ID;`，`-ExpectFwId <值>` 读回比对。读一个数即可，**不依赖 Flash 基地址、PC、段表或探针型号** | `FW_ID_MISMATCH` / `FW_ID_UNREADABLE` |
 
 没有板上可核对的固件标识或同一会话内的加载记录时标注 `UNVERIFIED_ID`，**不能声称"确认是本次固件"**。`PC` 所在 Flash/RAM 区也只能排除某些镜像，不能单独确认版本。
 
@@ -38,7 +83,7 @@ JTAG 不参与实时采样，只搬历史数据。**不做固件侧缓冲就直�
 |---|---|---|
 | 心跳递增 | 候选里**所有可读的**都参与判定，但**只要有一个递增即证明活性**（与实时读取脚本一致）。单个候选停滞会在逐项检查里显示 `row N not increasing` 并计入 `X/Y candidates advanced`，不单独判失败——多个计数器里停滞一个只说明那个计数器停止更新。两轮读取必须增加；三轮以上允许一次相邻同值，但连续两段不增即失败。一次同值会被记录，不能描述为"每轮都增加" | `HEARTBEAT_FAIL` |
 | 启动窗口 | 仅在本次单会话刚加载并运行后，按实际预热时间检查计数器；`run_read`/`read_dma` 都适用。计数器已在递增但首值超过窗口 → 镜像不是刚加载的那一份 | `STALE_PROGRAM` |
-| 速率（可选，当前人工核对） | 若该计数器确为毫秒计时，按主机时间间隔估算约 1000 /s（容差由工程确定）；当前通用脚本只查递增，**不自动核对速率** | `HEARTBEAT_RATE` |
+| 速率（**推荐**） | `-RateVar <计数器> -ExpectedRatePerSec <n> -RateTolerancePct <默认20>`：按主机时间算实测速率（32 位回绕已处理），不在容差内即失败。"在递增"只说明动过；"速率对"才说明按固件声明的频率在跑 | `HEARTBEAT_RATE` |
 | 至少一个心跳可用 | 指定的应用计数器必须可读；不能从任意递增列自动推断它是心跳 | `NO_HEARTBEAT` |
 | 目标在应答且执行本镜像（前置） | 探针被枚举、会话进程活着、`sha256` 一致都成立**仍不够**：`.out` 符号表求值在 JTAG 断开时照样返回地址（实测 `V main 35469`）。**读 `PC`，判断它是否落在本镜像自己的代码段内**（段表取自 `.map` 或 `ofd2000`，不硬编码 Flash 基址）：读不到 = 链路断；落在段内 = 正在执行这份镜像；落在段外 = 在跑 Flash 或别的镜像。无布局可用时退化为设备地址表并明示 `fallback` | `TARGET_NOT_CONNECTED`（环境故障，无开关可绕过）/ `NOT_RAM_IMAGE` |
 | 单行数据 | 一行无法建立"推进过"的证据；除显式 `-AllowNoHeartbeat` 外一律失败 | `NO_LIVENESS_INTERVAL` |

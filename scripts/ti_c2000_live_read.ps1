@@ -32,6 +32,16 @@ param(
     [string]$FrozenValue = 'true',
     [string]$SeqVar = 'gBufSeq',
     [string]$HeartbeatExpr = 'gMsTick,gRunMs,usMainLoop',
+    # ---- firmware self-proof: the portable way to ask "is this image running?" ----
+    # A number the firmware owns (gFwId) plus the rate of a counter it increments.
+    # Nothing here depends on the device's memory map, the boot configuration or the
+    # probe model: one memory read answers all of it, so it survives a different part,
+    # a different linker layout and a different debugger.
+    [string]$FwIdVar = 'gFwId',
+    [Nullable[double]]$ExpectFwId = $null,
+    [string]$RateVar = '',
+    [double]$ExpectedRatePerSec = 0,
+    [double]$RateTolerancePct = 20,
     [int]$Rounds = 10,
     [int]$IntervalMs = 500,
     [int]$RequestTimeoutMs = 15000,
@@ -60,6 +70,9 @@ if ($names.Count -gt 0 -and $ArrayName) {
 }
 if ($NoHeartbeat) { $HeartbeatExpr = '' }
 $heartbeats = @($HeartbeatExpr -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+# the rate variable is read the same way as a heartbeat (own tolerant request), so the
+# counter the caller wants timed does not have to appear in -Variables as well
+if ($RateVar -and $heartbeats -notcontains $RateVar) { $heartbeats += $RateVar }
 
 $svcDir = Join-Path $ProjectPath 'readout\.service'
 $stateFile = Join-Path $svcDir 'state.json'
@@ -307,6 +320,12 @@ for ($r = 1; $r -le $Rounds; $r++) {
     $merged = @{}
     foreach ($k in $resp.vars.Keys) { $merged[$k] = $resp.vars[$k] }
     foreach ($k in $hbVals.Keys) { $merged[$k] = $hbVals[$k] }
+    # firmware identity: a constant the image itself declares, read once. It is the only
+    # "is this the build I think" evidence that needs neither the memory map nor the probe.
+    if ($r -eq 1 -and $null -ne $ExpectFwId) {
+        $fr = Request-Soft ('VARS ' + $FwIdVar)
+        if ($fr -and $fr.errors.Count -eq 0) { $fwRaw = [string]$fr.vars[$FwIdVar] }
+    }
     $now = Get-Date
     $uptime = ($now - (Get-Process -Id $svcPid).StartTime).TotalMilliseconds
     $samples += [ordered]@{ round = $r; hostMs = [int64]$uptime; hostTime = $now.ToString('HH:mm:ss.fff'); vars = $merged }
@@ -362,6 +381,67 @@ $csvPath = Join-Path $dataDir 'data.csv'
 if ($heartbeats.Count -gt 0 -and $hbOk) { Out2 'HEARTBEAT: OK (all candidates increased)' }
 elseif ($heartbeats.Count -gt 0) { Out2 'HEARTBEAT: FAIL' }
 
+# ---- firmware self-proof, part 1: identity ---------------------------------------
+# gFwId is a constant the image declares. Comparing it needs nothing but a memory read:
+# no Flash base, no PC, no section table, no assumption about the probe. A mismatch means
+# the board is running a different build, which is exactly the failure the address-based
+# tests were trying to catch, only now it is stated by the firmware itself.
+$fwOk = $true
+$fwCode = ''
+if ($null -ne $ExpectFwId) {
+    $fwNum = $null
+    if ($fwRaw) {
+        $t = $fwRaw.Trim()
+        if ($t -match '^0[xX]([0-9A-Fa-f]+)$') { try { $fwNum = [double][Convert]::ToUInt64($t.Substring(2), 16) } catch { } }
+        else { $d = 0.0; if ([double]::TryParse($t, [ref]$d)) { $fwNum = $d } }
+    }
+    if ($null -eq $fwNum) {
+        $fwOk = $false; $fwCode = 'FW_ID_UNREADABLE'
+        Out2 ('CHECK fw id {0}: UNREADABLE - cannot confirm which build is running' -f $FwIdVar)
+    } elseif ($fwNum -ne [double]$ExpectFwId) {
+        $fwOk = $false; $fwCode = 'FW_ID_MISMATCH'
+        Out2 ('CHECK fw id {0}: {1} != expected {2} - the board runs a different build' -f $FwIdVar, $fwNum, $ExpectFwId)
+    } else {
+        Out2 ('CHECK fw id {0}: {1} (matches expected)' -f $FwIdVar, $fwNum)
+    }
+}
+
+# ---- firmware self-proof, part 2: rate -------------------------------------------
+# "Increasing" only says the counter moved at least once. The rate says it is moving at
+# the frequency the firmware claims, which is what separates a live program from a value
+# that happens to change between two reads. Units are the counter's own: per second.
+$rateOk = $true
+$rateCode = ''
+if ($RateVar -and $ExpectedRatePerSec -gt 0) {
+    $rv = @($samples | ForEach-Object { $_.vars[$RateVar] })
+    $nums = @()
+    foreach ($x in $rv) {
+        $s = ([string]$x).Trim(); $d = 0.0
+        if ($s -match '^0[xX]([0-9A-Fa-f]+)$') { try { $nums += [double][Convert]::ToUInt64($s.Substring(2), 16) } catch { } }
+        elseif ([double]::TryParse($s, [ref]$d)) { $nums += $d }
+    }
+    $t0 = [double]$samples[0].hostMs
+    $t1 = [double]$samples[-1].hostMs
+    $dt = ($t1 - $t0) / 1000.0
+    if ($nums.Count -lt 2 -or $dt -le 0) {
+        $rateOk = $false; $rateCode = 'HEARTBEAT_RATE'
+        Out2 ('CHECK rate {0}: cannot compute (samples={1}, seconds={2:N3})' -f $RateVar, $nums.Count, $dt)
+    } else {
+        $dr = $nums[-1] - $nums[0]
+        if ($dr -lt 0) { $dr += 4294967296.0 }   # 32-bit counter wrapped during the window
+        $rate = $dr / $dt
+        $lo = $ExpectedRatePerSec * (1 - ($RateTolerancePct / 100.0))
+        $hi = $ExpectedRatePerSec * (1 + ($RateTolerancePct / 100.0))
+        if ($rate -lt $lo -or $rate -gt $hi) {
+            $rateOk = $false; $rateCode = 'HEARTBEAT_RATE'
+            Out2 ('CHECK rate {0}: {1:N1}/s outside {2:N0}..{3:N0} (expected {4:N0} +/-{5:N0}%) - the program is not running at its claimed speed' -f `
+                    $RateVar, $rate, $lo, $hi, $ExpectedRatePerSec, $RateTolerancePct)
+        } else {
+            Out2 ('CHECK rate {0}: {1:N1}/s (expected {2:N0} +/-{3:N0}%)' -f $RateVar, $rate, $ExpectedRatePerSec, $RateTolerancePct)
+        }
+    }
+}
+
 $vargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $verdictScript,
     '-CsvPath', $csvPath, '-RangeVars', ($names -join ','))
 # The heartbeat was already judged above from live samples, which is stronger than
@@ -402,6 +482,23 @@ if ($heartbeats.Count -gt 0 -and -not $hbOk) {
     Out2 'FAILURE: HEARTBEAT_FAIL'; Out2 'RESULT: FAIL'
     Out2 ('REASON: heartbeat did not advance in the live session (not increasing: ' + ($hbFailed -join ', ') + ')')
     Out2 'HINT    : pass -HeartbeatExpr <var> with a counter that changes every millisecond, or -NoHeartbeat to skip the liveness judgement'
+    exit 1
+}
+if (-not $fwOk) {
+    Out2 ('FAILURE: ' + $fwCode); Out2 'RESULT: FAIL'
+    if ($fwCode -eq 'FW_ID_MISMATCH') {
+        Out2 ('REASON: the firmware answers {0} = {1}, but this build declares {2} - the target is running another image' -f $FwIdVar, $fwNum, $ExpectFwId)
+        Out2 'HINT    : rebuild and start the session again (-Start -ConfirmLoad); the value comes from the firmware itself, so a mismatch is never a reading error'
+    } else {
+        Out2 ('REASON: {0} could not be read, so which build is running is unknown' -f $FwIdVar)
+        Out2 'HINT    : the running firmware does not define it yet - add "volatile unsigned long gFwId" to the image, or drop -ExpectFwId to skip this check'
+    }
+    exit 1
+}
+if (-not $rateOk) {
+    Out2 'FAILURE: HEARTBEAT_RATE'; Out2 'RESULT: FAIL'
+    Out2 ('REASON: the counter {0} does not advance at {1:N0}/s (tolerance {2:N0}%) - the program is running, but not at the rate this firmware claims' -f $RateVar, $ExpectedRatePerSec, $RateTolerancePct)
+    Out2 'HINT    : check the clock/PLL and whether the ISR that increments it is still being serviced'
     exit 1
 }
 if ($vcode -ne 0) {

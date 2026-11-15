@@ -36,6 +36,17 @@ param(
     [string]$CcsRoot = '',
     [string]$CorePattern = '.*C28xx(?:_CPU1)?$',
     [string]$HeartbeatExpr = 'gMsTick,gRunMs,usMainLoop',
+    # ---- portable "is this image running" proof (see references/data-read-verdict.md) --
+    # Nothing below depends on the device memory map, the boot configuration or the probe:
+    # the image declares gFwId and increments a counter, and both are plain memory reads.
+    #   -ExpectFwId 0x00010001          read FwIdVar, compare with this build's FW_ID
+    #   -RateVar gMsTick -ExpectedRatePerSec 1000
+    #                                   the counter must advance at the claimed rate
+    [string]$FwIdVar = 'gFwId',
+    [Nullable[double]]$ExpectFwId = $null,
+    [string]$RateVar = '',
+    [double]$ExpectedRatePerSec = 0,
+    [double]$RateTolerancePct = 20,
     # optional value range for the read-back variables (判据 4). Pass both to enable it;
     # counters such as gMsTick must not be mixed into an ADC range, so name the columns
     # you actually want bounded with -Variables and keep the counters to the heartbeat.
@@ -183,27 +194,46 @@ if ($spec.mode -eq 'ReadOnly') {
     try {
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
-        # cmd.txt/res.txt pair: an enumerated probe plus a live pid does not prove the
-        # target answers, and symbol evaluation would succeed even with the link down.
-        # No switch bypasses this one - it is an environment fault, not an unverified image.
-        $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -OutFile $OutFile -CcsRoot $CcsRoot -AllowUnverified:$AllowUnverified
-        Info2 ('JUDGE   : ' + $ram.text)
-        if (-not $ram.ok) {
-            if ($ram.code -eq 'TARGET_NOT_CONNECTED') {
-                Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
-                Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
-                Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
-            } elseif ($ram.verified) {
-                Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the code answering on the target sits in Flash, not the RAM image this session loaded (board was reset, power-cycled or flashed with something else)'
-                Out2 'HINT    : start the session again with -Start -ConfirmLoad to put our image back in RAM'
-            } else {
-                Out2 'FAILURE: RAM_UNVERIFIED'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the entry symbol (main / _c_int00 / code_start) could not be read, so "this is our RAM image" is unproven - an unproven RAM image is how stale numbers get reported as fresh'
-                Out2 'HINT    : check the probe is attached and the program is running (not halted); -AllowUnverified reads anyway and logs that it did'
+        # Two ways to answer "is the image I think is running, actually running":
+        #
+        #   firmware self-proof  (portable)  - the image declares gFwId and increments a
+        #       counter; comparing the id and timing the counter needs only memory reads,
+        #       so it holds for any part, any boot mode and any probe model.
+        #   device inference     (fallback)  - PC inside the image's own code sections,
+        #       which needs a register read and, ideally, the section map.
+        #
+        # The self-proof is preferred whenever the caller supplies the expected id or a
+        # rate, because it does not encode anything about this chip.
+        $useFwProof = ($null -ne $ExpectFwId) -or ($RateVar -ne '' -and $ExpectedRatePerSec -gt 0)
+        if ($useFwProof) {
+            $what = @()
+            if ($null -ne $ExpectFwId) { $what += ('identity {0}={1}' -f $FwIdVar, $ExpectFwId) }
+            if ($RateVar -and $ExpectedRatePerSec -gt 0) { $what += ('rate {0}~{1:N0}/s' -f $RateVar, $ExpectedRatePerSec) }
+            Info2 ('JUDGE   : firmware self-proof: ' + ($what -join ', ') + ' - judged from memory reads only, no memory-map or probe assumption')
+        } else {
+            # cmd.txt/res.txt pair: an enumerated probe plus a live pid does not prove the
+            # target answers, and symbol evaluation would succeed even with the link down.
+            # No switch bypasses this one - it is an environment fault, not an unverified image.
+            $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -OutFile $OutFile -CcsRoot $CcsRoot -AllowUnverified:$AllowUnverified
+            Info2 ('JUDGE   : ' + $ram.text)
+            if (-not $ram.ok) {
+                if ($ram.code -eq 'TARGET_NOT_CONNECTED') {
+                    Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
+                    Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
+                    Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
+                    Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
+                } elseif ($ram.verified) {
+                    Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
+                    Out2 'REASON: the code answering on the target sits outside every code section of this image - the board runs something else'
+                    Out2 'HINT    : start the session again with -Start -ConfirmLoad to put our image back'
+                } else {
+                    Out2 'FAILURE: RAM_UNVERIFIED'; Out2 'RESULT: FAIL'
+                    Out2 'REASON: neither the program counter nor the entry symbol could be read, so "this is our image" is unproven - an unproven image is how stale numbers get reported as fresh'
+                    Out2 'HINT    : check the probe is attached and the program is running (not halted); -AllowUnverified reads anyway and logs that it did'
+                    Out2 'HINT    : or declare gFwId in the firmware and pass -ExpectFwId - that check needs no address map and survives a different part'
+                }
+                exit 4
             }
-            exit 4
         }
         # say the sampling period out loud: a polled read is not a scope, and the
         # caller must be able to tell "1.8 Hz" from "my signal updates every 100 ms"
@@ -216,6 +246,9 @@ if ($spec.mode -eq 'ReadOnly') {
         # caller would have to read, then run check_read by hand on the CSV
         if ($PSBoundParameters.ContainsKey('ValueMin')) { $largs += @('-ValueMin', [string]$ValueMin) }
         if ($PSBoundParameters.ContainsKey('ValueMax')) { $largs += @('-ValueMax', [string]$ValueMax) }
+        if ($PSBoundParameters.ContainsKey('ExpectFwId')) { $largs += @('-ExpectFwId', [string]$ExpectFwId, '-FwIdVar', $FwIdVar) }
+        if ($RateVar) { $largs += @('-RateVar', $RateVar) }
+        if ($ExpectedRatePerSec -gt 0) { $largs += @('-ExpectedRatePerSec', [string]$ExpectedRatePerSec, '-RateTolerancePct', [string]$RateTolerancePct) }
         if ($NoHeartbeat) { $largs += '-NoHeartbeat' }
         if ($Quiet) { $largs += '-Quiet' }
         & $pwshExe @largs
