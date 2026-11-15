@@ -42,6 +42,7 @@ Exit codes: 0 OK | 1 failure | 2 environment/argument | 3 no probe
 #>
 
 . (Join-Path $PSScriptRoot 'ti_c2000_loadcount.ps1')
+. (Join-Path $PSScriptRoot 'ti_c2000_fwcontract.ps1')
 
 $script:ReadModeNames = @('ReadOnly', 'LoadRead')
 $script:RunModeNames = @('SingleStep', 'Iterate')
@@ -461,9 +462,12 @@ Returns @{ ok; name; first; last; gapMs; reason }
 function Test-AliveNow {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
-        [string[]]$Candidates = @('gMsTick', 'usMainLoop', 'gRunMs'),
+        # Empty means "use the contract". These three names were hard-coded here and in
+        # three other files, in different orders (see references\firmware-contract.json).
+        [string[]]$Candidates = @(),
         [int]$GapMs = 150
     )
+    if ($Candidates.Count -eq 0) { $Candidates = @((Get-FwContract).heartbeat.candidates) }
     $r = [ordered]@{ ok = $false; name = ''; first = ''; last = ''; gapMs = $GapMs; reason = '' }
 
     foreach ($c in $Candidates) {

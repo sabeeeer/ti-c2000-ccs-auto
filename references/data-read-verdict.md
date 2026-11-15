@@ -93,6 +93,25 @@ PREFLIGHT: all conditions hold - reading
 - **身份比对是自动的**：`-Start` 成功后就读一次 `gFwId` 存进 `state.json`，读时直接比对，不需要调用方记得传 `-ExpectFwId`。没有该变量的旧固件只提示"身份仅靠 sha256"。
 - **拒绝必须清除旧结论**：`PREFLIGHT_FAILED` 时删掉 `data\*.csv` 并把 `check\verdict.txt` 改写成 `result: FAIL`，否则上一次的 `result: OK` 会被误用。
 
+## 0.4 固件契约：唯一一处声明
+
+本 skill 只认识**固件自己声明的**几个符号，全部写在 `references\firmware-contract.json`：
+
+| 项 | 默认 | 作用 |
+|---|---|---|
+| `identity.var` | `gFwId` | 固件身份常数；`-Start` 时记录，每次读比对 |
+| `heartbeat.candidates` | `gMsTick` / `usMainLoop` / `gRunMs` | **任一**递增即证明在跑；多一个能区分"中断在跑但主循环卡死" |
+| `rate.var` / `perSec` | `gMsTick` / 1000 | 计数器必须按声明的速率推进 |
+| `frozenBuffer.array` / `flag` / `flagValue` / `seq` | `gBuf` / `gBufFull` / `1` / `gBufSeq` | DMA 冻结窗口：标志必须**等于**期望值且拷贝期间不变 |
+
+改固件变量时**先改这个文件**，再让脚本跟上（顺序不能反）。
+
+为什么要有这个文件：这些名字曾经硬编码在 **12 处**，而且已经漂移——`FrozenValue` 在 `live_read` 里是 `'true'`、在 `read_dma` 里是 `'1'`；心跳候选在四个文件里出现了三种不同的集合与顺序。散在十二份拷贝里的契约不是契约。
+
+`tools/audit_fw_contract.ps1` 用 **AST** 只读 `param()` 的默认值（不扫注释，注释里引用变量名是正常的），任何脚本与契约不一致即 `FAILURE: FW_CONTRACT_DRIFT`。它自带 `-SelfTest`，植入三类漂移必须被抓到、注释里的举例必须不被误报。
+
+> 除这几个名字外，本 skill 对目标的一切（Flash 基址、段表、内存布局、探针型号）都是**运行时发现**，不做假设。
+
 ## 1. 四级判据
 
 ### 判据 1：固件身份（静态）

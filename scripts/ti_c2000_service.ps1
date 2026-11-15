@@ -574,7 +574,7 @@ $state.loadIndex = $rec.count
 # to remember. A build without gFwId simply records an empty value.
 $fwIdSeen = ''
 try {
-    $fwLines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('gFwId')
+    $fwLines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @((Get-FwContract).identity.var)
     foreach ($line in $fwLines) {
         $m = [regex]::Match([string]$line, '^V\s+gFwId\s+(\S+)\s*$')
         if ($m.Success) { $fwIdSeen = $m.Groups[1].Value; break }

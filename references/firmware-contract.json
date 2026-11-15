@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "about": [
+    "The variables this skill expects the FIRMWARE to declare. One file, because these names used",
+    "to be hard-coded in twelve places and had already drifted: FrozenValue was 'true' in",
+    "live_read and '1' in read_dma, and the heartbeat candidates differed in set AND order",
+    "across four files. tools/audit_fw_contract.ps1 fails the build when any script disagrees",
+    "with this file, so the drift cannot come back.",
+    "",
+    "These are the ONLY firmware symbols this skill knows by name. Everything else about the",
+    "target (memory map, Flash base, section layout, probe model) is discovered, never assumed."
+  ],
+  "identity": {
+    "var": "gFwId",
+    "why": "A constant the image declares (volatile unsigned long). Comparing it with the value recorded at -Start proves the board runs this build; it needs only a memory read, so it survives a different part, boot mode or probe.",
+    "firmware": "volatile unsigned long gFwId = FW_ID;  /* bump FW_ID on every build you flash */"
+  },
+  "heartbeat": {
+    "candidates": ["gMsTick", "usMainLoop", "gRunMs"],
+    "why": "Any ONE advancing proves the program is executing. More than one is better: gMsTick advancing while usMainLoop is frozen means interrupts still run but the main loop is stuck.",
+    "firmware": "volatile unsigned long gMsTick;   /* ++ inside the 1 ms timer ISR */",
+    "firmwareExtra": "volatile unsigned long usMainLoop; /* ++ inside the background for(;;) */"
+  },
+  "rate": {
+    "var": "gMsTick",
+    "perSec": 1000,
+    "tolerancePct": 20,
+    "why": "Increasing only says the counter moved once. The rate says it moves at the frequency the firmware claims, which separates a live program from a value that happens to change."
+  },
+  "frozenBuffer": {
+    "array": "gBuf",
+    "flag": "gBufFull",
+    "flagValue": "1",
+    "seq": "gBufSeq",
+    "why": "A DMA buffer is only consistent if the firmware freezes it first. flagValue is what the flag reads WHEN frozen (1 and 'true' are the same statement in C; readers normalise).",
+    "note": "Optional: a build with no frozen buffer passes -FrozenValue \"\" to require only that the flag does not change, and -Mode LoadRead may skip it entirely."
+  }
+}

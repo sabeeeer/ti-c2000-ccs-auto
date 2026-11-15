@@ -100,6 +100,27 @@ if (Test-Path -LiteralPath $deadAudit) {
     $problems.Add('tools\audit_dead_params.ps1 is missing, so parameters nobody reads go unnoticed')
 }
 
+# 6. every script must agree with references\firmware-contract.json. These firmware
+# symbols used to be hard-coded in twelve places and had already drifted (FrozenValue
+# 'true' vs '1'; the heartbeat candidate set differing across four files).
+$fwAudit = Join-Path $root 'tools\audit_fw_contract.ps1'
+if (Test-Path -LiteralPath $fwAudit) {
+    $selfOut = @(& pwsh -NoProfile -File $fwAudit -SelfTest 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $problems.Add('the firmware-contract detector failed its own self-test: ' + (($selfOut | ForEach-Object { [string]$_ }) -join '; '))
+    } else {
+        $fwOut = @(& pwsh -NoProfile -File $fwAudit 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($l in $fwOut) { if ([string]$l -match '^REASON:') { $problems.Add([string]$l) } }
+            if (-not @($fwOut | Where-Object { [string]$_ -match '^REASON:' }).Count) {
+                $problems.Add('the firmware-contract audit failed without a reason: ' + (($fwOut | ForEach-Object { [string]$_ }) -join '; '))
+            }
+        }
+    }
+} else {
+    $problems.Add('tools\audit_fw_contract.ps1 is missing, so firmware symbols can drift between scripts again')
+}
+
 if ($problems.Count -gt 0) {
     Write-Output 'FAILURE: DSS_BOOT_NOT_SHARED'
     foreach ($p in $problems) { Write-Output ('VIOLATION: ' + $p) }

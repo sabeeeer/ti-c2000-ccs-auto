@@ -93,7 +93,7 @@ $env:PYTHONUTF8 = '1'
 | 读模式 | 何时使用 | 入口 |
 |---|---|---|
 | **`-Mode ReadOnly`（默认）** | 日常读。会话已在跑，只想看当前程序。 | `scripts/ti_c2000_run_read.ps1 -Variables gMsTick,gState`（慢变量）/ `scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName gBuf -Rows 256 -Columns 1`（DMA 冻结窗口）。**绝不下载**：读之前要过四道证明「① 仿真器被 Windows 枚举在线 ② 会话进程活着 ③ `sha256(out)` 与本次构建一致 ④ **"跑的是这份固件、而且真的在跑"** —— 两种做法，**优先前一种**：
-**（推荐）固件自证**：`-ExpectFwId 0x00010001` 读回固件自己声明的 `gFwId` 比对（不匹配 = `FW_ID_MISMATCH`），`-RateVar gMsTick -ExpectedRatePerSec 1000` 校验计数器速率（不符 = `HEARTBEAT_RATE`）。**只依赖"能读内存"**，不碰 Flash 基地址、PC、段表、`ofd2000`，换芯片/改 boot/换探针都不受影响。
+**（推荐）固件自证**：`-ExpectFwId 0x00010001` 读回固件自己声明的 `gFwId` 比对（不匹配 = `FW_ID_MISMATCH`）。**这类符号名只在一个地方声明**：`references\firmware-contract.json`（身份、心跳候选、速率、冻结标志），改固件变量先改它；`tools\audit_fw_contract.ps1` 会发现任何脚本与它不一致，`-RateVar gMsTick -ExpectedRatePerSec 1000` 校验计数器速率（不符 = `HEARTBEAT_RATE`）。**只依赖"能读内存"**，不碰 Flash 基地址、PC、段表、`ofd2000`，换芯片/改 boot/换探针都不受影响。
 **（回退）设备推断**：不给上面两个参数时，读 `PC` 判断是否落在本镜像代码段内（段表来自 `.map` / `ofd2000`；`PC` 读不到 = `TARGET_NOT_CONNECTED`，无开关可绕过）。这条依赖工具链知识，只在拿不到固件变量时用。」，`NO_PROBE`(3) / `NO_SESSION` / `STALE_SERVICE` 不成立就拒绝，不会偷偷烧一次把数据凑出来。**第 ④ 条不同：它报告而不断言**——每次读都打印 `RUNNING : RAM|FLASH   (PC = 0x…, region …)`，区域名取自本工程 `.map` 的 MEMORY 定义（`RAMLS0` / `FLASHA`…），所以换器件、改 boot 都跟着工程走；跑在 Flash 会同时给 `WARN`，因为没烧过这份构建时那些值属于上一份固件。要强制只在 RAM 跑就加 `-RequireRam`（此时非 RAM = `NOT_RAM_IMAGE` exit 4）。`-AllowUnverified` 仍可放过"身份没验证"，`-NoProbeCheck` 可跳过 1 秒的探针枚举。 |
 | **`-Mode LoadRead`（显式）** | 本次读必须从新固件开始（改了代码、要确认新镜像），只下载一次。 | 同一命令加 `-Mode LoadRead -ConfirmLoad`：停常驻会话 → **下载一次** → 读 → 退出。`-MaxLoads N -Expect 'gBufSeq>=3'` 可反复下载到判据满足（等价于连续运行的单次版）。 |
 

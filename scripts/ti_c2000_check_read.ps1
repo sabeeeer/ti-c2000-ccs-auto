@@ -24,7 +24,10 @@ Exit code: 0 OK | 1 verdict failed | 2 argument/file problem
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$CsvPath,
-    [string[]]$HeartbeatVars = @('gMsTick', 'usMainLoop'),
+    # Must match references\firmware-contract.json (tools/audit_fw_contract.ps1 enforces
+    # it). A candidate with no column in this CSV is reported MISSING and skipped, not
+    # failed, so listing all three costs nothing on a build that only declares two.
+    [string[]]$HeartbeatVars = @('gMsTick', 'usMainLoop', 'gRunMs'),
     [string[]]$RangeVars = @(),
     [Nullable[double]]$ValueMin = $null,
     [Nullable[double]]$ValueMax = $null,
