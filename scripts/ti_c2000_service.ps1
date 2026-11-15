@@ -399,7 +399,18 @@ catch (e1) {
     try { session.target.halt(); print("DSS: halted"); } catch (e2) { print("DSS: halt skipped: " + e2); }
 }
 try { session.memory.loadProgram(OUT); }
-catch (e3) { writeText(WORK + "/error.txt", "LOAD_FAILED " + e3); throw "load failed"; }
+catch (e3a) {
+    // One recovery attempt. A previous session that could not clear its debug state
+    // leaves breakpoint opcodes in RAM, and the next load then fails immediately; a
+    // halt + reset + retry clears it without a human replugging the board (2026-11-15).
+    print("DSS: load failed, retrying after halt+reset: " + e3a);
+    try { session.target.halt(); } catch (e3b) { }
+    try { session.target.reset(); } catch (e3c) { }
+    sleepMs(400);
+    try { session.memory.loadProgram(OUT); }
+    catch (e3d) { writeText(WORK + "/error.txt", "LOAD_FAILED " + e3d); throw "load failed"; }
+    print("DSS: loaded after recovery reset");
+}
 print("DSS: loaded");
 session.target.runAsynch();
 sleepMs(300);
@@ -414,7 +425,17 @@ while (running) {
     var cmd = readText(cmdPath).replace(/\s+$/, "");
     removeIfExists(cmdPath);
     if (cmd.length === 0) { continue; }
-    if (cmd === "STOP") { running = false; break; }
+    if (cmd === "STOP") {
+        running = false;
+        // Halt before breaking out: disconnect() has to remove DSS's debug state (the
+        // breakpoint opcodes it patched into program memory), and that step fails while
+        // the core is free-running. Measured 2026-11-15: after such a stop the NEXT load
+        // failed with "Failed to remove the debug state from the target before
+        // disconnecting ... reset the emulator before you connect".
+        try { session.target.halt(); } catch (eStop) { print("DSS: halt before stop failed: " + eStop); }
+        sleepMs(150);
+        break;
+    }
 
     var out = [];
     var halted = session.target.isHalted();
@@ -516,6 +537,22 @@ $state = [ordered]@{
 # moves (kept in readout\, outside .service, -Stop never resets it)
 $rec = Add-LoadRecord -ProjectPath $ProjectPath -Mode $runSpec.mode -Out $OutFile -Sha256 $outSha
 $state.loadIndex = $rec.count
+
+# Remember the firmware's own identity while we still hold the lock and the session is
+# freshly started. Later reads compare against this, so "is the board running the image
+# this session loaded" becomes an automatic check instead of a parameter the caller has
+# to remember. A build without gFwId simply records an empty value.
+$fwIdSeen = ''
+try {
+    $fwLines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('gFwId')
+    foreach ($line in $fwLines) {
+        $m = [regex]::Match([string]$line, '^V\s+gFwId\s+(\S+)\s*$')
+        if ($m.Success) { $fwIdSeen = $m.Groups[1].Value; break }
+    }
+} catch { }
+if ($fwIdSeen) { $state.fwId = $fwIdSeen; Info2 ('IMAGE   : gFwId = {0} (recorded; later reads compare against it)' -f $fwIdSeen) }
+else { $state.fwId = ''; Info2 'IMAGE   : no gFwId in this build - identity cannot be re-checked later (add "volatile unsigned long gFwId" to enable it)' }
+
 [IO.File]::WriteAllText($stateFile, ($state | ConvertTo-Json), (New-Object Text.UTF8Encoding($true)))
 Exit-TargetLock -ProjectPath $ProjectPath
 

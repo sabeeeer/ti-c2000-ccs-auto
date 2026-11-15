@@ -199,45 +199,88 @@ if ($spec.mode -eq 'ReadOnly') {
     try {
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
-        # Where is the core executing? Report RAM or Flash; do not refuse either.
-        # Debugging in Flash is a legitimate mode, so the failure that must be prevented
-        # is not "it is in Flash" but "Flash values were handed over without saying so".
-        # The region names come from the project's own .map, never from a device table,
-        # so a part whose Flash starts at 0x300000 answers correctly too.
+        # ---- PREFLIGHT: report the state of the target BEFORE reading anything --------
+        # Reading first and reporting afterwards is the pattern that produced the original
+        # bug (ADC values from an old project, discovered only when they made no sense).
+        # Every fact below is gathered first; a hard failure stops here, with no CSV and no
+        # verdict written, so nothing can be mistaken for a reading.
+        $blocking = New-Object System.Collections.Generic.List[string]
+        $cnt = Get-LoadCount -ProjectPath $ProjectPath
+
+        # 1. RAM or Flash (region names from this project's .map)
         $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile
-        switch ($loc.code) {
-            'TARGET_NOT_CONNECTED' {
-                Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
-                Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
-                Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
-                exit 4
-            }
-            'LOCATION_UNKNOWN' {
-                # no .map: say so instead of guessing. The identity/rate checks below can
-                # still prove the build, they just cannot name the region.
-                Info2 ('JUDGE   : location unknown - ' + $loc.text)
-                Info2 'JUDGE   : build the project once so a .map exists, or pass -MapFile, to get RAM/Flash reporting'
-            }
-            default {
-                Info2 ('RUNNING : {0}   (PC = {1}, region {2})' -f $loc.kind, $loc.pc, $loc.region)
-                if ($loc.kind -eq 'FLASH') {
-                    Out2 'WARN    : the core is executing from FLASH, not from the image this session loaded into RAM'
-                    Out2 'WARN    : if you did not flash this build yourself, these values belong to whatever firmware was last flashed'
-                    Out2 'HINT    : pass -ExpectFwId so the firmware itself confirms which build is running, or -RequireRam to refuse Flash outright'
-                } elseif ($loc.kind -eq 'OTHER') {
-                    Out2 'WARN    : the program counter is outside RAM and Flash - the core may have run away'
-                }
-                if ($RequireRam -and $loc.kind -ne 'RAM') {
-                    Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
-                    Out2 ('REASON: -RequireRam was given, but the core is executing from {0} ({1})' -f $loc.kind, $loc.region)
-                    Out2 'HINT    : start the session again with -Start -ConfirmLoad to run the RAM image, or drop -RequireRam'
-                    exit 4
-                }
-            }
+        if ($loc.code -eq 'TARGET_NOT_CONNECTED') {
+            Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
+            Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
+            Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
+            Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
+            exit 4
         }
+
+        # 2. firmware identity: compare with what -Start recorded, automatically
+        $fwNow = ''
+        $fwLine = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @($FwIdVar)
+        foreach ($line in $fwLine) {
+            $m = [regex]::Match([string]$line, ('^V\s+' + [regex]::Escape($FwIdVar) + '\s+(\S+)\s*$'))
+            if ($m.Success) { $fwNow = $m.Groups[1].Value; break }
+        }
+        $fwExpect = if ($null -ne $ExpectFwId) { [string]$ExpectFwId } else { [string]$s.state.fwId }
+
+        # 3. is it running right now
+        $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates @($RateVar, 'gMsTick', 'usMainLoop', 'gRunMs')
+
+        Info2 'PREFLIGHT: 读之前必须确认的事'
+        Info2 ('  LOCATION : {0}' -f $(if ($loc.code -eq 'LOCATION_UNKNOWN') { 'UNKNOWN - ' + $loc.text } else { '{0} (PC = {1}, region {2})' -f $loc.kind, $loc.pc, $loc.region }))
+        Info2 ('  BUILD    : {0}   sha256 {1}' -f $OutFile, $curSha.Substring(0, 16))
+        Info2 ('  LOADS    : #{0} total for this project; this session is load #{1} (started {2})' -f $cnt.count, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }), $s.state.started)
+        if ($fwNow) {
+            $same = (-not $fwExpect) -or ($fwNow -eq $fwExpect)
+            Info2 ('  IMAGE    : {0} = {1} {2}' -f $FwIdVar, $fwNow, $(if (-not $fwExpect) { '(no recorded value to compare - pass -ExpectFwId)' } elseif ($same) { '(same build as this session loaded)' } else { ('!= recorded ' + $fwExpect + ' - ANOTHER BUILD') }))
+            if (-not $same) { $blocking.Add(('the firmware answers {0} = {1}, but this session loaded a build that declared {2}' -f $FwIdVar, $fwNow, $fwExpect)) }
+        } else {
+            Info2 ('  IMAGE    : {0} not readable - the running firmware does not declare it, so build identity rests on sha256 only' -f $FwIdVar)
+            if ($null -ne $ExpectFwId) { $blocking.Add(('{0} could not be read, so -ExpectFwId cannot be satisfied' -f $FwIdVar)) }
+        }
+        Info2 ('  ALIVE    : {0}' -f $(if ($alive.ok) { '{0} {1} -> {2}, {3}' -f $alive.name, $alive.first, $alive.last, $alive.reason } else { 'NOT RUNNING - ' + $alive.reason }))
+        if (-not $alive.ok) { $blocking.Add('the program is not advancing, so any values read now describe a stopped or missing program') }
+
+        if ($loc.kind -eq 'FLASH') {
+            Info2 '  WARN     : the core is executing from FLASH, not from the image this session loaded into RAM'
+            Info2 '  WARN     : if you did not flash this build yourself, these values belong to whatever firmware was last flashed'
+        } elseif ($loc.kind -eq 'OTHER') {
+            Info2 '  WARN     : the program counter is outside RAM and Flash - the core may have run away'
+        }
+        if ($RequireRam -and $loc.kind -ne 'RAM') {
+            $blocking.Add(('-RequireRam was given, but the core is executing from {0}' -f $loc.kind))
+        }
+
+        if ($blocking.Count -gt 0) {
+            # a refusal must not leave the previous run's data or its "result: OK" behind
+            $dDir = Join-Path $ProjectPath 'readout\data'
+            $cDir = Join-Path $ProjectPath 'readout\check'
+            foreach ($n in @('data.csv', 'array.csv', 'variables.csv')) {
+                $p = Join-Path $dDir $n
+                if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+            }
+            if (Test-Path -LiteralPath $cDir) {
+                $v = @('result: FAIL', 'failure: PREFLIGHT_FAILED',
+                    ('mode: ' + $spec.mode),
+                    ('out: ' + $OutFile), ('out_sha256: ' + $curSha),
+                    ('location: ' + $loc.kind + ' ' + $loc.pc),
+                    ('image: ' + $(if ($fwNow) { $FwIdVar + '=' + $fwNow } else { 'not declared' })),
+                    ('reason: ' + ($blocking -join '; ')),
+                    ('at: ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
+                [IO.File]::WriteAllLines((Join-Path $cDir 'verdict.txt'), $v, (New-Object Text.UTF8Encoding($true)))
+            }
+            Out2 'FAILURE: PREFLIGHT_FAILED'; Out2 'RESULT: FAIL'
+            foreach ($b in $blocking) { Out2 ('REASON: ' + $b) }
+            Out2 'HINT    : nothing was read; the previous data.csv and verdict.txt were cleared so no stale result survives'
+            exit 4
+        }
+        Info2 'PREFLIGHT: all conditions hold - reading'
+        Info2 ''
         if ($null -ne $ExpectFwId) {
-            Info2 ('JUDGE   : firmware identity will be checked: {0} must equal {1} (a memory read, no address assumption)' -f $FwIdVar, $ExpectFwId)
+            Info2 ('JUDGE   : firmware identity will be re-checked while sampling: {0} must equal {1}' -f $FwIdVar, $ExpectFwId)
         }
         if ($RateVar -and $ExpectedRatePerSec -gt 0) {
             Info2 ('JUDGE   : firmware rate will be checked: {0} ~ {1:N0}/s' -f $RateVar, $ExpectedRatePerSec)

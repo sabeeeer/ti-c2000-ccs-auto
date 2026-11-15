@@ -108,6 +108,7 @@ $env:PYTHONUTF8 = '1'
 | `ReadOnly` 但探针没被枚举（拔线/驱动没起来） | `NO_PROBE` exit 3 |
 | `ReadOnly` 且 `-RequireRam`，但核心在 Flash / 跑飞 | `NOT_RAM_IMAGE` exit 4 |
 | `ReadOnly` 但读不到 PC（链路断） | `TARGET_NOT_CONNECTED` exit 4（无开关可绕过） |
+| `ReadOnly` 读前门禁不通过（固件身份不符 / 计数器不动） | `PREFLIGHT_FAILED` exit 4，且清空旧数据与旧结论 |
 | `ReadOnly` 但找不到 `.map` | 不失败：`RUNNING : ?`，位置未知；补建一次或给 `-MapFile` |
 | `LoadRead` 无 `-ConfirmLoad`（含 `-Standalone`） | `LOAD_NOT_CONFIRMED` exit 4 |
 | 连续运行无 `-UserApproved` | `ITERATE_NOT_APPROVED` exit 4 |

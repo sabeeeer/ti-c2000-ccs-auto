@@ -428,6 +428,55 @@ function Assert-ProbeOnline {
 }
 
 <#
+Test-AliveNow -- is the program running RIGHT NOW, before any data is read?
+
+Reading first and judging liveness afterwards answers the wrong question: by then the
+values are already on disk and a failure only tells you to throw them away. This takes
+two samples of a counter the firmware increments, a known gap apart, and reports the
+movement. It must be called while holding the target lock (it talks over cmd/res).
+
+Returns @{ ok; name; first; last; gapMs; reason }
+#>
+function Test-AliveNow {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [string[]]$Candidates = @('gMsTick', 'usMainLoop', 'gRunMs'),
+        [int]$GapMs = 150
+    )
+    $r = [ordered]@{ ok = $false; name = ''; first = ''; last = ''; gapMs = $GapMs; reason = '' }
+
+    foreach ($c in $Candidates) {
+        if (-not $c) { continue }
+        $a = $null
+        $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @($c)
+        foreach ($line in $lines) {
+            $m = [regex]::Match([string]$line, ('^V\s+' + [regex]::Escape($c) + '\s+(\S+)\s*$'))
+            if ($m.Success) { $a = $m.Groups[1].Value; break }
+        }
+        if (-not $a) { continue }
+        Start-Sleep -Milliseconds $GapMs
+        $b = $null
+        $lines2 = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @($c)
+        foreach ($line in $lines2) {
+            $m = [regex]::Match([string]$line, ('^V\s+' + [regex]::Escape($c) + '\s+(\S+)\s*$'))
+            if ($m.Success) { $b = $m.Groups[1].Value; break }
+        }
+        if (-not $b) { continue }
+        $r.name = $c; $r.first = $a; $r.last = $b
+        $da = 0.0; $db = 0.0
+        if ([double]::TryParse([string]$a, [ref]$da) -and [double]::TryParse([string]$b, [ref]$db)) {
+            $r.ok = ($db -gt $da)
+            $r.reason = if ($r.ok) { ('advanced by {0:N0} in {1} ms' -f ($db - $da), $GapMs) }
+                        else { ('did not advance ({0} -> {1})' -f $a, $b) }
+            return $r
+        }
+        $r.reason = ('unreadable value ({0} -> {1})' -f $a, $b)
+        return $r
+    }
+    $r.reason = 'no readable counter among ' + ($Candidates -join ', ')
+    return $r
+}
+<#
 Get-ImageCodeRanges -- where does THIS .out put its code?
 
 The obvious criterion is "PC < 0x080000", but that hard-codes one family's memory map:

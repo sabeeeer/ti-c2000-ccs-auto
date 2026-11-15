@@ -21,6 +21,10 @@ $cases = 0
 
 function Say([string]$m) { Write-Host $m }
 function Run([string]$label, [string[]]$argv, [int]$wantCode, [string]$wantPattern) {
+    # a short gap between cases: this board's XDS100 drops the JTAG link when a dozen
+    # reads are issued back to back (observed three times on 2026-11-15), and a test that
+    # triggers the dropout measures the probe, not the skill
+    Start-Sleep -Milliseconds 400
     $out = @(& pwsh @argv 2>&1)
     $code = $LASTEXITCODE
     $text = (@($out | ForEach-Object { [string]$_ }) -join "`n")

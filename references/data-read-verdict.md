@@ -66,6 +66,33 @@ pwsh -NoProfile -File scripts/ti_c2000_run_read.ps1 -ProjectPath <工程> `
 
 **代价**：固件里必须真的存在这几个变量。没有就退回地址判据（`PC` + 段表），并在输出里说明用了哪种。
 
+## 0.6 读前门禁（PREFLIGHT）：先报告，再决定要不要读
+
+"读完再判"有个致命顺序问题：失败时数据已经落盘，而结论错误时只留下一句泛化的失败原因。所以每个读入口在**采样之前**先打印这份报告，硬性条件不满足就**不读**：
+
+```text
+PREFLIGHT: 读之前必须确认的事
+  LOCATION : RAM (PC = 0x00008870, region RAMLS1)
+  BUILD    : <out>   sha256 9F9EBDF603577961
+  LOADS    : #16 total for this project; this session is load #16 (started 19:49:16)
+  IMAGE    : gFwId = 65537 (same build as this session loaded)
+  ALIVE    : gMsTick 2748 -> 3033, advanced by 285 in 150 ms
+PREFLIGHT: all conditions hold - reading
+```
+
+| 行 | 数据来源 | 不满足时 |
+|---|---|---|
+| `LOCATION` | 读 `PC`，落在本工程 `.map` 的哪个 MEMORY 区（`RAMLS0` / `FLASHA`…） | 默认只 `WARN`（Flash 调试合法）；`-RequireRam` 时 `NOT_RAM_IMAGE` |
+| `BUILD` | `sha256(.out)` 与会话记录 | `STALE_SERVICE` |
+| `LOADS` | `load-count.json` 与 `state.loadIndex` | 仅报告 |
+| `IMAGE` | 固件声明的 `gFwId` 与 **`-Start` 时记录的值** 比对 | `PREFLIGHT_FAILED` |
+| `ALIVE` | 间隔 150 ms 读两次计数器，必须递增 | `PREFLIGHT_FAILED` |
+
+两点要求：
+
+- **身份比对是自动的**：`-Start` 成功后就读一次 `gFwId` 存进 `state.json`，读时直接比对，不需要调用方记得传 `-ExpectFwId`。没有该变量的旧固件只提示"身份仅靠 sha256"。
+- **拒绝必须清除旧结论**：`PREFLIGHT_FAILED` 时删掉 `data\*.csv` 并把 `check\verdict.txt` 改写成 `result: FAIL`，否则上一次的 `result: OK` 会被误用。
+
 ## 1. 四级判据
 
 ### 判据 1：固件身份（静态）
