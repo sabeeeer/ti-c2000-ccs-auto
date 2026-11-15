@@ -28,10 +28,10 @@
     "why": "Increasing only says the counter moved once. The rate says it moves at the frequency the firmware claims, which separates a live program from a value that happens to change."
   },
   "frozenBuffer": {
-    "array": "gBuf",
-    "flag": "gBufFull",
+    "array": "gDmaFrameA",
+    "flag": "gDmaReady",
     "flagValue": "1",
-    "seq": "gBufSeq",
+    "seq": "gDmaSeq",
     "why": "A DMA buffer is only consistent if the firmware freezes it first. flagValue is what the flag reads WHEN frozen (1 and 'true' are the same statement in C; readers normalise).",
     "note": "Optional: a build with no frozen buffer passes -FrozenValue \"\" to require only that the flag does not change, and -Mode LoadRead may skip it entirely."
   }

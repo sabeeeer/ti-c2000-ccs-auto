@@ -28,9 +28,9 @@ param(
     [string]$ArrayName = '',
     [int]$Rows = 1,
     [int]$Columns = 1,
-    [string]$FrozenFlag = 'gBufFull',
+    [string]$FrozenFlag = 'gDmaReady',
     [string]$FrozenValue = 'true',
-    [string]$SeqVar = 'gBufSeq',
+    [string]$SeqVar = 'gDmaSeq',
     [string]$HeartbeatExpr = 'gMsTick,gRunMs,usMainLoop',
     # ---- firmware self-proof: the portable way to ask "is this image running?" ----
     # A number the firmware owns (gFwId) plus the rate of a counter it increments.
