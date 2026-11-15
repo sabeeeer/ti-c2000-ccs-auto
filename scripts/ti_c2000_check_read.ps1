@@ -121,27 +121,53 @@ if ($singleRow) {
 }
 
 $ok = $true
+# The failure taxonomy of references/data-read-verdict.md, in priority order. The doc
+# promises these codes, so they must actually be produced: an AI that reads
+# "| startup window | ... | STALE_PROGRAM |" looks for that word, and a bare
+# "RESULT: FAIL" leaves it guessing which of the three checks broke.
+$failCode = ''
+function Set-Fail([string]$code) {
+    if (-not $script:failCode) { $script:failCode = $code }
+    $script:ok = $false
+}
+$hbCandidates = 0
+$hbAdvanced = 0
 foreach ($c in $(if ($hbSkipped) { @() } else { $selected })) {
     $nums = @(ColumnNumbers $c)
+    $hbCandidates++
     if ($CheckStartupWindow -and $c -match 'Tick|RunMs' -and $nums[0] -gt $StartupMaxMs) {
-        $ok = $false
+        Set-Fail 'STALE_PROGRAM'
         Out2 ("CHECK {0}: first value {1} > {2} - looks like an old program, not this load" -f $c, $nums[0], $StartupMaxMs)
     }
     $badRun = 0
+    $candOk = $true
     for ($i = 1; $i -lt $nums.Count; $i++) {
         if ($nums[$i] -gt $nums[$i - 1]) { $badRun = 0; continue }
         $badRun++
         Out2 ("CHECK {0}: row {1} not increasing ({2} -> {3})" -f $c, ($i + 1), $nums[$i - 1], $nums[$i])
-        if ($badRun -ge 2 -or $nums.Count -eq 2) { $ok = $false }
+        if ($badRun -ge 2 -or $nums.Count -eq 2) { $candOk = $false }
     }
+    if ($candOk) { $hbAdvanced++ }
     Out2 ("CHECK {0}: {1} -> {2}  delta = {3}" -f $c, $nums[0], $nums[-1], ($nums[-1] - $nums[0]))
 }
 if ($hbSkipped) {
     # already reported SKIPPED
-} elseif (-not $ok) {
-    Out2 'HEARTBEAT: FAIL'
-} else {
+} elseif ($hbAdvanced -gt 0) {
+    # "at least one candidate advanced" is the criterion of data-read-verdict.md 判据 2
+    # and matches the live reader, which also needs only one. A readable-but-frozen
+    # candidate stays visible above as "row N not increasing" without failing the run:
+    # with several counters, one frozen only proves that counter stopped being updated.
     Out2 'HEARTBEAT: OK'
+    if ($hbCandidates -gt 1) { Out2 ("CHECK HB : {0}/{1} candidates advanced (any one proves liveness)" -f $hbAdvanced, $hbCandidates) }
+} else {
+    Out2 'HEARTBEAT: FAIL'
+    Set-Fail 'HEARTBEAT_FAIL'
+}
+# A stale image is a different fault from a frozen counter, and the two must not read as
+# one: here the counter IS advancing, the problem is that it was already running before
+# this load (data-read-verdict.md 判据 2, startup window).
+if ($failCode -eq 'STALE_PROGRAM' -and $hbAdvanced -gt 0) {
+    Out2 'CHECK   : the counter advances, but it was already past the startup window - this is not the image that was just loaded'
 }
 
 # value range (level 4): only the columns named by -RangeVars (counters such as
@@ -180,7 +206,7 @@ if ($null -ne $ValueMin -or $null -ne $ValueMax -or $RangeVars.Count -gt 0) {
             Out2 ("RANGE {0}: max {1} > {2}" -f $col, $hi, $ValueMax)
         }
     }
-    if (-not $rangeOk) { Out2 'RANGE: FAIL'; $ok = $false }
+    if (-not $rangeOk) { Out2 'RANGE: FAIL'; Set-Fail 'VALUE_OUT_OF_RANGE' }
     elseif ($null -eq $ValueMin -and $null -eq $ValueMax) { Out2 'NUMERIC: OK'; Out2 'RANGE: SKIPPED (no bounds)' }
     else { Out2 'RANGE: OK' }
 } else {
@@ -188,6 +214,10 @@ if ($null -ne $ValueMin -or $null -ne $ValueMax -or $RangeVars.Count -gt 0) {
 }
 
 Info2 ("ROWS    : {0}" -f $rows.Count)
-if (-not $ok) { Out2 'RESULT: FAIL'; exit 1 }
+if (-not $ok) {
+    if ($failCode) { Out2 ('FAILURE: ' + $failCode) }
+    Out2 'RESULT: FAIL'
+    exit 1
+}
 Out2 'RESULT: OK'
 exit 0

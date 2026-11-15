@@ -62,6 +62,9 @@ param(
     [string]$RunMode = 'SingleStep',
     [switch]$UserApproved,
     [int]$StartTimeoutSec = 90,
+    # -Status only: also ask Windows whether a JTAG probe is still enumerated. The session
+    # process can outlive the USB link, and then "RUNNING" is true but useless.
+    [switch]$CheckProbe,
     [switch]$Quiet
 )
 
@@ -140,6 +143,21 @@ if ($Status) {
         $idx = $st.loadIndex
         if (-not $idx -and $st.outSha256 -and $st.outSha256 -eq $cnt.lastSha256) { $idx = $cnt.count }
         Out2 ('SERVICE : RUNNING (pid {0}, since {1})' -f $st.pid, $st.started)
+        if ($CheckProbe) {
+            # the process survives an unplugged probe, so "RUNNING" alone cannot answer
+            # "can I still read?" - enumerate the hardware and say so (measured 2026-11-15:
+            # pid alive, XDS100 gone, every read refused with NO_PROBE)
+            $pa = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'ti_c2000_debug.ps1'),
+                '-ProjectPath', $ProjectPath, '-ProbeCheckOnly')
+            if ($CcsRoot) { $pa += @('-CcsRoot', $CcsRoot) }
+            $po = @(& $pwshExe @pa 2>&1)
+            if ($LASTEXITCODE -eq 0) {
+                foreach ($l in $po) { if ([string]$l -match '^PROBE') { Out2 ([string]$l) } }
+            } else {
+                Out2 'PROBE   : NOT FOUND - Windows enumerates no JTAG probe; the session process is alive but cannot reach the target'
+                Out2 'HINT    : check the USB cable / board power, then run -Stop and start the session again'
+            }
+        }
         $rm = if ($st.runMode) { [string]$st.runMode } else { 'SingleStep' }
         # runMode=Iterate in the state file only means "a loop put this image here"; whether
         # a loop is running NOW is the marker's job (see Get-RunModeInfo)

@@ -36,6 +36,11 @@ param(
     [string]$CcsRoot = '',
     [string]$CorePattern = '.*C28xx(?:_CPU1)?$',
     [string]$HeartbeatExpr = 'gMsTick,gRunMs,usMainLoop',
+    # optional value range for the read-back variables (判据 4). Pass both to enable it;
+    # counters such as gMsTick must not be mixed into an ADC range, so name the columns
+    # you actually want bounded with -Variables and keep the counters to the heartbeat.
+    [Nullable[double]]$ValueMin = $null,
+    [Nullable[double]]$ValueMax = $null,
     [int]$StartupMaxMs = 10000,
     # default: 5 s total, 0.5 s interval -> 10 rounds
     [int]$Rounds = 10,
@@ -199,6 +204,10 @@ if ($spec.mode -eq 'ReadOnly') {
         $largs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'ti_c2000_live_read.ps1'),
             '-ProjectPath', $ProjectPath, '-Variables', ($names -join ','),
             '-Rounds', [string]$Rounds, '-IntervalMs', [string]$IntervalMs, '-HeartbeatExpr', $HeartbeatExpr)
+        # range verdict (data-read-verdict.md 判据 4) belongs at read time: without it the
+        # caller would have to read, then run check_read by hand on the CSV
+        if ($PSBoundParameters.ContainsKey('ValueMin')) { $largs += @('-ValueMin', [string]$ValueMin) }
+        if ($PSBoundParameters.ContainsKey('ValueMax')) { $largs += @('-ValueMax', [string]$ValueMax) }
         if ($NoHeartbeat) { $largs += '-NoHeartbeat' }
         if ($Quiet) { $largs += '-Quiet' }
         & $pwshExe @largs

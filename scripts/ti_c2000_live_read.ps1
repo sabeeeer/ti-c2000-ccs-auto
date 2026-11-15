@@ -372,8 +372,15 @@ if ($ValueMin -ne [int]::MinValue) { $vargs += @('-ValueMin', [string]$ValueMin)
 if ($ValueMax -ne [int]::MaxValue) { $vargs += @('-ValueMax', [string]$ValueMax) }
 $vout = & $pwshExe @vargs 2>&1
 $vcode = $LASTEXITCODE
-# HEARTBEAT was already reported above; do not let the verdict repeat it
-foreach ($l in $vout) { if ([string]$l -notmatch '^(RESULT|HEARTBEAT):') { Out2 ([string]$l) } }
+# HEARTBEAT was already reported above; do not let the verdict repeat it. The verdict's
+# own FAILURE line becomes CHECK so this script keeps the single FAILURE: VERDICT_FAILED
+# that its caller expects (one failure line per invocation).
+foreach ($l in $vout) {
+    $s = [string]$l
+    if ($s -match '^(RESULT|HEARTBEAT):') { continue }
+    if ($s -match '^FAILURE:\s*(.+)$') { Out2 ('CHECK   : ' + $Matches[1]); continue }
+    Out2 $s
+}
 
 $verdictResult = if ($vcode -eq 0 -and $hbOk) { 'OK' } else { 'FAIL' }
 $verdict = @(

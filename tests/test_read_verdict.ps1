@@ -46,6 +46,30 @@ try {
     if ($LASTEXITCODE -eq 0 -or -not @($invalidNoBounds | Where-Object { $_ -eq 'RANGE: FAIL' }).Count) { throw 'non-numeric array data passed without bounds' }
     $singleNoHeartbeat = @(& pwsh -NoProfile -File $checker -CsvPath (Join-Path $fixture 'single.csv') -AllowNoHeartbeat -HeartbeatVars gMsTick 2>&1)
     if ($LASTEXITCODE -ne 0 -or -not @($singleNoHeartbeat | Where-Object { $_ -match '^HEARTBEAT: SKIPPED' }).Count -or @($singleNoHeartbeat | Where-Object { $_ -eq 'HEARTBEAT: OK' }).Count) { throw 'single-row liveness was reported as OK' }
+    # ---- the failure taxonomy of data-read-verdict.md must actually be produced ----
+    # An AI follows the doc's table, so a bare "RESULT: FAIL" would leave it guessing
+    # which of the three checks broke.
+    $stale = @(& pwsh -NoProfile -File $checker -CsvPath $existingPath -HeartbeatVars gMsTick -CheckStartupWindow -StartupMaxMs 5000 2>&1)
+    if ($LASTEXITCODE -eq 0 -or -not @($stale | Where-Object { $_ -eq 'FAILURE: STALE_PROGRAM' }).Count) {
+        throw "startup-window failure must report FAILURE: STALE_PROGRAM; got $($stale -join '; ')"
+    }
+    $outOfRange = @(& pwsh -NoProfile -File $checker -CsvPath $existingPath -HeartbeatVars gMsTick -RangeVars gMsTick -ValueMin 0 -ValueMax 100 2>&1)
+    if ($LASTEXITCODE -eq 0 -or -not @($outOfRange | Where-Object { $_ -eq 'FAILURE: VALUE_OUT_OF_RANGE' }).Count) {
+        throw "range failure must report FAILURE: VALUE_OUT_OF_RANGE; got $($outOfRange -join '; ')"
+    }
+    $stalledOut = @(& pwsh -NoProfile -File $checker -CsvPath (Join-Path $fixture 'stalled.csv') -HeartbeatVars gMsTick 2>&1)
+    if (-not @($stalledOut | Where-Object { $_ -eq 'FAILURE: HEARTBEAT_FAIL' }).Count) {
+        throw "a frozen counter must report FAILURE: HEARTBEAT_FAIL; got $($stalledOut -join '; ')"
+    }
+
+    # ---- liveness needs only ONE advancing candidate (matches the live reader) ----
+    $mixed = Join-Path $fixture 'mixed-candidates.csv'
+    [IO.File]::WriteAllText($mixed, "gMsTick,frozenFlag`n100,0`n200,0`n300,0`n")
+    $mixedOut = @(& pwsh -NoProfile -File $checker -CsvPath $mixed -HeartbeatVars 'gMsTick,frozenFlag' 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not @($mixedOut | Where-Object { $_ -eq 'HEARTBEAT: OK' }).Count) {
+        throw "one advancing candidate must prove liveness even if another is frozen; got $($mixedOut -join '; ')"
+    }
+
     Write-Output 'PASS: stalled/missing/single-row heartbeats fail; existing firmware and frozen arrays use separate criteria'
     Write-Output 'RESULT: OK'
     exit 0
