@@ -47,17 +47,20 @@ try {
 
     # --- 3. RAM proof is fail-closed -------------------------------------------
     $lib = Join-Path $scripts 'ti_c2000_readmode.ps1'
+    # PC decides both questions at once: an unreadable PC means the link is gone, and
+    # that is an environment fault, not an unverified image - so -AllowUnverified must
+    # NOT pass it (measured 2026-11-15: symbol lookup still worked with the link down).
     $ramOut = @(& pwsh -NoProfile -Command @"
 . '$lib'
 `$r = Test-RamImageEvidence -ProjectPath '$empty'
 'ok=' + `$r.ok + ' verified=' + `$r.verified + ' code=' + `$r.code + ' text=' + `$r.text
 `$r2 = Test-RamImageEvidence -ProjectPath '$empty' -AllowUnverified
-'allow ok=' + `$r2.ok + ' verified=' + `$r2.verified
+'allow ok=' + `$r2.ok + ' code=' + `$r2.code
 "@ 2>&1) | ForEach-Object { [string]$_ }
     $ramText = ($ramOut -join "`n")
-    if ($ramText -notmatch 'ok=False verified=False') { throw "RAM unverified must refuse`n$ramText" }
-    if ($ramText -notmatch 'allow ok=True') { throw "-AllowUnverified must pass`n$ramText" }
-    if ($ramText -notmatch 'UNVERIFIED') { throw "the refusal must name the reason`n$ramText" }
+    if ($ramText -notmatch 'ok=False verified=False code=TARGET_NOT_CONNECTED') { throw "a dead link must be named as such`n$ramText" }
+    if ($ramText -notmatch 'allow ok=False code=TARGET_NOT_CONNECTED') { throw "-AllowUnverified must not excuse an unplugged board`n$ramText" }
+    if ($ramText -notmatch 'NOT connected') { throw "the refusal must name the reason`n$ramText" }
 
     # --- 4. probe gate: a probe-less target is NO_PROBE / exit 3 ---------------
     $fake = Join-Path $fixture 'no_probe.ps1'
@@ -69,17 +72,17 @@ try {
     if ($g.text -match 'FAILURE: NO_PROBE[\s\S]*FAILURE: NO_PROBE') { throw "the gate must report NO_PROBE exactly once`n$($g.text)" }
     if ($g.text -match 'WRONG') { throw "the gate continued past a missing probe`n$($g.text)" }
 
-    # --- 5. target-connection gate: environment faults have no switch -----------
-    # Symbol evaluation answers from the .out even with the link down, so a probe in the
-    # device list plus a live pid is not proof that the target responds (measured
-    # 2026-11-15). -AllowUnverified covers "the image may be another build", never
-    # "the board may be unplugged", so this gate exists as a separate exit.
-    $conn = Join-Path $fixture 'conn.ps1'
-    [IO.File]::WriteAllText($conn, ". '$lib'`nAssert-TargetConnected -ProjectPath '$empty'`n'CONTINUED (WRONG)'`n", (New-Object Text.UTF8Encoding($false)))
-    $c = Invoke-Script @('-NoProfile', '-File', $conn)
-    Expect 'target connection gate' $c 4 'FAILURE: TARGET_NOT_CONNECTED'
-    if ($c.text -match 'CONTINUED') { throw "the gate continued past a dead link`n$($c.text)" }
-    if ($c.text -notmatch 'AllowUnverified does not apply') { throw "the gate must say why no switch helps`n$($c.text)" }
+    # --- 5. the read entry refuses a dead link with exit 4, no switch ----------
+    $connProj = Join-Path $fixture 'dead-link'
+    New-Item -ItemType Directory -Force -Path $connProj, (Join-Path $connProj 'targetConfigs') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $connProj '.cproject'), '<project/>', (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $connProj 'targetConfigs/x.ccxml'), '<configurations/>', (New-Object Text.UTF8Encoding($false)))
+    $c = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_run_read.ps1'),
+        '-ProjectPath', $connProj, '-Variables', 'gMsTick', '-Mode', 'ReadOnly', '-NoProbeCheck')
+    # no session here, so NO_SESSION comes first; what matters is that it never reads and
+    # never reports a RAM image
+    if ($c.code -ne 4) { throw "a project with no session must exit 4, got $($c.code)`n$($c.text)" }
+    if ($c.text -match 'RESULT: OK') { throw "a project with no session reported OK`n$($c.text)" }
 
     'RESULT: OK'
     exit 0

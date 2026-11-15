@@ -38,7 +38,7 @@ REASON: ... Could not read 0x0000AC48@Data: target is not connected
 - 已排除：程序跑飞（`gMsTick` 之前正常递增）；`.out` 被改（sha256 未变）；会话进程崩溃（pid 在）；探针被拔（PnP 仍在）。
 - 根因（已证实）：**DSS 与目标之间的 JTAG 链路断开，而 DSS server 进程和 PnP 枚举都还在**。断开后 `target.connect()` 不会被旧会话自动重做。
 - 修复/绕过：`-Stop` 然后 `-Start -ConfirmLoad`（换一个 LOAD 号）。旧会话不能自愈。
-- 判据改动（2026-11-15）：新增第 ④ 道证明 `Assert-TargetConnected`——读 `PC`（寄存器，必须连接才应答），失败即 `FAILURE: TARGET_NOT_CONNECTED`（exit 4）。**这道门禁没有开关**：`-AllowUnverified` 的语义是"镜像可能是别的版本"，不是"板子可能没插"。
+- 判据改动（2026-11-15）：第 ④ 道证明改为**直接读 `PC`**（寄存器，必须连接才应答），一次读取同时给出"链路是否活着"和"是否在 RAM 执行"：`PC` 读不到 → `TARGET_NOT_CONNECTED`（exit 4，**无开关**，`-AllowUnverified` 的语义只是"镜像可能是别的版本"）；`PC` ≥ 0x080000 → `NOT_RAM_IMAGE`。原来的 `main` 符号判据降级为交叉核对并打印在括号里，**因为它断线也算成功**。
 - `service -Status` 现在默认枚举探针（`-NoProbeCheck` 可跳过），避免"RUNNING 却是死的"。
 
 ## 回归方式

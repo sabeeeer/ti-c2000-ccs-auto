@@ -427,86 +427,69 @@ function Assert-ProbeOnline {
     exit 2
 }
 
-<#
-Assert-TargetConnected -- proof 0, and the only proof with no bypass switch.
-
-Symbol evaluation is answered from the .out symbol table and keeps working with the JTAG
-link down, so "running from RAM: main = 0x00008A8D" can be printed for a target that
-answers nothing at all. Measured 2026-11-15: probe re-enumerated, session process alive,
-sha256 matched, the RAM proof reported success, and every byte read then failed with
-"target is not connected". PC is a register read: it only answers while the link is alive.
-
--AllowUnverified means "the image may be a different build and I accept that"; it must not
-also mean "the board may be unplugged", so this gate exits on its own.
-#>
-function Assert-TargetConnected {
-    param(
-        [Parameter(Mandatory)][string]$ProjectPath,
-        [switch]$Quiet
-    )
-    $pc = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC')
-    if ($pc -and @($pc | Where-Object { [string]$_ -match '^V\s+PC\s+\S' }).Count) { return }
-    Write-Output 'FAILURE: TARGET_NOT_CONNECTED'
-    Write-Output 'RESULT: FAIL'
-    Write-Output 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone (unplugged, power-cycled, or the connection died)'
-    Write-Output 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
-    Write-Output 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
-    exit 4
-}
-
-<#
-Test-RamImageEvidence -- the "is it RAM" criterion of ReadOnly mode. Program counters
-and code live below Flash on C28x when the image was loaded into RAM by the debugger,
-so the address of the entry symbols decides it. Unreadable symbols are NOT a pass:
-"probably RAM" is exactly how a stale Flash image ends up reported as fresh data.
--AllowUnverified is the only way through, and it says so in the log.
-
-The expression is the bare symbol name, not "&main": measured on F28379D + CCS 12.8,
-`&main` fails with "cannot take address of rvalue" while `main` evaluates to the
-function address (0x8A8D in the run below). `code_start` returns 0 on some builds and
-is skipped, so it can never decide the verdict by itself.
-#>
 function Test-RamImageEvidence {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
         [switch]$AllowUnverified
     )
 
-    $r = [ordered]@{ ok = $false; verified = $false; symbol = ''; address = ''; text = ''; code = '' }
+    $r = [ordered]@{ ok = $false; verified = $false; pc = ''; symbol = ''; address = ''; text = ''; code = '' }
 
-    $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('main', '_main', '_c_int00', 'code_start')
+    # one round trip: the register (needs a live link) and the symbol (does not)
+    $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC', 'main', '_main', '_c_int00')
     if (-not $lines) {
-        $r.text = 'RAM image UNVERIFIED (the session did not answer - probe offline or target halted)'
-        if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
-        return $r
+        $r.code = 'TARGET_NOT_CONNECTED'
+        $r.text = 'target NOT connected (the session did not answer) - the process may be alive but the JTAG link is gone'
+        return $r   # no -AllowUnverified here: an unplugged board is not an unverified image
     }
+
+    $pcValue = $null
+    $symbolAddr = $null
+    $symbolName = ''
+    $pcFailed = $false
     foreach ($line in $lines) {
-        # &name and name both accepted: older builds answer "V &main 0x...", CCS 12.8
-        # answers "V main 35469"; either way the value is the entry address
-        $m = [regex]::Match([string]$line, '^V\s+&?(\w+)\s+(\S+)\s*$')
+        $s = [string]$line
+        if ($s -match '^E\s+PC\b') { $pcFailed = $true; continue }
+        $m = [regex]::Match($s, '^V\s+&?(\w+)\s+(\S+)\s*$')
         if (-not $m.Success) { continue }
+        $name = $m.Groups[1].Value
         $raw = $m.Groups[2].Value
         $addr = [int64]0
         $parsed = $false
         if ($raw -match '^0[xX]([0-9A-Fa-f]+)$') { $addr = [Convert]::ToInt64($Matches[1], 16); $parsed = $true }
         elseif ($raw -match '^(-?\d+)$') { $addr = [int64]$Matches[1]; $parsed = $true }
-        if (-not $parsed -or $addr -le 0) { continue }
-        $r.verified = $true
-        $r.symbol = $m.Groups[1].Value
-        $r.address = ('0x{0:X8}' -f $addr)
-        if ($addr -lt $script:C28xFlashBase) {
-            $r.ok = $true
-            $r.text = ('running from RAM: {0} = {1} < 0x080000' -f $r.symbol, $r.address)
-        } else {
-            $r.ok = $false
-            $r.text = ('NOT ours in RAM: {0} = {1} is in Flash (>= 0x080000)' -f $r.symbol, $r.address)
-        }
+        if (-not $parsed) { continue }
+        if ($name -eq 'PC') { $pcValue = $addr }
+        elseif (-not $symbolName -and $addr -gt 0) { $symbolName = $name; $symbolAddr = $addr }
+    }
+
+    if ($null -eq $pcValue) {
+        $r.code = 'TARGET_NOT_CONNECTED'
+        $r.text = $(if ($pcFailed) {
+                'target NOT connected (PC read failed) - the process may be alive but the JTAG link is gone'
+            } else {
+                'target NOT connected (PC returned no value) - the JTAG link is gone'
+            })
+        return $r   # again: no bypass, the board is not there
+    }
+
+    $r.verified = $true
+    $r.pc = ('0x{0:X8}' -f $pcValue)
+    if ($symbolName) { $r.symbol = $symbolName; $r.address = ('0x{0:X8}' -f $symbolAddr) }
+    $symText = if ($symbolName) { (' (entry {0} = {1})' -f $symbolName, $r.address) } else { '' }
+
+    if ($pcValue -lt $script:C28xFlashBase) {
+        $r.ok = $true
+        $r.text = ('running from RAM: PC = {0} < 0x080000{1}' -f $r.pc, $symText)
         return $r
     }
-    $r.text = 'RAM image UNVERIFIED (no entry symbol readable: main / _c_int00)'
+
+    $r.ok = $false
+    $r.text = ('PC = {0} is in Flash (>= 0x080000) - the core is not executing our RAM image{1}' -f $r.pc, $symText)
     if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
     return $r
 }
+
 
 <#
 Invoke-LoadReadLoop -- -MaxLoads N of LoadRead: re-run this same reader once per

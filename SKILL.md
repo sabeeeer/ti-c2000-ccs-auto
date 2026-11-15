@@ -53,7 +53,7 @@ Get-ChildItem tests\test_*.ps1 | Sort-Object Name | ForEach-Object { pwsh -NoPro
 | `test_state_chaos` | 19 个脏状态：死 pid 的锁/标记必须可接管、活 pid 的锁必须挡住、坏 JSON 的状态必须判"无会话"、坏计数不能崩 | 崩溃、断电、上次强杀都会留下这种状态，绝不能被当成"一切正常" |
 | `test_skill_identity` | 身份行、`skill-runs.jsonl` 记录、副本存在时写路径 `PROJECT_NOT_CLEAN` 拒绝/读路径仅警告 | "走了 skill"必须可证 |
 | `test_project_entry` | 工程入口文档齐全、无脚本副本、文档没指向已删脚本 | 换工具后的第一道闸 |
-| `test_e2e_readonly` | 真机 10 例只读场景 + 下载计数不得 +1；**无探针时自动 SKIP** | 夹具测不到的探针/会话/五道证明组合 |
+| `test_e2e_readonly` | 真机 10 例只读场景 + 下载计数不得 +1；**无探针时自动 SKIP** | 夹具测不到的探针/会话/四道证明组合 |
 | 其余（模式、判据、契约、生成器） | 运行模式互锁、读判据、DSS 生成、序列号探针 | 回归防线 |
 
 **判定标准**：15 个测试两轮全绿 + `PARSE_ERRORS=0` + 可迁移性门禁 0 拦截，才算这个 skill 可用。
@@ -92,7 +92,7 @@ $env:PYTHONUTF8 = '1'
 
 | 读模式 | 何时使用 | 入口 |
 |---|---|---|
-| **`-Mode ReadOnly`（默认）** | 日常读。会话已在跑，只想看当前程序。 | `scripts/ti_c2000_run_read.ps1 -Variables gMsTick,gState`（慢变量）/ `scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName gBuf -Rows 256 -Columns 1`（DMA 冻结窗口）。**绝不下载**：读之前要过五道证明「① 仿真器被 Windows 枚举在线 ② 会话进程活着 ③ `sha256(out)` 与本次构建一致 ④ 目标真的在应答（`PC` 可读——**符号表求值在 JTAG 断开时照样成功**，不能当作连接证据；`TARGET_NOT_CONNECTED` 是环境故障，**没有开关可绕过**，`-AllowUnverified` 也不放过） ⑤ 入口符号 `main`/`_c_int00` 地址 < 0x080000 即 RAM（裸符号名，`&main` 在 C28x 上无法求值）」，任一条不成立就拒绝——`NO_PROBE`(3) / `NO_SESSION` / `STALE_SERVICE` / `NOT_RAM_IMAGE` / `RAM_UNVERIFIED`，不会偷偷烧一次把数据凑出来。**"证明不了在 RAM"= 拒绝，不是放行**；确实要读未验证目标时才用 `-AllowUnverified`（日志里会写明）；`-NoProbeCheck` 可跳过 1 秒的探针枚举。 |
+| **`-Mode ReadOnly`（默认）** | 日常读。会话已在跑，只想看当前程序。 | `scripts/ti_c2000_run_read.ps1 -Variables gMsTick,gState`（慢变量）/ `scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName gBuf -Rows 256 -Columns 1`（DMA 冻结窗口）。**绝不下载**：读之前要过四道证明「① 仿真器被 Windows 枚举在线 ② 会话进程活着 ③ `sha256(out)` 与本次构建一致 ④ **`PC` 可读且 < 0x080000**（一次寄存器读同时回答"在线吗"和"在 RAM 吗"；`PC` 读不到 = `TARGET_NOT_CONNECTED`，环境故障**无开关可绕过**，`-AllowUnverified` 也不放过；`PC` ≥ 0x080000 = `NOT_RAM_IMAGE`）」，任一条不成立就拒绝——`NO_PROBE`(3) / `NO_SESSION` / `STALE_SERVICE` / `NOT_RAM_IMAGE` / `RAM_UNVERIFIED`，不会偷偷烧一次把数据凑出来。**"证明不了在 RAM"= 拒绝，不是放行**；确实要读未验证目标时才用 `-AllowUnverified`（日志里会写明）；`-NoProbeCheck` 可跳过 1 秒的探针枚举。 |
 | **`-Mode LoadRead`（显式）** | 本次读必须从新固件开始（改了代码、要确认新镜像），只下载一次。 | 同一命令加 `-Mode LoadRead -ConfirmLoad`：停常驻会话 → **下载一次** → 读 → 退出。`-MaxLoads N -Expect 'gBufSeq>=3'` 可反复下载到判据满足（等价于连续运行的单次版）。 |
 
 **慢速读只有"轮询"精度，选它之前先对时标**：单轮周期 S ≈ `-IntervalMs` + 50~120 ms（默认 0.5 s → S≈0.55~0.62 s，采样上限约 8~20 Hz）。判据三条：① 被测量变化周期 ≥ 10×S（看趋势 ≥ 3×S）；② 不需要等间隔/精确时刻（测不了频率、相位、占空比）；③ 两次采样之间没有有意义的瞬变。**例：数据 100 ms 一更新（10 Hz），慢速读 1.8 Hz 欠采样 5.5 倍——数值本身是真的，但漏掉 5~6 次更新，画出来是混叠假波形，要看每一点必须用 DMA 冻结缓冲。** 算例、实测方法与自测命令见 [慢速读的时限与适用条件](references/single-session-read.md#慢速读的时限与适用条件轮询不是采样示波器)。
