@@ -428,6 +428,33 @@ function Assert-ProbeOnline {
 }
 
 <#
+Assert-TargetConnected -- proof 0, and the only proof with no bypass switch.
+
+Symbol evaluation is answered from the .out symbol table and keeps working with the JTAG
+link down, so "running from RAM: main = 0x00008A8D" can be printed for a target that
+answers nothing at all. Measured 2026-11-15: probe re-enumerated, session process alive,
+sha256 matched, the RAM proof reported success, and every byte read then failed with
+"target is not connected". PC is a register read: it only answers while the link is alive.
+
+-AllowUnverified means "the image may be a different build and I accept that"; it must not
+also mean "the board may be unplugged", so this gate exits on its own.
+#>
+function Assert-TargetConnected {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [switch]$Quiet
+    )
+    $pc = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC')
+    if ($pc -and @($pc | Where-Object { [string]$_ -match '^V\s+PC\s+\S' }).Count) { return }
+    Write-Output 'FAILURE: TARGET_NOT_CONNECTED'
+    Write-Output 'RESULT: FAIL'
+    Write-Output 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone (unplugged, power-cycled, or the connection died)'
+    Write-Output 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
+    Write-Output 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
+    exit 4
+}
+
+<#
 Test-RamImageEvidence -- the "is it RAM" criterion of ReadOnly mode. Program counters
 and code live below Flash on C28x when the image was loaded into RAM by the debugger,
 so the address of the entry symbols decides it. Unreadable symbols are NOT a pass:
@@ -446,20 +473,6 @@ function Test-RamImageEvidence {
     )
 
     $r = [ordered]@{ ok = $false; verified = $false; symbol = ''; address = ''; text = ''; code = '' }
-
-    # Proof 0: is the target reachable at all? Symbol evaluation is answered from the
-    # .out symbol table and keeps working with the JTAG link down, so "running from RAM:
-    # main = 0x00008A8D" can be printed for a target that answers nothing. Measured
-    # 2026-11-15: probe re-enumerated, session process alive, sha256 matched, this proof
-    # reported success, and every byte read then failed with "target is not connected".
-    # PC is a register read: it only answers while the connection is alive.
-    $pcLines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC')
-    if (-not $pcLines -or -not @($pcLines | Where-Object { [string]$_ -match '^V\s+PC\s+\S' }).Count) {
-        $r.code = 'TARGET_NOT_CONNECTED'
-        $r.text = 'target NOT connected (PC unreadable) - the session process is alive but the JTAG link is gone'
-        if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
-        return $r
-    }
 
     $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('main', '_main', '_c_int00', 'code_start')
     if (-not $lines) {

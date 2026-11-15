@@ -62,9 +62,10 @@ param(
     [string]$RunMode = 'SingleStep',
     [switch]$UserApproved,
     [int]$StartTimeoutSec = 90,
-    # -Status only: also ask Windows whether a JTAG probe is still enumerated. The session
-    # process can outlive the USB link, and then "RUNNING" is true but useless.
-    [switch]$CheckProbe,
+    # -Status enumerates the JTAG probe by default: the session process outlives the USB
+    # link, so "RUNNING" alone is how a dead board looks healthy (measured 2026-11-15).
+    # -NoProbeCheck skips the ~1 s enumeration when you only want the state files.
+    [switch]$NoProbeCheck,
     [switch]$Quiet
 )
 
@@ -143,7 +144,7 @@ if ($Status) {
         $idx = $st.loadIndex
         if (-not $idx -and $st.outSha256 -and $st.outSha256 -eq $cnt.lastSha256) { $idx = $cnt.count }
         Out2 ('SERVICE : RUNNING (pid {0}, since {1})' -f $st.pid, $st.started)
-        if ($CheckProbe) {
+        if (-not $NoProbeCheck) {
             # the process survives an unplugged probe, so "RUNNING" alone cannot answer
             # "can I still read?" - enumerate the hardware and say so (measured 2026-11-15:
             # pid alive, XDS100 gone, every read refused with NO_PROBE)

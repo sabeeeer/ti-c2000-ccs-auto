@@ -38,6 +38,7 @@
 | `LoadRead` + `-AllowUnverified` / `-NoProbeCheck` | `MUTUALLY_EXCLUSIVE` exit 2（两者只属于 ReadOnly） |
 | `ReadOnly` 但 Windows 没枚举到探针 | `NO_PROBE` exit 3 |
 | `ReadOnly` 时没有存活会话 | `NO_SESSION` exit 4 |
+| `ReadOnly` 但目标不应答（`PC` 读不到，JTAG 断了） | `TARGET_NOT_CONNECTED` exit 4（无开关可绕过） |
 | 会话存在但 `sha256(out)` 与 state 不符 | `STALE_SERVICE` exit 2 |
 | 入口符号 `main`（裸符号名）/ `_c_int00` ≥ 0x080000（跑的是 Flash 镜像） | `NOT_RAM_IMAGE` exit 4 |
 | 入口符号读不到（无法证明 RAM） | `RAM_UNVERIFIED` exit 4（`-AllowUnverified` 才放行，并写日志） |

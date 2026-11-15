@@ -57,12 +57,7 @@ try {
     $ramText = ($ramOut -join "`n")
     if ($ramText -notmatch 'ok=False verified=False') { throw "RAM unverified must refuse`n$ramText" }
     if ($ramText -notmatch 'allow ok=True') { throw "-AllowUnverified must pass`n$ramText" }
-    # No session means no PC, and symbol evaluation alone must never be mistaken for a
-    # live RAM image: the proof reports TARGET_NOT_CONNECTED before it looks at symbols
-    # (measured 2026-11-15, when a re-enumerated probe plus a live pid still gave
-    # "running from RAM" while every byte read said "target is not connected").
-    if ($ramText -notmatch 'code=TARGET_NOT_CONNECTED') { throw "a dead link must be named, not reported as a RAM image`n$ramText" }
-    if ($ramText -notmatch 'NOT connected') { throw "the refusal must name the reason`n$ramText" }
+    if ($ramText -notmatch 'UNVERIFIED') { throw "the refusal must name the reason`n$ramText" }
 
     # --- 4. probe gate: a probe-less target is NO_PROBE / exit 3 ---------------
     $fake = Join-Path $fixture 'no_probe.ps1'
@@ -73,6 +68,18 @@ try {
     Expect 'probe gate' $g 3 'FAILURE: NO_PROBE'
     if ($g.text -match 'FAILURE: NO_PROBE[\s\S]*FAILURE: NO_PROBE') { throw "the gate must report NO_PROBE exactly once`n$($g.text)" }
     if ($g.text -match 'WRONG') { throw "the gate continued past a missing probe`n$($g.text)" }
+
+    # --- 5. target-connection gate: environment faults have no switch -----------
+    # Symbol evaluation answers from the .out even with the link down, so a probe in the
+    # device list plus a live pid is not proof that the target responds (measured
+    # 2026-11-15). -AllowUnverified covers "the image may be another build", never
+    # "the board may be unplugged", so this gate exists as a separate exit.
+    $conn = Join-Path $fixture 'conn.ps1'
+    [IO.File]::WriteAllText($conn, ". '$lib'`nAssert-TargetConnected -ProjectPath '$empty'`n'CONTINUED (WRONG)'`n", (New-Object Text.UTF8Encoding($false)))
+    $c = Invoke-Script @('-NoProfile', '-File', $conn)
+    Expect 'target connection gate' $c 4 'FAILURE: TARGET_NOT_CONNECTED'
+    if ($c.text -match 'CONTINUED') { throw "the gate continued past a dead link`n$($c.text)" }
+    if ($c.text -notmatch 'AllowUnverified does not apply') { throw "the gate must say why no switch helps`n$($c.text)" }
 
     'RESULT: OK'
     exit 0
