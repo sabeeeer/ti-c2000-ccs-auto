@@ -217,6 +217,10 @@ if ($Stop) {
     foreach ($f in @($cmdFile, $resFile, $readyFile, $stateFile)) {
         if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     }
+    # The DSP process is gone, but Windows/FTDI still holds the USB handle for a moment.
+    # A start issued the instant -Stop returns then dies with "Error -150 ... FTDI driver
+    # functions" (measured 2026-11-15). Give the port time to come back.
+    Start-Sleep -Milliseconds 800
     $cnt = Get-LoadCount -ProjectPath $ProjectPath
     Exit-TargetLock -ProjectPath $ProjectPath
     Out2 'SERVICE : STOPPED'
@@ -385,18 +389,71 @@ var session = server.openSession(CORE);
 session.options.setBoolean("AllowInterruptsWhenHalted", true);
 session.options.setBoolean("PoliteRealtimeMode", true);
 
+// connect() returning normally does NOT prove the link is up: measured 2026-11-15, it
+// returned cleanly and the very next reset() failed with "target is not connected", after
+// which every load attempt operated on a dead link. So verify with an operation that must
+// touch the target (isHalted) and retry the whole connect when it throws.
+function linkIsUp() {
+    try { session.target.isHalted(); return true; } catch (eV) { return false; }
+}
+// Error -1138 ("Device refused to allow debug mode") is the core refusing to enter debug
+// state at all, and TI's own advice is to power-cycle the board. Retrying makes it worse,
+// not better: each attempt pushes the probe into -1041 then -150, and the last one cannot
+// even remove its debug state, so the NEXT session starts from a worse place
+// (measured 2026-11-15 across six stop/start cycles).
+function boardRefusedDebug(msg) {
+    var s = "" + msg;
+    // The exception object does NOT carry -1138: GEL prints that to stdout, while the
+    // Java message only says "Target reset failed. Error: -1" (measured 2026-11-15).
+    // So match the message's own wording too, otherwise this check never fires.
+    return (s.indexOf("-1138") >= 0)
+        || (s.indexOf("Device refused to allow debug mode") >= 0)
+        || (s.indexOf("Target reset failed") >= 0);
+}
 var connected = false;
-for (var i = 1; i <= 3 && !connected; i++) {
-    try { session.target.connect(); connected = true; }
-    catch (e) { print("CONNECT_RETRY: " + e); sleepMs(1000); }
+for (var i = 1; i <= 5 && !connected; i++) {
+    try {
+        session.target.connect();
+        if (linkIsUp()) { connected = true; break; }
+        print("CONNECT_RETRY " + i + ": connect returned but the target does not answer");
+        try { session.target.disconnect(); } catch (eX) { }
+    } catch (e) {
+        var msg = "" + e;
+        print("CONNECT_RETRY " + i + ": " + msg);
+        // "Error -150" is the FTDI/USB layer failing to configure the port, not a logic
+        // error: the previous DSP process may still be releasing the USB handle. It needs
+        // a longer settle than a normal retry, and the wait grows each attempt.
+    }
+    sleepMs(1000 + 500 * i);
 }
 if (!connected) { writeText(WORK + "/error.txt", "CONNECT_FAILED"); throw "connect failed"; }
 print("DSS: connected");
 
 try { session.target.reset(); print("DSS: reset"); }
 catch (e1) {
-    print("DSS: reset failed (" + e1 + "), fallback halt");
-    try { session.target.halt(); print("DSS: halted"); } catch (e2) { print("DSS: halt skipped: " + e2); }
+    // A reset that reports "target is not connected" right after a successful connect
+    // means the link dropped: fall back to halt only when the link is alive, otherwise
+    // reconnect and try once more (2026-11-15).
+    print("DSS: reset failed (" + e1 + ")");
+    if (boardRefusedDebug(e1)) {
+        // No retry, no load attempt: the target will not accept debug mode until the
+        // board is power-cycled. Stop here and let the caller say so plainly.
+        writeText(WORK + "/error.txt", "BOARD_REFUSED_DEBUG " + e1);
+        throw "board refused debug mode";
+    }
+    if (linkIsUp()) {
+        try { session.target.halt(); print("DSS: halted (link alive, reset skipped)"); } catch (e2) { print("DSS: halt skipped: " + e2); }
+    } else {
+        print("DSS: link lost after connect, reconnecting");
+        try { session.target.disconnect(); } catch (e0) { }
+        sleepMs(900);
+        var recovered = false;
+        for (var r = 1; r <= 3 && !recovered; r++) {
+            try { session.target.connect(); if (linkIsUp()) { session.target.reset(); recovered = true; print("DSS: reset after reconnect (try " + r + ")"); } }
+            catch (e3r) { print("DSS: reconnect " + r + " failed: " + e3r); sleepMs(900 * r); }
+        }
+        if (!recovered) { writeText(WORK + "/error.txt", "RESET_FAILED " + e1); throw "reset failed"; }
+    }
 }
 var loaded = false;
 try { session.memory.loadProgram(OUT); loaded = true; }
@@ -411,7 +468,13 @@ catch (e3a) {
         try { session.target.reset(); } catch (eR) { }
         sleepMs(500 * attempt);
         try { session.memory.loadProgram(OUT); loaded = true; print("DSS: loaded on attempt " + attempt); }
-        catch (eN) { print("DSS: load failed, attempt " + attempt + ": " + eN); if (attempt === 3) { writeText(WORK + "/error.txt", "LOAD_FAILED " + eN); throw "load failed"; } }
+        catch (eN) {
+            print("DSS: load failed, attempt " + attempt + ": " + eN);
+            // -1138 mid-retry means the core has stopped accepting debug mode: further
+            // attempts only damage the probe state
+            if (boardRefusedDebug(eN)) { writeText(WORK + "/error.txt", "BOARD_REFUSED_DEBUG " + eN); throw "board refused debug mode"; }
+            if (attempt === 3) { writeText(WORK + "/error.txt", "LOAD_FAILED " + eN); throw "load failed"; }
+        }
     }
 }
 if (!loaded) { writeText(WORK + "/error.txt", "LOAD_FAILED unknown"); throw "load failed"; }
@@ -529,9 +592,27 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
     Exit-TargetLock -ProjectPath $ProjectPath
     foreach ($line in $tail) { Out2 ([string]$line) }
     Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
-    if ($failReason -match 'Load failed|Failed to remove the debug state') {
+    # The whole log, not -Tail 12: -1138 appears near the top (GEL output first), and by
+    # the time the load retries have run it is dozens of lines above the end.
+    $logText = ''
+    if (Test-Path -LiteralPath $logFile) { try { $logText = Get-Content -LiteralPath $logFile -Raw -Encoding utf8 } catch { } }
+    if ($logText -match 'Error -1138|Device refused to allow debug mode' -or $failReason -match 'board refused debug mode|Target reset failed') {
+        # Not a software condition: the core will not enter debug mode until power is cycled.
+        # Say exactly that instead of suggesting another -Start that cannot help.
+        Out2 'HINT    : the chip refused debug mode (Error -1138) - this is a board state, not a script problem'
+        Out2 'HINT    : power-cycle the board: unplug the USB cable, wait 3 s, plug it back in'
+        Out2 'HINT    : repeated -1138 without a power cycle is normal; retrying -Start will not clear it'
+        exit 3
+    }
+    if ($tail -join "`n" -match 'Error -150|FTDI driver functions') {
+        # Error -150 comes from the FTDI/USB layer, not from DSS or the image. No amount
+        # of retrying inside DSS fixes it; the port has to come back.
+        Out2 'HINT    : Error -150 is the FTDI/USB layer, not the image: the probe port did not come back after the previous session'
+        Out2 'HINT    : unplug the USB cable, wait 3 s, plug it back in, then run -Start again'
+        Out2 'HINT    : if this repeats, check the cable/port and disable USB selective suspend for this device'
+    } elseif ($failReason -match 'Load failed|Failed to remove the debug state') {
         # measured 2026-11-15: the first load after an unclean disconnect can fail even
-        # with three in-process retries, and the very next whole -Start then succeeds
+        # with in-process retries, and the very next whole -Start then succeeds
         Out2 'HINT    : the target still holds debug state from an earlier session - run -Start again (a fresh DSS process usually clears it)'
         Out2 'HINT    : if it fails twice in a row, power-cycle the board (unplug USB, wait 3 s, plug back in) and start again'
     }

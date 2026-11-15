@@ -545,6 +545,8 @@ $log = New-Object System.Collections.Generic.List[string]
 
 # ---------- 6. compile ----------
 $cflags = @("-v$siliconVer", '-g', '--display_error_number', '--diag_wrap=off', '-c')
+$cla = Get-OptionValue 'compilerID.CLA_SUPPORT'
+$vcu = Get-OptionValue 'compilerID.VCU_SUPPORT'
 if ($largeMem) { $cflags += '-ml' }
 if ($unified)  { $cflags += '-mt' }
 $cflags += $floatFlag
@@ -552,6 +554,12 @@ $cflags += $floatFlag
 # 内建函数会退化成外部调用，链接时报 "___sinpuf32 unresolved"。
 if ($tmu -match 'tmu1')      { $cflags += '--tmu_support=tmu1' }
 elseif ($tmu -match 'tmu0')  { $cflags += '--tmu_support=tmu0' }
+# CLA / VCU change the generated code just like TMU does. Leaving them out was a silent
+# divergence from the CCS build: today's sources do not use them, so nothing failed, but
+# a project that does would either error or link a different library (measured
+# 2026-11-15: .cproject declared cla1 and vcu2, the build passed neither).
+if ($cla -match 'cla(\d)')   { $cflags += ('--cla_support=cla' + $Matches[1]) }
+if ($vcu -match 'vcu(\d)')   { $cflags += ('--vcu_support=vcu' + $Matches[1]) }
 if ($optLevel)    { $cflags += $optLevel }
 if ($mfOpt)       { $cflags += $mfOpt }
 if ($fpMode)      { $cflags += $fpMode }
@@ -618,6 +626,20 @@ if ($compileErrors.Count -eq 0) {
     $lflags = @("-v$siliconVer", '-g', '--display_error_number', '--diag_warning=225', '--diag_wrap=off', '-z',
                "-m$OutputDir\$projName.map", "--stack_size=$stackSz", '--warn_sections',
                "-i$cgRoot\lib", "-i$cgRoot\include", '--reread_libs', $romModel)
+    # ENTRY_POINT: CCS passes -e from .cproject. Without it the linker falls back to
+    # _c_int00, so the skill's .out had a different entry point than the CCS build of the
+    # same sources (measured 2026-11-15: .cproject said code_start, ofd2000 reported
+    # 0x000088E2 inside .text). Debug loads masked it, because the debugger sets the PC
+    # itself, but a Flash boot vector does not.
+    $entryPoint = Get-OptionValue 'linkerID.ENTRY_POINT'
+    if ($entryPoint) { $lflags += @('-e', $entryPoint) }
+    # XML_LINK_INFO is a build artefact CCS always produces; harmless, but keeping it means
+    # a project script that reads it still works.
+    $xmlInfo = Get-OptionValue 'linkerID.XML_LINK_INFO'
+    if ($xmlInfo) {
+        $xmlName = ($xmlInfo -replace '\$\{ProjName\}', $projName).Trim('"')
+        $lflags += "--xml_link_info=$OutputDir\$xmlName"
+    }
     if ($lnkPriority) { $lflags += '--priority' }
     foreach ($d in $lnkDiagSupp) { $lflags += "--diag_suppress=$d" }
     # the project's own library search paths (--search_path), macros expanded, existing ones only
