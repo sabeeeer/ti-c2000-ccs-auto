@@ -103,6 +103,53 @@ pwsh -NoProfile -File tools/audit_build_options.ps1 -ProjectPath <工程>
 - `tools/portability_gate.ps1`：不许硬编码用户路径
 - 上机：`-Stop` → `-Start -ConfirmLoad` 应连续成功（板子未进 -1138 时）；进入 -1138 时应 `exit 3` 并给出断电提示
 
+## 八、第二轮五遍通读（同日晚）
+
+通读方式：① 语法 + 函数重复 + 孤立引用；② DSS 模板逐行 + 共享片段调用点；
+③ 文件与并发（锁、原子写、编码）；④ 参数契约（文档 vs param 块 vs 是否被读）；
+⑤ 上机。
+
+### 抓到的 6 个真问题
+
+| # | 问题 | 危害 | 修法 |
+|---|---|---|---|
+| 1 | `ti_c2000_read_dma.ps1` 的 JS 用了 `WARMUP`，模板里从未定义 | **必然失败**：Rhino 抛 `ReferenceError`，一个字节都没读就崩 | 改成字面量 300，并删掉重复的 isHalted 检查 |
+| 2 | `live_read` 的 `-FrozenValue` 声明、文档、且被 `read_dma` 转发，但**从未被读** | DMA 冻结判据只查"拷贝期间不变"；标志恒为 0（还在写）时也通过，读到的可能是撕裂数据 | 加 `Test-FlagEquals`（true/1 归一），要求等于期望值 |
+| 3 | `readmode.Get-SessionExpressions` 的 cmd/res 交换未原子化 | 与 `live_read.Send-Request` 同一类竞态：清场失败时返回**上一轮的响应** | 清场重试 10 次 + 临时文件 rename |
+| 4 | `dssShutdown` 定义后从未被调用 | 三处各写一份关闭序列（halt/等待/断开/终止），顺序不一致 | 三处统一调用 |
+| 5 | `-MapFile` 未传给 `Get-RunLocation` | 文档说"可以自己指定 map"，实际无效 | 透传 |
+| 6 | 新写的 JS 标识符检测器**自身是瞎的**（只识别 `@"` 独占一行，实际模板用 `$js = @'`） | 它报"通过"但一个文件都没扫，等于没有检查 | 修正 here-string 识别，并加 `-SelfTest`（植入 bug 必须被抓到） |
+
+### 两个新审计工具（都带自检）
+
+| 工具 | 抓什么 | 为什么必须有 |
+|---|---|---|
+| `tools/audit_js_identifiers.ps1` | DSS 模板里"用了但没定义"的全大写标识符 | 模板是 PowerShell here-string 里的 JS，**PowerShell 看不见**，只有摘要在板上跑时才报错。问题 1 就是这一类 |
+| `tools/audit_dead_params.ps1` | `param()` 里声明、函数体从不读的参数 | 死参数让文档变成谎话：调用方传了以为生效。问题 2 和 5 都是这一类 |
+
+`audit_js_identifiers.ps1 -SelfTest` 会植入 `NOT_DEFINED_ANYWHERE` 和 `ALSO_MISSING`，两个都必须被报出来，否则 `FAILURE: AUDIT_DETECTOR_BLIND`；同时对干净代码误报会报 `AUDIT_DETECTOR_NOISY`。**一个从没抓到过东西的检测器，不能算检测器。**
+
+两个工具都已接入 `tests/test_dss_boot_shared.ps1`，随自动测试集运行。
+
+### 上机结果：-1138，软件无解
+
+三次 `-Start -ConfirmLoad` 全部：
+
+```text
+DSS: connected
+DSS: reset failed (... Target reset failed. Error: -1)
+DSS: board refused debug mode - not retrying
+FAILURE: SERVICE_START_FAILED
+HINT : the chip refused debug mode (Error -1138) - this is a board state
+HINT : power-cycle the board: unplug the USB cable, wait 3 s, plug it back in
+exit=3
+```
+
+探针 PnP 正常、无残留 java 进程、`.service` 清理干净、等待 12 秒后重试也无效。
+**这正是本轮修复想要的行为**：一次就停、不重试、退出码 3、给出断电步骤。以前会在它之后继续 halt+reset+load 三次，把探针推入 -1041 / -150。
+
+断电后的验证清单见下一节，其中第 1 条必须做：`WARMUP` 修复只在 `-Mode LoadRead` 路径生效，静态检查证明"没有未定义常量"，但真正的执行只能上机。
+
 ## 七、尚未验证（需板子恢复后补）
 
 | 项 | 为什么要测 |
