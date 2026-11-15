@@ -91,7 +91,7 @@ HINT    : on C2837x a control bit sits in a bitfield - write Reg.BITFIELD.bit.NA
 
 ## 本次确认正常的部分
 
-- 四道证明：探针枚举 / 会话存活 / `sha256` 一致 / `main = 0x00008A8D < 0x080000`。
+- 五道证明：探针枚举 / 会话存活 / `sha256` 一致 / 目标应答（`PC` 可读）/ `main = 0x00008A8D < 0x080000`。
 - 门禁 10 种组合全部按文档拒绝（互斥、无确认、无批准、非法模式、注入变量名、重复变量、脏工程）。
 - 并发互锁在真实 iterate 运行中全部正确：`READONLY_IN_ITERATE` / `MUTUALLY_EXCLUSIVE` /
   `ITERATE_IN_PROGRESS`，且 `-Status` 仍可读。

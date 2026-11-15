@@ -40,6 +40,7 @@ JTAG 不参与实时采样，只搬历史数据。**不做固件侧缓冲就直�
 | 启动窗口 | 仅在本次单会话刚加载并运行后，按实际预热时间检查计数器；`run_read`/`read_dma` 都适用。计数器已在递增但首值超过窗口 → 镜像不是刚加载的那一份 | `STALE_PROGRAM` |
 | 速率（可选，当前人工核对） | 若该计数器确为毫秒计时，按主机时间间隔估算约 1000 /s（容差由工程确定）；当前通用脚本只查递增，**不自动核对速率** | `HEARTBEAT_RATE` |
 | 至少一个心跳可用 | 指定的应用计数器必须可读；不能从任意递增列自动推断它是心跳 | `NO_HEARTBEAT` |
+| 目标在应答（前置） | 探针被枚举、会话进程活着、`sha256` 一致都成立**仍不够**：`.out` 符号表求值在 JTAG 断开时照样返回地址。必须读到 `PC` 这类寄存器值才能证明目标在线 | `TARGET_NOT_CONNECTED` |
 | 单行数据 | 一行无法建立"推进过"的证据；除显式 `-AllowNoHeartbeat` 外一律失败 | `NO_LIVENESS_INTERVAL` |
 
 以上四个分类（`HEARTBEAT_FAIL` / `STALE_PROGRAM` / `NO_HEARTBEAT` / `NO_LIVENESS_INTERVAL`）以及范围判据的 `VALUE_OUT_OF_RANGE`，都由 `ti_c2000_check_read.ps1` 实际输出 `FAILURE:` 行；脚本整体失败时另给一条最终 `RESULT: FAIL`，退出码 1。

@@ -201,6 +201,12 @@ if ($spec.mode -eq 'ReadOnly') {
         $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -AllowUnverified:$AllowUnverified
         Info2 ('JUDGE   : ' + $ram.text)
         if (-not $ram.ok) {
+            if ($ram.code -eq 'TARGET_NOT_CONNECTED') {
+                Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
+                Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link died'
+                Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a session cannot reconnect to a board that disappeared and came back'
+                exit 4
+            }
             if ($ram.verified) {
                 Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
                 Out2 'REASON: the code answering on the target sits in Flash, not the RAM image this session loaded (board was reset, power-cycled or flashed with something else)'

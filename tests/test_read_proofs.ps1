@@ -50,14 +50,19 @@ try {
     $ramOut = @(& pwsh -NoProfile -Command @"
 . '$lib'
 `$r = Test-RamImageEvidence -ProjectPath '$empty'
-'ok=' + `$r.ok + ' verified=' + `$r.verified + ' text=' + `$r.text
+'ok=' + `$r.ok + ' verified=' + `$r.verified + ' code=' + `$r.code + ' text=' + `$r.text
 `$r2 = Test-RamImageEvidence -ProjectPath '$empty' -AllowUnverified
 'allow ok=' + `$r2.ok + ' verified=' + `$r2.verified
 "@ 2>&1) | ForEach-Object { [string]$_ }
     $ramText = ($ramOut -join "`n")
     if ($ramText -notmatch 'ok=False verified=False') { throw "RAM unverified must refuse`n$ramText" }
     if ($ramText -notmatch 'allow ok=True') { throw "-AllowUnverified must pass`n$ramText" }
-    if ($ramText -notmatch 'UNVERIFIED') { throw "the refusal must name the reason`n$ramText" }
+    # No session means no PC, and symbol evaluation alone must never be mistaken for a
+    # live RAM image: the proof reports TARGET_NOT_CONNECTED before it looks at symbols
+    # (measured 2026-11-15, when a re-enumerated probe plus a live pid still gave
+    # "running from RAM" while every byte read said "target is not connected").
+    if ($ramText -notmatch 'code=TARGET_NOT_CONNECTED') { throw "a dead link must be named, not reported as a RAM image`n$ramText" }
+    if ($ramText -notmatch 'NOT connected') { throw "the refusal must name the reason`n$ramText" }
 
     # --- 4. probe gate: a probe-less target is NO_PROBE / exit 3 ---------------
     $fake = Join-Path $fixture 'no_probe.ps1'

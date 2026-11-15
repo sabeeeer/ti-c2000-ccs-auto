@@ -445,7 +445,22 @@ function Test-RamImageEvidence {
         [switch]$AllowUnverified
     )
 
-    $r = [ordered]@{ ok = $false; verified = $false; symbol = ''; address = ''; text = '' }
+    $r = [ordered]@{ ok = $false; verified = $false; symbol = ''; address = ''; text = ''; code = '' }
+
+    # Proof 0: is the target reachable at all? Symbol evaluation is answered from the
+    # .out symbol table and keeps working with the JTAG link down, so "running from RAM:
+    # main = 0x00008A8D" can be printed for a target that answers nothing. Measured
+    # 2026-11-15: probe re-enumerated, session process alive, sha256 matched, this proof
+    # reported success, and every byte read then failed with "target is not connected".
+    # PC is a register read: it only answers while the connection is alive.
+    $pcLines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC')
+    if (-not $pcLines -or -not @($pcLines | Where-Object { [string]$_ -match '^V\s+PC\s+\S' }).Count) {
+        $r.code = 'TARGET_NOT_CONNECTED'
+        $r.text = 'target NOT connected (PC unreadable) - the session process is alive but the JTAG link is gone'
+        if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
+        return $r
+    }
+
     $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('main', '_main', '_c_int00', 'code_start')
     if (-not $lines) {
         $r.text = 'RAM image UNVERIFIED (the session did not answer - probe offline or target halted)'
