@@ -46,8 +46,9 @@ param([string]$Dir, [string]$Fw, [int]$Step)
 $cmd = Join-Path $Dir 'cmd.txt'
 $res = Join-Path $Dir 'res.txt'
 $tick = 1000
-[IO.File]::WriteAllText((Join-Path $Dir 'stub-ready.txt'), 'up')
+$first = $true
 while ($true) {
+    if ($first) { [IO.File]::WriteAllText((Join-Path $Dir 'stub-ready.txt'), 'up'); $first = $false }
     if (Test-Path $cmd) {
         $c = (Get-Content $cmd -Raw).Trim()
         if (-not (Test-Path $res)) {
@@ -77,14 +78,20 @@ while ($true) {
         if (Test-Path $ready) { Remove-Item $ready -Force -ErrorAction SilentlyContinue }
         $waited = 0
         while (-not (Test-Path $ready) -and $waited -lt 8000) { Start-Sleep -Milliseconds 100; $waited += 100 }
+        Start-Sleep -Milliseconds 250
         try {
             $argv = @('-NoProfile', '-File', $read, '-ProjectPath', $proj, '-Variables', 'gMsTick',
                 '-Mode', 'ReadOnly', '-Rounds', '2', '-IntervalMs', '200', '-NoProbeCheck')
             $out = @(& pwsh @argv 2>&1)
             return [ordered]@{ code = $LASTEXITCODE; text = (@($out | ForEach-Object { [string]$_ }) -join "`n") }
         } finally {
-            Remove-Item (Join-Path $svc 'res.txt') -Force -ErrorAction SilentlyContinue
+            # kill first, then clear: a stub still running would answer the next case's
+            # requests with the previous firmware value
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            try { $p.WaitForExit(2000) | Out-Null } catch { }
+            foreach ($n in @('res.txt', 'cmd.txt', 'stub-ready.txt')) {
+                Remove-Item (Join-Path $svc $n) -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
