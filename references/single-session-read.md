@@ -41,8 +41,9 @@
 | `ReadOnly` 但目标不应答（`PC` 读不到，JTAG 断了） | `TARGET_NOT_CONNECTED` exit 4（无开关可绕过） |
 | `PC` 落在本镜像代码段之外（在跑 Flash 或别的镜像） | `NOT_RAM_IMAGE` exit 4 |
 | 会话存在但 `sha256(out)` 与 state 不符 | `STALE_SERVICE` exit 2 |
-| 入口符号 `main`（裸符号名）/ `_c_int00` ≥ 0x080000（跑的是 Flash 镜像） | `NOT_RAM_IMAGE` exit 4 |
-| 入口符号读不到（无法证明 RAM） | `RAM_UNVERIFIED` exit 4（`-AllowUnverified` 才放行，并写日志） |
+| 核心在 Flash（`PC` 落在 MEMORY 区名以 `FLASH` 开头处） | 默认只报告 `RUNNING : FLASH` + `WARN`；加 `-RequireRam` 才 `NOT_RAM_IMAGE` exit 4 |
+| 读不到 `PC`（链路断） | `TARGET_NOT_CONNECTED` exit 4（无开关可绕过） |
+| 找不到 `.map` | 不失败：`RUNNING : ?`，位置未知；补建一次或给 `-MapFile` |
 | 连续运行无 `-UserApproved` | `ITERATE_NOT_APPROVED` exit 4 |
 | 连续运行期间外部 `ReadOnly` | `READONLY_IN_ITERATE` exit 4 |
 | 连续运行期间外部 `LoadRead` | `MUTUALLY_EXCLUSIVE` exit 2 |

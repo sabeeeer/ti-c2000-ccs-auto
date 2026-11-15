@@ -77,7 +77,11 @@ param(
     # buffer timeout instead of NO_PROBE)
     [switch]$NoProbeCheck,
     # ReadOnly: copy even when the entry symbol cannot be read, i.e. RAM is unproven
-    [switch]$AllowUnverified
+    [switch]$AllowUnverified,
+    # Flash debugging is legitimate, so the default only REPORTS where the core runs;
+    # -RequireRam turns "running in Flash" into a refusal
+    [switch]$RequireRam,
+    [string]$MapFile = ''
 )
 
 $ErrorActionPreference = 'Continue'
@@ -198,24 +202,34 @@ if ($spec.mode -eq 'ReadOnly') {
     try {
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
-        $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -OutFile $OutFile -CcsRoot $CcsRoot -AllowUnverified:$AllowUnverified
-        Info2 ('JUDGE   : ' + $ram.text)
-        if (-not $ram.ok) {
-            if ($ram.code -eq 'TARGET_NOT_CONNECTED') {
-                Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
-                Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
-                Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
-            } elseif ($ram.verified) {
-                Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the code answering on the target sits in Flash, not the RAM image this session loaded (board was reset, power-cycled or flashed with something else)'
-                Out2 'HINT    : start the session again with -Start -ConfirmLoad to put our image back in RAM'
-            } else {
-                Out2 'FAILURE: RAM_UNVERIFIED'; Out2 'RESULT: FAIL'
-                Out2 'REASON: the entry symbol (main / _c_int00 / code_start) could not be read, so "this is our RAM image" is unproven - the buffer you would copy may belong to another run'
-                Out2 'HINT    : check the probe is attached and the program is running (not halted); -AllowUnverified copies anyway and logs that it did'
-            }
+        # Report where the core runs; refuse only when the caller demands RAM.
+        # A frozen buffer read in Flash is a legitimate mode, but it must be labelled.
+        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile
+        if ($loc.code -eq 'TARGET_NOT_CONNECTED') {
+            Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
+            Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
+            Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
+            Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
             exit 4
+        }
+        if ($loc.code -eq 'LOCATION_UNKNOWN') {
+            Info2 ('JUDGE   : location unknown - ' + $loc.text)
+            Info2 'JUDGE   : build the project once so a .map exists, or pass -MapFile, to get RAM/Flash reporting'
+        } else {
+            Info2 ('RUNNING : {0}   (PC = {1}, region {2})' -f $loc.kind, $loc.pc, $loc.region)
+            if ($loc.kind -eq 'FLASH') {
+                Out2 'WARN    : the core is executing from FLASH, not from the image this session loaded into RAM'
+                Out2 'WARN    : if you did not flash this build yourself, this buffer belongs to whatever firmware was last flashed'
+                Out2 'HINT    : pass -RequireRam to refuse this, or -ExpectFwId so the firmware confirms its own build'
+            } elseif ($loc.kind -eq 'OTHER') {
+                Out2 'WARN    : the program counter is outside RAM and Flash - the core may have run away'
+            }
+            if ($RequireRam -and $loc.kind -ne 'RAM') {
+                Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
+                Out2 ('REASON: -RequireRam was given, but the core is executing from {0} ({1})' -f $loc.kind, $loc.region)
+                Out2 'HINT    : start the session again with -Start -ConfirmLoad to run the RAM image, or drop -RequireRam'
+                exit 4
+            }
         }
         $largs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'ti_c2000_live_read.ps1'),
             '-ProjectPath', $ProjectPath, '-ArrayName', $ArrayName,

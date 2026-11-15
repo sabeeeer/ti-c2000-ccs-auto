@@ -47,6 +47,11 @@ param(
     [string]$RateVar = '',
     [double]$ExpectedRatePerSec = 0,
     [double]$RateTolerancePct = 20,
+    # Flash debugging is legitimate, so the default only REPORTS where the core runs.
+    # -RequireRam turns that report into a refusal when RAM is the only acceptable answer.
+    [switch]$RequireRam,
+    # explicit linker map, when the build left it somewhere other than next to the .out
+    [string]$MapFile = '',
     # optional value range for the read-back variables (判据 4). Pass both to enable it;
     # counters such as gMsTick must not be mixed into an ADC range, so name the columns
     # you actually want bounded with -Variables and keep the counters to the heartbeat.
@@ -194,46 +199,48 @@ if ($spec.mode -eq 'ReadOnly') {
     try {
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
-        # Two ways to answer "is the image I think is running, actually running":
-        #
-        #   firmware self-proof  (portable)  - the image declares gFwId and increments a
-        #       counter; comparing the id and timing the counter needs only memory reads,
-        #       so it holds for any part, any boot mode and any probe model.
-        #   device inference     (fallback)  - PC inside the image's own code sections,
-        #       which needs a register read and, ideally, the section map.
-        #
-        # The self-proof is preferred whenever the caller supplies the expected id or a
-        # rate, because it does not encode anything about this chip.
-        $useFwProof = ($null -ne $ExpectFwId) -or ($RateVar -ne '' -and $ExpectedRatePerSec -gt 0)
-        if ($useFwProof) {
-            $what = @()
-            if ($null -ne $ExpectFwId) { $what += ('identity {0}={1}' -f $FwIdVar, $ExpectFwId) }
-            if ($RateVar -and $ExpectedRatePerSec -gt 0) { $what += ('rate {0}~{1:N0}/s' -f $RateVar, $ExpectedRatePerSec) }
-            Info2 ('JUDGE   : firmware self-proof: ' + ($what -join ', ') + ' - judged from memory reads only, no memory-map or probe assumption')
-        } else {
-            # cmd.txt/res.txt pair: an enumerated probe plus a live pid does not prove the
-            # target answers, and symbol evaluation would succeed even with the link down.
-            # No switch bypasses this one - it is an environment fault, not an unverified image.
-            $ram = Test-RamImageEvidence -ProjectPath $ProjectPath -OutFile $OutFile -CcsRoot $CcsRoot -AllowUnverified:$AllowUnverified
-            Info2 ('JUDGE   : ' + $ram.text)
-            if (-not $ram.ok) {
-                if ($ram.code -eq 'TARGET_NOT_CONNECTED') {
-                    Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
-                    Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
-                    Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
-                    Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
-                } elseif ($ram.verified) {
-                    Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
-                    Out2 'REASON: the code answering on the target sits outside every code section of this image - the board runs something else'
-                    Out2 'HINT    : start the session again with -Start -ConfirmLoad to put our image back'
-                } else {
-                    Out2 'FAILURE: RAM_UNVERIFIED'; Out2 'RESULT: FAIL'
-                    Out2 'REASON: neither the program counter nor the entry symbol could be read, so "this is our image" is unproven - an unproven image is how stale numbers get reported as fresh'
-                    Out2 'HINT    : check the probe is attached and the program is running (not halted); -AllowUnverified reads anyway and logs that it did'
-                    Out2 'HINT    : or declare gFwId in the firmware and pass -ExpectFwId - that check needs no address map and survives a different part'
-                }
+        # Where is the core executing? Report RAM or Flash; do not refuse either.
+        # Debugging in Flash is a legitimate mode, so the failure that must be prevented
+        # is not "it is in Flash" but "Flash values were handed over without saying so".
+        # The region names come from the project's own .map, never from a device table,
+        # so a part whose Flash starts at 0x300000 answers correctly too.
+        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile
+        switch ($loc.code) {
+            'TARGET_NOT_CONNECTED' {
+                Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
+                Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
+                Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
+                Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
                 exit 4
             }
+            'LOCATION_UNKNOWN' {
+                # no .map: say so instead of guessing. The identity/rate checks below can
+                # still prove the build, they just cannot name the region.
+                Info2 ('JUDGE   : location unknown - ' + $loc.text)
+                Info2 'JUDGE   : build the project once so a .map exists, or pass -MapFile, to get RAM/Flash reporting'
+            }
+            default {
+                Info2 ('RUNNING : {0}   (PC = {1}, region {2})' -f $loc.kind, $loc.pc, $loc.region)
+                if ($loc.kind -eq 'FLASH') {
+                    Out2 'WARN    : the core is executing from FLASH, not from the image this session loaded into RAM'
+                    Out2 'WARN    : if you did not flash this build yourself, these values belong to whatever firmware was last flashed'
+                    Out2 'HINT    : pass -ExpectFwId so the firmware itself confirms which build is running, or -RequireRam to refuse Flash outright'
+                } elseif ($loc.kind -eq 'OTHER') {
+                    Out2 'WARN    : the program counter is outside RAM and Flash - the core may have run away'
+                }
+                if ($RequireRam -and $loc.kind -ne 'RAM') {
+                    Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
+                    Out2 ('REASON: -RequireRam was given, but the core is executing from {0} ({1})' -f $loc.kind, $loc.region)
+                    Out2 'HINT    : start the session again with -Start -ConfirmLoad to run the RAM image, or drop -RequireRam'
+                    exit 4
+                }
+            }
+        }
+        if ($null -ne $ExpectFwId) {
+            Info2 ('JUDGE   : firmware identity will be checked: {0} must equal {1} (a memory read, no address assumption)' -f $FwIdVar, $ExpectFwId)
+        }
+        if ($RateVar -and $ExpectedRatePerSec -gt 0) {
+            Info2 ('JUDGE   : firmware rate will be checked: {0} ~ {1:N0}/s' -f $RateVar, $ExpectedRatePerSec)
         }
         # say the sampling period out loud: a polled read is not a scope, and the
         # caller must be able to tell "1.8 Hz" from "my signal updates every 100 ms"

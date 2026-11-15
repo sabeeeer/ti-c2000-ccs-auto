@@ -531,8 +531,140 @@ byte read failed with "target is not connected").
 
 -AllowUnverified skips the image verdict only, never the connection verdict.
 #>
-function Test-RamImageEvidence {
+<#
+Get-ImageMemoryMap -- where can this image run, according to its own build?
 
+"RAM or Flash?" needs a memory map, and the only map that travels with the project is
+the linker's own. The .map file lists every MEMORY region with its name, origin and
+length, and those names are chosen in the linker command file:
+
+    MEMORY CONFIGURATION
+             name            origin    length      used     unused   attr
+    PAGE 0:
+      RAMM0                 00000123   000002dd  00000074  00000269  RWIX
+      RAMLS0                00008000   00000800  000007fb  00000005  RWIX
+      FLASHA                00080002   00001ffe  00000000  00001ffe  RWIX
+
+So "is the PC in RAM or Flash" becomes "which region does the PC fall into, and what did
+the linker call it" - no device table, no hard-coded 0x080000. A part whose Flash starts
+at 0x300000, a Flash-debug build, or a renamed region all work unchanged.
+
+Returns @{ regions = @(@{name;start;end;isFlash}); source = <path> } or $null.
+#>
+$script:MemoryMapCache = @{}
+
+function Get-ImageMemoryMap {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [string]$OutFile = '',
+        [string]$MapFile = ''
+    )
+    $candidates = @()
+    if ($MapFile) { $candidates += $MapFile }
+    if ($OutFile) {
+        $candidates += [IO.Path]::ChangeExtension($OutFile, '.map')
+        $candidates += (Join-Path (Split-Path $OutFile -Parent) 'map') | ForEach-Object { Join-Path $_ ((Split-Path $OutFile -Leaf) -replace '\.out$', '.map') }
+    }
+    $dbg = Join-Path $ProjectPath 'Debug'
+    if (Test-Path -LiteralPath $dbg) {
+        $candidates += @(Get-ChildItem -LiteralPath $dbg -Filter '*.map' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+    $projName = Split-Path $ProjectPath -Leaf
+    $candidates += (Join-Path ([IO.Path]::GetTempPath()) "ti_c2000_build\$projName\$projName.map")
+
+    $map = @($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) | Select-Object -First 1
+    if (-not $map) { return $null }
+    if ($script:MemoryMapCache.ContainsKey($map)) { return $script:MemoryMapCache[$map] }
+
+    $regions = @()
+    $inMem = $false
+    foreach ($line in [IO.File]::ReadAllLines($map)) {
+        if ($line -match 'MEMORY CONFIGURATION') { $inMem = $true; continue }
+        if (-not $inMem) { continue }
+        # "  RAMLS0                00008000   00000800  000007fb  00000005  RWIX"
+        $m = [regex]::Match($line, '^\s{2,}(\S+)\s+([0-9a-fA-F]{8})\s+([0-9a-fA-F]{8})\s+[0-9a-fA-F]{8}\s+[0-9a-fA-F]{8}')
+        if (-not $m.Success) {
+            if ($line -match '^\s*SECTION ALLOCATION MAP') { break }
+            continue
+        }
+        $start = [Convert]::ToInt64($m.Groups[2].Value, 16)
+        $size = [Convert]::ToInt64($m.Groups[3].Value, 16)
+        if ($size -le 0) { continue }
+        $name = $m.Groups[1].Value
+        # Only three answers matter for a program counter: Flash, RAM, or somewhere a
+        # core should not be executing (peripheral frame, reserved area). The linker
+        # names the first two itself, so no device table is involved.
+        $kind = if ($name -match '^FLASH|^OTP|^SECURE') { 'FLASH' }
+                elseif ($name -match '^RAM|^BEGIN|^BOOT_RSVD') { 'RAM' }
+                else { 'OTHER' }
+        $regions += [pscustomobject]@{ name = $name; start = $start; end = $start + $size; kind = $kind }
+    }
+    if ($regions.Count -eq 0) { $script:MemoryMapCache[$map] = $null; return $null }
+    $result = [ordered]@{ regions = @($regions | Sort-Object start); source = $map }
+    $script:MemoryMapCache[$map] = $result
+    return $result
+}
+
+<#
+Get-RunLocation -- read the program counter and say where the core is executing.
+
+Returns code = '' (known), 'TARGET_NOT_CONNECTED' (no answer) or 'LOCATION_UNKNOWN'
+(no memory map). kind is 'RAM', 'FLASH' or 'OTHER' so the caller can report it instead
+of guessing. Nothing here refuses a Flash build: if you debug in Flash, that is the
+answer, not a failure - what must never happen is reporting Flash values without saying
+they came from Flash.
+#>
+function Get-RunLocation {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [string]$OutFile = '',
+        [string]$MapFile = ''
+    )
+    $r = [ordered]@{ ok = $false; pc = ''; region = ''; kind = ''; code = ''; text = '' }
+
+    $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC')
+    $pcValue = $null
+    if ($lines) {
+        foreach ($line in $lines) {
+            $m = [regex]::Match([string]$line, '^V\s+PC\s+(\S+)\s*$')
+            if (-not $m.Success) { continue }
+            $raw = $m.Groups[1].Value
+            if ($raw -match '^0[xX]([0-9A-Fa-f]+)$') { $pcValue = [Convert]::ToInt64($Matches[1], 16) }
+            elseif ($raw -match '^(-?\d+)$') { $pcValue = [int64]$Matches[1] }
+        }
+    }
+    if ($null -eq $pcValue) {
+        $r.code = 'TARGET_NOT_CONNECTED'
+        $r.text = 'target NOT connected (PC unreadable) - the process may be alive but the JTAG link is gone'
+        return $r
+    }
+    $r.pc = ('0x{0:X8}' -f $pcValue)
+
+    $map = Get-ImageMemoryMap -ProjectPath $ProjectPath -OutFile $OutFile -MapFile $MapFile
+    if (-not $map) {
+        $r.code = 'LOCATION_UNKNOWN'
+        $r.text = ('PC = {0}; no .map found, so RAM/Flash cannot be told apart' -f $r.pc)
+        return $r
+    }
+    $hit = @($map.regions | Where-Object { $pcValue -ge $_.start -and $pcValue -lt $_.end }) | Select-Object -First 1
+    if (-not $hit) {
+        $r.ok = $false
+        $r.kind = 'OTHER'
+        $r.text = ('PC = {0} is in none of the {1} MEMORY regions of this build - the core is running something else' -f $r.pc, $map.regions.Count)
+        return $r
+    }
+    $r.region = $hit.name
+    $r.kind = $hit.kind
+    $r.ok = ($hit.kind -ne 'OTHER')
+    $r.text = ('PC = {0} -> region {1} ({2}), map {3}' -f $r.pc, $hit.name, $hit.kind, (Split-Path $map.source -Leaf))
+    return $r
+}
+
+<#
+Test-RamImageEvidence -- legacy address-based check, kept for callers that have no map.
+Prefer Get-RunLocation: it reports RAM vs FLASH instead of refusing anything not in RAM.
+#>
+function Test-RamImageEvidence {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
         # the image whose layout decides "is the PC inside our code"; omit and the check
