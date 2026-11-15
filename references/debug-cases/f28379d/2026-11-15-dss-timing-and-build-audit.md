@@ -154,6 +154,9 @@ exit=3
 
 | 项 | 为什么要测 |
 |---|---|
+| `read_dma -Mode LoadRead -ConfirmLoad` | `WARMUP` 修复所在的路径；静态审计只能说"没有未定义常量"，能否真的跑起来必须上机 |
+| `read_dma -Mode ReadOnly -FrozenBufferReady` | `-FrozenValue` 现在会比对期望值，需要确认正常冻结时不会被误拒 |
+|---|---|
 | `runAsynch()` 后 300 ms 检查是否足够 | 现有值是经验值；若某个工程初始化 >300 ms，`isHalted()` 可能读到假"在跑" |
 | `halt` 后 `isHalted()` 是否立即为真 | 决定 `-Stop` 的 150 ms 等待是否够 |
 | 连续 halt/run 20 次稳定性 | 探针在这种循环下的耐受度 |

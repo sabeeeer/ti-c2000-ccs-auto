@@ -60,6 +60,22 @@ exit /b 1
         if ($mode -eq 'array' -and ($js -notmatch 'var EXTRAS = \["gBootStage","EPwm1Regs\.TBPRD"\]' -or $js -notmatch 'EXTRA.*before' -or $js -notmatch 'EXTRA.*after' -or $js -notmatch 'ARRAY_LAYOUT_MISMATCH' -or $js -notmatch 'var FROZEN_EXPECTED = "2"' -or $js -notmatch 'isFinite\(hAfter\)')) {
             throw 'Frozen-buffer reader omitted same-session scalars or address anchors'
         }
+        # The array reader used to call dssRunVerified(..., WARMUP) while its template never
+        # defined WARMUP: Rhino threw ReferenceError before reading a byte, and PowerShell
+        # could not see it (found 2026-11-15). Assert on the GENERATED script, so the check
+        # covers the real artifact rather than the source that produces it.
+        # Note: USING WARMUP is fine when the same script defines it (run_read has
+        # -WarmupMs); only "use without definition" is the bug.
+        if ($js -match 'dssRunVerified\(session, print, WARMUP\)' -and $js -notmatch 'var WARMUP\s*=') {
+            throw "$mode uses WARMUP without defining it - Rhino would throw ReferenceError before reading a byte"
+        }
+        if ($js -notmatch 'dssRunVerified\(session, print, (300|WARMUP)\)') {
+            throw "$mode does not pass a settle time to dssRunVerified"
+        }
+        # and nothing else undefined either
+        if ($js -notmatch 'function dssRunVerified') {
+            throw "$mode generated JavaScript has no boot sequence injected"
+        }
     }
     Write-Output 'PASS: both execution readers generate DSS scripts, resolve .project output name, and load once per session'
     Write-Output 'RESULT: OK'
