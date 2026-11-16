@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 3,
   "about": [
     "The variables this skill expects the FIRMWARE to declare. One file, because these names used",
     "to be hard-coded in twelve places and had already drifted: FrozenValue was 'true' in",
@@ -12,8 +12,15 @@
   ],
   "identity": {
     "var": "gFwId",
-    "why": "A constant the image declares (volatile unsigned long). Comparing it with the value recorded at -Start proves the board runs this build; it needs only a memory read, so it survives a different part, boot mode or probe.",
-    "firmware": "volatile unsigned long gFwId = FW_ID;  /* bump FW_ID on every build you flash */"
+    "why": "A firmware-declared build identity is compared with the value recorded at load. This detects mismatches only if each build has a unique ID; a repeated or stale ID cannot prove a SHA256 match by itself.",
+    "firmware": "volatile unsigned long gFwId = FW_ID;  /* generate a unique ID for every build; never reuse */"
+  },
+  "ramProof": {
+    "counter": "gRamProofTick",
+    "updater": "TiC2000_RamProofTick",
+    "why": "The updater function must be retained and linked to a RAM run region, and only that function may advance the counter. A retained DSS session checks both symbol addresses against the exact loaded map and observes the counter advancing. This avoids a PC read. The program must call the updater periodically; a missing map, symbol or moving counter is a refusal.",
+    "firmware": "See references/ram-proof-firmware.md for an illustrative C and linker integration pattern; compile it with the selected project before accepting reads.",
+    "integration": "Place the function in a section whose RUN address is RAM according to the selected .cmd/.map, call it every 1-10 ms from the running application, keep the counter in RAM, and ensure no other code writes the counter. Compiler and linker syntax are checked against the selected project before adding it."
   },
   "heartbeat": {
     "candidates": ["gMsTick", "usMainLoop", "gRunMs"],
@@ -33,6 +40,23 @@
     "flagValue": "1",
     "seq": "gDmaSeq",
     "why": "A DMA buffer is only consistent if the firmware freezes it first. flagValue is what the flag reads WHEN frozen (1 and 'true' are the same statement in C; readers normalise).",
-    "note": "Optional: a build with no frozen buffer passes -FrozenValue \"\" to require only that the flag does not change, and -Mode LoadRead may skip it entirely."
+    "note": "A waveform read requires a frozen buffer and the expected completed flag value; no empty flag bypass."
+  },
+  "readGate": {
+    "requireProbe": true,
+    "requireLiveSession": true,
+    "requireOutSha256": true,
+    "requireSourceFreshness": true,
+    "requireCompleteDssResponse": true,
+    "requireFirmwareIdentity": true,
+    "requireRam": true,
+    "requireHeartbeat": true,
+    "why": "A read is accepted only when the retained DSS session and target are live, the selected image hash matches the load record, the firmware identity is readable and unchanged, a counter advances, and RAM execution has independent evidence. A repeated firmware ID is a known residual risk."
+  },
+  "timing": {
+    "minLoadGapMs": 5000,
+    "minReadGapMs": 400,
+    "minReconnectGapMs": 400,
+    "why": "Limit program loads and repeated JTAG requests. The load gap covers retries, failed attempts and successive continuous-mode rounds; the read gap applies before each new data request."
   }
 }

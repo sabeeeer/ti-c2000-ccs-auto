@@ -16,14 +16,14 @@ RUN MODE (how the program gets onto the target; -RunMode on ti_c2000_service.ps1
 READ MODE (how data comes back; -Mode on the two readers):
   ReadOnly  (default) never downloads. It attaches to the live session after proving
             four things; a failure refuses (exit 4) instead of quietly downloading:
-              probe online   a JTAG probe is enumerated by Windows (-NoProbeCheck skips)
+              probe online   the selected probe adapter confirms availability
               session alive  state.json + ready.txt + pid
               same image     sha256(out) == state.outSha256
-              from RAM       main / _c_int00 address below 0x080000 (C28x Flash base)
+              from RAM       pinned map, RAM updater address and advancing RAM counter
             "Cannot prove it from RAM" is a refusal, not a pass: a stale Flash image
             answering on the target would otherwise come back as fresh data. The only
-            way past it is -AllowUnverified, which says so in the log.
-  LoadRead  downloads once, runs, reads, exits. Needs -ConfirmLoad. -MaxLoads N
+            way past it is to integrate the firmware RAM proof contract.
+  LoadRead  downloads once, runs, reads through the retained session. Needs -ConfirmLoad. -MaxLoads N
             repeats the cycle until -Expect passes.
 
 INTERLOCKS (checked before any hardware work; a violation reports one FAILURE line
@@ -46,12 +46,99 @@ Exit codes: 0 OK | 1 failure | 2 environment/argument | 3 no probe
 
 $script:ReadModeNames = @('ReadOnly', 'LoadRead')
 $script:RunModeNames = @('SingleStep', 'Iterate')
-# every C28x part puts Flash at or above 0x080000 (28335: 0x300000, 2837x: 0x080000)
-$script:C28xFlashBase = 0x080000
+
+# Called only under the project's target lock, immediately before a program load.
+# Store attempts as well as successes: a failed load may already have touched target
+# memory, so the next try must observe the same quiet period.
+function Wait-MinLoadGap {
+    param([Parameter(Mandatory)][string]$ProjectPath)
+    $gap = [int](Get-FwContract -Quiet).timing.minLoadGapMs
+    if ($gap -lt 5000) { $gap = 5000 }
+    $path = Join-Path $ProjectPath 'readout\.service\last-load-attempt-ms.txt'
+    $dir = Split-Path -Parent $path
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $last = [long]0
+    if (Test-Path -LiteralPath $path) {
+        [void][long]::TryParse(([string](Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)).Trim(), [ref]$last)
+    }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $wait = [int][Math]::Max([long]0, ([long]$gap - ($now - $last)))
+    if ($wait -gt 0) {
+        Write-Output ('LOAD_GAP: waiting {0} ms before another program load' -f $wait)
+        Start-Sleep -Milliseconds $wait
+    }
+    [IO.File]::WriteAllText($path, [string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), [Text.Encoding]::ASCII)
+}
+
+function Mark-LoadAttemptEnd {
+    param([Parameter(Mandatory)][string]$ProjectPath)
+    $path = Join-Path $ProjectPath 'readout\.service\last-load-attempt-ms.txt'
+    [IO.File]::WriteAllText($path, [string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), [Text.Encoding]::ASCII)
+}
+
+function Wait-MinReadGap {
+    param([Parameter(Mandatory)][string]$ProjectPath)
+    $gap = [int](Get-FwContract -Quiet).timing.minReadGapMs
+    if ($gap -lt 400) { $gap = 400 }
+    $path = Join-Path $ProjectPath 'readout\.service\last-read-request-ms.txt'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    $last = [long]0
+    if (Test-Path -LiteralPath $path) {
+        [void][long]::TryParse(([string](Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)).Trim(), [ref]$last)
+    }
+    $wait = [int][Math]::Max([long]0, ([long]$gap - ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $last)))
+    if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+    [IO.File]::WriteAllText($path, [string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), [Text.Encoding]::ASCII)
+}
+
+function Get-SelectedOutFreshEvidence {
+    param([Parameter(Mandatory)][string]$ProjectPath,[Parameter(Mandatory)][string]$OutFile)
+    if (-not (Test-Path -LiteralPath $OutFile)) {
+        return [ordered]@{ ok = $false; file = $OutFile; reason = 'selected .out does not exist' }
+    }
+    $out = Get-Item -LiteralPath $OutFile
+    $newest = @(Get-ChildItem -LiteralPath $ProjectPath -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Extension -in @('.c','.cpp','.h','.hpp','.asm','.cla','.cmd','.inc') -or
+            $_.Name -in @('.cproject','.project')
+        } |
+        Where-Object { $_.FullName -notmatch '[\\/](?:Debug|Release|readout|\.git)[\\/]' } |
+        Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+    if ($newest -and $newest.LastWriteTimeUtc -gt $out.LastWriteTimeUtc.AddSeconds(2)) {
+        return [ordered]@{ ok = $false; file = $newest.FullName; reason = 'a project input is newer than the selected .out' }
+    }
+    return [ordered]@{ ok = $true; file = $(if ($newest) { $newest.FullName } else { '' }); reason = 'project inputs are no newer than the selected .out' }
+}
+
+function Assert-SelectedOutFresh {
+    param([Parameter(Mandatory)][string]$ProjectPath,[Parameter(Mandatory)][string]$OutFile)
+    if (-not (Test-Path -LiteralPath $OutFile)) { return }
+    $evidence = Get-SelectedOutFreshEvidence -ProjectPath $ProjectPath -OutFile $OutFile
+    if (-not $evidence.ok) {
+        Write-Output 'FAILURE: STALE_ARTEFACT'; Write-Output 'RESULT: FAIL'
+        Write-Output ('REASON: {0}: {1}' -f $evidence.reason,$evidence.file)
+        Write-Output 'HINT    : rebuild and stage this exact -OutFile before download'
+        exit 4
+    }
+}
 
 function Get-TargetLockPath {
     param([Parameter(Mandatory)][string]$ProjectPath)
     return (Join-Path (Join-Path $ProjectPath 'readout\.service') 'target.lock')
+}
+
+# Once a reader owns the target, invalidate any previous success before touching DSS.
+# A failure halfway through preflight then cannot leave a plausible old CSV/verdict.
+function Initialize-ReadFailureVerdict {
+    param([Parameter(Mandatory)][string]$ProjectPath)
+    $dataDir = Join-Path $ProjectPath 'readout\data'
+    $checkDir = Join-Path $ProjectPath 'readout\check'
+    New-Item -ItemType Directory -Path $dataDir,$checkDir -Force | Out-Null
+    foreach ($path in @((Join-Path $dataDir 'data.csv'),(Join-Path $dataDir 'array.csv'),
+                       (Join-Path $checkDir 'variables.csv'),(Join-Path $checkDir 'verdict.txt'))) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+    [IO.File]::WriteAllText((Join-Path $checkDir 'verdict.txt'),"result: FAIL`nfailure: READ_INCOMPLETE`n",[Text.Encoding]::UTF8)
 }
 
 function Get-TargetLockInfo {
@@ -102,8 +189,23 @@ function Enter-TargetLock {
         Start-Sleep -Milliseconds 200
     }
     $text = '{0}|{1}|{2}' -f $PID, $Mode, (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    try { [IO.File]::WriteAllText($path, $text, [Text.Encoding]::ASCII) } catch { }
-    return [ordered]@{ ok = $true; message = @() }
+    try {
+        # CreateNew is atomic. The previous Test-Path + WriteAllText let two processes
+        # both observe no lock, overwrite each other, and drive the same DSS session.
+        $stream = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $bytes = [Text.Encoding]::ASCII.GetBytes($text)
+            $stream.Write($bytes, 0, $bytes.Length)
+        } finally { $stream.Dispose() }
+        return [ordered]@{ ok = $true; message = @() }
+    } catch {
+        $owner = Get-TargetLockInfo -ProjectPath $ProjectPath
+        return [ordered]@{
+            ok = $false
+            message = @('FAILURE: TARGET_BUSY', 'RESULT: FAIL',
+                ('REASON: target lock could not be acquired atomically; owner pid {0}' -f $(if ($owner) { $owner.pid } else { '?' })))
+        }
+    }
 }
 
 function Exit-TargetLock {
@@ -363,11 +465,12 @@ function Resolve-ReadModeSpec {
     return [ordered]@{ mode = $norm; downloads = ($norm -eq 'LoadRead'); expect = @($Expect); maxLoads = $MaxLoads }
 }
 
-<# one VARS request straight against the session (caller must hold the lock) #>
+<# one variable or address request against the retained session (caller holds lock) #>
 function Get-SessionExpressions {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
         [Parameter(Mandatory)][string[]]$Exprs,
+        [ValidateSet('VARS','ADDR')][string]$Kind = 'VARS',
         [int]$TimeoutMs = 6000
     )
     $svcDir = Join-Path $ProjectPath 'readout\.service'
@@ -387,7 +490,8 @@ function Get-SessionExpressions {
         Start-Sleep -Milliseconds 30
     }
     if (Test-Path -LiteralPath $resFile) { return $null }
-    $req = 'VARS ' + ($Exprs -join '|')
+    Wait-MinReadGap -ProjectPath $ProjectPath
+    $req = $Kind + ' ' + ($Exprs -join '|')
     $tmpCmd = $cmdFile + '.tmp'
     try {
         [IO.File]::WriteAllText($tmpCmd, $req, [Text.Encoding]::ASCII)
@@ -402,7 +506,12 @@ function Get-SessionExpressions {
         Start-Sleep -Milliseconds 50
     }
     if (-not (Test-Path -LiteralPath $resFile)) { return $null }
-    try { return @(Get-Content -LiteralPath $resFile -Encoding utf8) } catch { return $null }
+    try {
+        $lines = @(Get-Content -LiteralPath $resFile -Encoding utf8)
+        if (@($lines | Where-Object { $_ -match '^HALTED 0\s*$' }).Count -ne 1) { return $null }
+        if (@($lines | Where-Object { $_ -match '^END\s*$' }).Count -ne 1) { return $null }
+        return $lines
+    } catch { return $null }
 }
 
 <#
@@ -420,12 +529,30 @@ function Assert-ProbeOnline {
         [switch]$Quiet
     )
     if ($Skip) { return }
+
+    # Probe enumeration belongs in the device/probe adapter (debug.ps1). Retry that
+    # adapter until it says usable; no emulator-name patterns live in this read gate.
     $pwshExe = Join-Path $PSHOME 'pwsh.exe'
     if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $DebugScript, '-ProjectPath', $ProjectPath, '-ProbeCheckOnly')
     if ($CcsRoot) { $a += @('-CcsRoot', $CcsRoot) }
-    $out = & $pwshExe @a 2>&1
-    $code = $LASTEXITCODE
+    # Retry the check itself, not just the PnP scan: right after a session exits the device
+    # re-enumerates, and for a moment PnP lists it while its driver is still loading - a
+    # single scan reports NO_PROBE for a probe that works one second later (measured
+    # 2026-11-15: -Stop printed "PROBE : re-enumerated", the very next -Start still failed).
+    $out = @()
+    $code = 1
+    # Up to 12 s, because after a session exits the device is listed in PnP well before its
+    # driver can actually open it: measured 2026-11-15, -Stop reported "PROBE :
+    # re-enumerated" and the next -Start still failed NO_PROBE three times in a row
+    # (3.6 s). A probe that is genuinely absent still ends up as NO_PROBE, just later.
+    for ($try = 1; $try -le 6; $try++) {
+        $out = @(& $pwshExe @a 2>&1)
+        $code = $LASTEXITCODE
+        $text = (@($out | ForEach-Object { [string]$_ }) -join "`n")
+        if ($code -eq 0 -and $text -match 'RESULT: OK') { break }
+        if ($try -lt 6) { Start-Sleep -Milliseconds 2000 }
+    }
     $text = (@($out | ForEach-Object { [string]$_ }) -join "`n")
     if ($code -eq 0 -and $text -match 'RESULT: OK') {
         if (-not $Quiet) {
@@ -502,115 +629,10 @@ function Test-AliveNow {
     return $r
 }
 <#
-Get-ImageCodeRanges -- where does THIS .out put its code?
-
-The obvious criterion is "PC < 0x080000", but that hard-codes one family's memory map:
-it breaks for a part whose Flash starts elsewhere (28335 keeps its Flash at 0x300000), for
-a build configured to boot from Flash, and for any future device. The image already knows
-its own layout, so ask the image:
-
-    * prefer <out>.map next to the .out (plain text, instant)
-    * otherwise ask ofd2000 --section_info from the compiler -CcsRoot points at
-    * if neither works return $null and let the caller fall back to the address test
-
-Only page-0 (code) sections that are actually allocated are kept. The .debug_* sections
-must be dropped explicitly: ofd2000 lists them at 0x00000000 with alloc=N, so a naive
-range test matches a live PC of 0x86DB into .debug_info - measured 2026-11-15.
-
-Returns @{ entry; ranges = @(@{name;start;end}); source = 'map'|'ofd2000' } or $null.
-#>
-$script:SectionMapCache = @{}
-
-function Get-ImageCodeRanges {
-    param(
-        [Parameter(Mandatory)][string]$OutFile,
-        [string]$CcsRoot = ''
-    )
-    if (-not (Test-Path -LiteralPath $OutFile)) { return $null }
-    if ($script:SectionMapCache.ContainsKey($OutFile)) { return $script:SectionMapCache[$OutFile] }
-
-    $ranges = @()
-    $entry = $null
-    $source = ''
-
-    $mapFile = [IO.Path]::ChangeExtension($OutFile, '.map')
-    if (Test-Path -LiteralPath $mapFile) {
-        $inAlloc = $false
-        foreach ($line in [IO.File]::ReadAllLines($mapFile)) {
-            if ($line -match 'SECTION ALLOCATION MAP') { $inAlloc = $true; continue }
-            if (-not $inAlloc) { continue }
-            $m = [regex]::Match($line, '^\s*(\S+)\s+(\d)\s+([0-9a-fA-F]{8})\s+([0-9a-fA-F]{8})')
-            if (-not $m.Success) { continue }
-            $name = $m.Groups[1].Value
-            if ($name -match '^\$|^\.debug' -or $m.Groups[2].Value -ne '0') { continue }
-            $start = [Convert]::ToInt64($m.Groups[3].Value, 16)
-            $size = [Convert]::ToInt64($m.Groups[4].Value, 16)
-            if ($size -le 0) { continue }
-            $ranges += [pscustomobject]@{ name = $name; start = $start; end = $start + $size }
-        }
-        if ($ranges.Count -gt 0) { $source = 'map' }
-    }
-
-    if ($ranges.Count -eq 0 -and $CcsRoot) {
-        $ofd = $null
-        $croot = Join-Path $CcsRoot 'tools\compiler'
-        if (Test-Path $croot) {
-            $ofd = @(Get-ChildItem $croot -Directory -Filter 'ti-cgt-c2000*' -ErrorAction SilentlyContinue |
-                Sort-Object Name -Descending |
-                ForEach-Object { Join-Path $_.FullName 'bin\ofd2000.exe' } |
-                Where-Object { Test-Path $_ }) | Select-Object -First 1
-        }
-        if ($ofd) {
-            $out = @(& $ofd $OutFile --section_info 2>&1) | ForEach-Object { [string]$_ }
-            foreach ($line in $out) {
-                if ($line -match 'Entry Point:\s+(0x[0-9a-fA-F]+)') { $entry = [Convert]::ToInt64($Matches[1].Substring(2), 16) }
-                $m = [regex]::Match($line, '^\s*(\d+)\s+(\S+)\s+(\d+)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+\d+\s+([YN])\s*$')
-                if (-not $m.Success) { continue }
-                $name = $m.Groups[2].Value
-                if ($name -match '^\$|^\.debug') { continue }
-                if ([int]$m.Groups[3].Value -ne 0) { continue }
-                if ($m.Groups[7].Value -ne 'Y') { continue }
-                $start = [Convert]::ToInt64($m.Groups[5].Value.Substring(2), 16)
-                $size = [Convert]::ToInt64($m.Groups[6].Value.Substring(2), 16)
-                if ($size -le 0) { continue }
-                $ranges += [pscustomobject]@{ name = $name; start = $start; end = $start + $size }
-            }
-            if ($ranges.Count -gt 0) { $source = 'ofd2000' }
-        }
-    }
-
-    if ($ranges.Count -eq 0) { $script:SectionMapCache[$OutFile] = $null; return $null }
-    $result = [ordered]@{ entry = $entry; ranges = @($ranges | Sort-Object start); source = $source }
-    $script:SectionMapCache[$OutFile] = $result
-    return $result
-}
-
-<#
-Test-RamImageEvidence -- proof 4: is the target executing THIS image right now?
-
-One register read answers two questions that used to be asked separately:
-
-    PC unreadable  -> TARGET_NOT_CONNECTED  (environment fault, no switch)
-    PC inside the image's own code sections -> executing this image   (pass)
-    PC outside them -> something else is running (Flash, another build) -> NOT_RAM_IMAGE
-
-"Inside the image's code sections" comes from Get-ImageCodeRanges, so the check follows
-the linker layout instead of a hard-coded Flash base. When no layout can be read it falls
-back to "PC below the C28x Flash base" and says so, so the weaker answer is never silent.
-
-The entry symbol (bare `main`, never `&main` which fails on C28x) is still read in the same
-round trip and printed as a cross-check, but it does NOT decide: symbol lookup is answered
-from the .out and succeeds even with the JTAG link down (V main 35469 measured while every
-byte read failed with "target is not connected").
-
--AllowUnverified skips the image verdict only, never the connection verdict.
-#>
-<#
 Get-ImageMemoryMap -- where can this image run, according to its own build?
 
-"RAM or Flash?" needs a memory map, and the only map that travels with the project is
-the linker's own. The .map file lists every MEMORY region with its name, origin and
-length, and those names are chosen in the linker command file:
+"RAM or Flash?" is checked against the exact linker map pinned at load. The .map
+file lists every MEMORY region with its name, origin and length:
 
     MEMORY CONFIGURATION
              name            origin    length      used     unused   attr
@@ -619,9 +641,7 @@ length, and those names are chosen in the linker command file:
       RAMLS0                00008000   00000800  000007fb  00000005  RWIX
       FLASHA                00080002   00001ffe  00000000  00001ffe  RWIX
 
-So "is the PC in RAM or Flash" becomes "which region does the PC fall into, and what did
-the linker call it" - no device table, no hard-coded 0x080000. A part whose Flash starts
-at 0x300000, a Flash-debug build, or a renamed region all work unchanged.
+No PC or fixed device address is involved. Unknown region names fail closed.
 
 Returns @{ regions = @(@{name;start;end;isFlash}); source = <path> } or $null.
 #>
@@ -633,18 +653,7 @@ function Get-ImageMemoryMap {
         [string]$OutFile = '',
         [string]$MapFile = ''
     )
-    $candidates = @()
-    if ($MapFile) { $candidates += $MapFile }
-    if ($OutFile) {
-        $candidates += [IO.Path]::ChangeExtension($OutFile, '.map')
-        $candidates += (Join-Path (Split-Path $OutFile -Parent) 'map') | ForEach-Object { Join-Path $_ ((Split-Path $OutFile -Leaf) -replace '\.out$', '.map') }
-    }
-    $dbg = Join-Path $ProjectPath 'Debug'
-    if (Test-Path -LiteralPath $dbg) {
-        $candidates += @(Get-ChildItem -LiteralPath $dbg -Filter '*.map' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-    }
-    $projName = Split-Path $ProjectPath -Leaf
-    $candidates += (Join-Path ([IO.Path]::GetTempPath()) "ti_c2000_build\$projName\$projName.map")
+    $candidates = if ($MapFile) { @($MapFile) } elseif ($OutFile) { @([IO.Path]::ChangeExtension($OutFile, '.map')) } else { @() }
 
     $map = @($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) | Select-Object -First 1
     if (-not $map) { return $null }
@@ -665,11 +674,9 @@ function Get-ImageMemoryMap {
         $size = [Convert]::ToInt64($m.Groups[3].Value, 16)
         if ($size -le 0) { continue }
         $name = $m.Groups[1].Value
-        # Only three answers matter for a program counter: Flash, RAM, or somewhere a
-        # core should not be executing (peripheral frame, reserved area). The linker
-        # names the first two itself, so no device table is involved.
+        # The linker names the region; an unrecognised name is not guessed into RAM.
         $kind = if ($name -match '^FLASH|^OTP|^SECURE') { 'FLASH' }
-                elseif ($name -match '^RAM|^BEGIN|^BOOT_RSVD') { 'RAM' }
+                elseif ($name -match '^RAM') { 'RAM' }
                 else { 'OTHER' }
         $regions += [pscustomobject]@{ name = $name; start = $start; end = $start + $size; kind = $kind }
     }
@@ -679,151 +686,85 @@ function Get-ImageMemoryMap {
     return $result
 }
 
-<#
-Get-RunLocation -- read the program counter and say where the core is executing.
-
-Returns code = '' (known), 'TARGET_NOT_CONNECTED' (no answer) or 'LOCATION_UNKNOWN'
-(no memory map). kind is 'RAM', 'FLASH' or 'OTHER' so the caller can report it instead
-of guessing. Nothing here refuses a Flash build: if you debug in Flash, that is the
-answer, not a failure - what must never happen is reporting Flash values without saying
-they came from Flash.
-#>
-function Get-RunLocation {
+# No PC read. The selected map is pinned by SHA256 at load time. The updater
+# function and its counter must both resolve into RAM regions of that map, .text
+# must also be RAM-linked, and the counter must move while this session runs.
+function Get-RamProofEvidence {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
-        [string]$OutFile = '',
+        [Parameter(Mandatory)][string]$OutFile,
+        [Parameter(Mandatory)]$SessionState,
         [string]$MapFile = ''
     )
-    $r = [ordered]@{ ok = $false; pc = ''; region = ''; kind = ''; code = ''; text = '' }
-
-    $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC')
-    $pcValue = $null
-    if ($lines) {
-        foreach ($line in $lines) {
-            $m = [regex]::Match([string]$line, '^V\s+PC\s+(\S+)\s*$')
-            if (-not $m.Success) { continue }
-            $raw = $m.Groups[1].Value
-            if ($raw -match '^0[xX]([0-9A-Fa-f]+)$') { $pcValue = [Convert]::ToInt64($Matches[1], 16) }
-            elseif ($raw -match '^(-?\d+)$') { $pcValue = [int64]$Matches[1] }
-        }
+    $r = [ordered]@{ ok = $false; kind = 'UNKNOWN'; region = ''; code = 'RAM_PROOF_UNAVAILABLE'; text = ''; counter = ''; first = ''; last = ''; mapSha256 = '' }
+    if (-not $MapFile) { $MapFile = [string]$SessionState.map }
+    if (-not $MapFile -or -not (Test-Path -LiteralPath $MapFile)) {
+        $r.text = 'the selected image has no linker map'; return $r
     }
-    if ($null -eq $pcValue) {
-        $r.code = 'TARGET_NOT_CONNECTED'
-        $r.text = 'target NOT connected (PC unreadable) - the process may be alive but the JTAG link is gone'
-        return $r
+    $MapFile = (Get-Item -LiteralPath $MapFile).FullName
+    if ([string]$SessionState.map -ne $MapFile -or -not $SessionState.mapSha256) {
+        $r.text = 'the map is not the one pinned by the retained load'; return $r
     }
-    $r.pc = ('0x{0:X8}' -f $pcValue)
-
+    $sha = (Get-FileHash -LiteralPath $MapFile -Algorithm SHA256).Hash
+    $r.mapSha256 = $sha
+    if ($sha -ne [string]$SessionState.mapSha256) {
+        $r.code = 'STALE_MAP'; $r.text = 'the map changed after the image was loaded'; return $r
+    }
     $map = Get-ImageMemoryMap -ProjectPath $ProjectPath -OutFile $OutFile -MapFile $MapFile
-    if (-not $map) {
-        $r.code = 'LOCATION_UNKNOWN'
-        $r.text = ('PC = {0}; no .map found, so RAM/Flash cannot be told apart' -f $r.pc)
-        return $r
+    if (-not $map -or $map.source -ne $MapFile) {
+        $r.text = 'the selected map has no readable MEMORY configuration'; return $r
     }
-    $hit = @($map.regions | Where-Object { $pcValue -ge $_.start -and $pcValue -lt $_.end }) | Select-Object -First 1
-    if (-not $hit) {
-        $r.ok = $false
-        $r.kind = 'OTHER'
-        $r.text = ('PC = {0} is in none of the {1} MEMORY regions of this build - the core is running something else' -f $r.pc, $map.regions.Count)
-        return $r
-    }
-    $r.region = $hit.name
-    $r.kind = $hit.kind
-    $r.ok = ($hit.kind -ne 'OTHER')
-    $r.text = ('PC = {0} -> region {1} ({2}), map {3}' -f $r.pc, $hit.name, $hit.kind, (Split-Path $map.source -Leaf))
-    return $r
-}
-
-<#
-Test-RamImageEvidence -- legacy address-based check, kept for callers that have no map.
-Prefer Get-RunLocation: it reports RAM vs FLASH instead of refusing anything not in RAM.
-#>
-function Test-RamImageEvidence {
-    param(
-        [Parameter(Mandatory)][string]$ProjectPath,
-        # the image whose layout decides "is the PC inside our code"; omit and the check
-        # falls back to the device-table address test
-        [string]$OutFile = '',
-        [string]$CcsRoot = '',
-        [switch]$AllowUnverified
-    )
-
-    $r = [ordered]@{ ok = $false; verified = $false; pc = ''; symbol = ''; address = ''; section = ''; text = ''; code = '' }
-
-    # one round trip: the register (needs a live link) and the symbol (does not)
-    $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @('PC', 'main', '_main', '_c_int00')
-    if (-not $lines) {
-        $r.code = 'TARGET_NOT_CONNECTED'
-        $r.text = 'target NOT connected (the session did not answer) - the process may be alive but the JTAG link is gone'
-        return $r   # no -AllowUnverified here: an unplugged board is not an unverified image
-    }
-
-    $pcValue = $null
-    $symbolAddr = $null
-    $symbolName = ''
-    $pcFailed = $false
-    foreach ($line in $lines) {
-        $s = [string]$line
-        if ($s -match '^E\s+PC\b') { $pcFailed = $true; continue }
-        $m = [regex]::Match($s, '^V\s+&?(\w+)\s+(\S+)\s*$')
+    $codeSections = @()
+    $inAlloc = $false
+    foreach ($line in [IO.File]::ReadAllLines($MapFile)) {
+        if ($line -match 'SECTION ALLOCATION MAP') { $inAlloc = $true; continue }
+        if (-not $inAlloc) { continue }
+        $m = [regex]::Match($line,'^\s*(\.text(?:[.:]\S+)?)\s+0\s+([0-9a-fA-F]{8})\s+([0-9a-fA-F]{8})')
         if (-not $m.Success) { continue }
-        $name = $m.Groups[1].Value
+        $start = [Convert]::ToInt64($m.Groups[2].Value,16)
+        $size = [Convert]::ToInt64($m.Groups[3].Value,16)
+        if ($size -le 0) { continue }
+        $hit = @($map.regions | Where-Object { $start -ge $_.start -and ($start+$size) -le $_.end }) | Select-Object -First 1
+        $codeSections += [pscustomobject]@{ name=$m.Groups[1].Value; region=$hit; start=$start; size=$size }
+    }
+    if ($codeSections.Count -eq 0) { $r.text = 'no allocated .text section in the selected map'; return $r }
+    $badText = @($codeSections | Where-Object { -not $_.region -or $_.region.kind -ne 'RAM' })
+    if ($badText.Count -gt 0) {
+        $r.kind = if (@($badText | Where-Object { $_.region -and $_.region.kind -eq 'FLASH' }).Count) { 'FLASH' } else { 'UNKNOWN' }
+        $r.code = 'NOT_RAM_IMAGE'; $r.text = '.text is not entirely RAM-linked'; return $r
+    }
+    $contract = Get-FwContract
+    $symbols = @([string]$contract.ramProof.updater,[string]$contract.ramProof.counter)
+    $lines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs $symbols -Kind ADDR
+    if (-not $lines) { $r.code = 'TARGET_NOT_CONNECTED'; $r.text = 'DSS did not answer the symbol-address request'; return $r }
+    $addresses = @{}
+    foreach ($line in $lines) {
+        $m = [regex]::Match([string]$line,'^P\s+(\S+)\s+(\S+)\s*$')
+        if (-not $m.Success) { continue }
         $raw = $m.Groups[2].Value
-        $addr = [int64]0
-        $parsed = $false
-        if ($raw -match '^0[xX]([0-9A-Fa-f]+)$') { $addr = [Convert]::ToInt64($Matches[1], 16); $parsed = $true }
-        elseif ($raw -match '^(-?\d+)$') { $addr = [int64]$Matches[1]; $parsed = $true }
-        if (-not $parsed) { continue }
-        if ($name -eq 'PC') { $pcValue = $addr }
-        elseif (-not $symbolName -and $addr -gt 0) { $symbolName = $name; $symbolAddr = $addr }
+        $v = [long]0
+        if ($raw -match '^0[xX]([0-9A-Fa-f]+)$') { try { $v = [Convert]::ToInt64($Matches[1],16) } catch { } }
+        else { [void][long]::TryParse($raw,[ref]$v) }
+        if ($v -gt 0) { $addresses[$m.Groups[1].Value] = $v }
     }
-
-    if ($null -eq $pcValue) {
-        $r.code = 'TARGET_NOT_CONNECTED'
-        $r.text = $(if ($pcFailed) {
-                'target NOT connected (PC read failed) - the process may be alive but the JTAG link is gone'
-            } else {
-                'target NOT connected (PC returned no value) - the JTAG link is gone'
-            })
-        return $r   # again: no bypass, the board is not there
-    }
-
-    $r.verified = $true
-    $r.pc = ('0x{0:X8}' -f $pcValue)
-    if ($symbolName) { $r.symbol = $symbolName; $r.address = ('0x{0:X8}' -f $symbolAddr) }
-    $symText = if ($symbolName) { (' (entry {0} = {1})' -f $symbolName, $r.address) } else { '' }
-
-    # which section is the core actually in?
-    $map = $null
-    if ($OutFile) { $map = Get-ImageCodeRanges -OutFile $OutFile -CcsRoot $CcsRoot }
-    if ($map) {
-        $hit = @($map.ranges | Where-Object { $pcValue -ge $_.start -and $pcValue -lt $_.end }) | Select-Object -First 1
-        if ($hit) {
-            $r.ok = $true
-            $r.section = $hit.name
-            $r.text = ('executing this image: PC = {0} inside {1} (0x{2:X8}..0x{3:X8}, layout from {4}){5}' -f `
-                    $r.pc, $hit.name, $hit.start, $hit.end, $map.source, $symText)
-            return $r
+    foreach ($symbol in $symbols) {
+        if (-not $addresses.ContainsKey($symbol)) { $r.text = "symbol $symbol has no address in the loaded image"; return $r }
+        $address = [long]$addresses[$symbol]
+        $region = @($map.regions | Where-Object { $address -ge $_.start -and $address -lt $_.end }) | Select-Object -First 1
+        if (-not $region -or $region.kind -ne 'RAM') {
+            $r.kind = if ($region -and $region.kind -eq 'FLASH') { 'FLASH' } else { 'UNKNOWN' }
+            $r.code = 'NOT_RAM_IMAGE'; $r.text = "$symbol is not in a RAM run region"; return $r
         }
-        $r.ok = $false
-        $r.text = ('PC = {0} is outside every code section of this image ({1}) - something else is running{2}' -f `
-                $r.pc, (($map.ranges | ForEach-Object { $_.name }) -join ', '), $symText)
-        if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
-        return $r
+        if ($symbol -eq $contract.ramProof.updater) { $r.region = [string]$region.name }
     }
-
-    # no layout available: device-table fallback, and the text says so - never silent
-    if ($pcValue -lt $script:C28xFlashBase) {
-        $r.ok = $true
-        $r.text = ('PC = {0} is below the C28x Flash base 0x080000 (device-table fallback: no image layout available){1}' -f $r.pc, $symText)
-        return $r
-    }
-    $r.ok = $false
-    $r.text = ('PC = {0} is at or above the C28x Flash base 0x080000 (device-table fallback: no image layout available){1}' -f $r.pc, $symText)
-    if ($AllowUnverified) { $r.ok = $true; $r.text += ' - allowed by -AllowUnverified' }
+    $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates @([string]$contract.ramProof.counter)
+    if (-not $alive.ok) { $r.code = 'RAM_PROOF_NOT_ADVANCING'; $r.text = $alive.reason; return $r }
+    $r.ok = $true; $r.kind = 'RAM'; $r.code = ''; $r.counter = $alive.name
+    $r.first = $alive.first; $r.last = $alive.last
+    $r.text = ('RAM-linked .text and updater {0} in {1}; {2} advanced {3}->{4}; map SHA256 {5}' -f `
+        $contract.ramProof.updater,$r.region,$r.counter,$r.first,$r.last,$sha.Substring(0,16))
     return $r
 }
-
 
 <#
 Invoke-LoadReadLoop -- -MaxLoads N of LoadRead: re-run this same reader once per
@@ -898,6 +839,58 @@ function Invoke-LoadReadLoop {
     return [ordered]@{ converged = $converged; attempts = $done; reason = $reason }
 }
 
+# A confirmed load is performed by the retained service, followed by the normal
+# ReadOnly gate in the SAME DSS session. The service is left running for further
+# reads; no end-of-read halt/disconnect is necessary.
+function Invoke-RetainedLoadRead {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Bound,
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [switch]$Quiet
+    )
+    $pwshExe = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
+    $service = Join-Path $PSScriptRoot 'ti_c2000_service.ps1'
+    $live = Get-LiveSessionInfo -ProjectPath $ProjectPath
+    if ($live.alive) {
+        Write-Output 'STEP    : replacing the existing session for the approved load'
+        $stopArgs = @('-NoProfile','-File',$service,'-ProjectPath',$ProjectPath,'-Stop')
+        if ($Bound.ContainsKey('CcsRoot') -and [string]$Bound['CcsRoot']) { $stopArgs += @('-CcsRoot',[string]$Bound['CcsRoot']) }
+        $stop = @(& $pwshExe @stopArgs 2>&1)
+        if ($LASTEXITCODE -ne 0 -or -not @($stop | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
+            foreach ($line in $stop) { if ([string]$line -notmatch '^(RESULT|FAILURE):') { Write-Output ([string]$line) } }
+            Write-Output 'FAILURE: STOP_FAILED'; Write-Output 'RESULT: FAIL'; exit 1
+        }
+    }
+    $startArgs = @('-NoProfile','-File',$service,'-ProjectPath',$ProjectPath,'-Start','-ConfirmLoad')
+    foreach ($key in @('Ccxml','OutFile','MapFile','CcsRoot','CorePattern')) {
+        if ($Bound.ContainsKey($key) -and [string]$Bound[$key]) { $startArgs += @('-' + $key,[string]$Bound[$key]) }
+    }
+    if ($Bound.ContainsKey('Build') -and $Bound['Build']) { $startArgs += '-Build' }
+    if ($Quiet) { $startArgs += '-Quiet' }
+    $start = @(& $pwshExe @startArgs 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not @($start | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
+        foreach ($line in $start) { if ([string]$line -notmatch '^(RESULT|FAILURE):') { Write-Output ([string]$line) } }
+        Write-Output 'FAILURE: LOAD_FAILED'; Write-Output 'RESULT: FAIL'; exit 1
+    }
+    foreach ($line in $start) { if ([string]$line -match '^(LOAD|LOADS|IMAGE|SERVICE|PROBE)') { Write-Output ([string]$line) } }
+    $readArgs = @('-NoProfile','-File',$ScriptPath,'-ProjectPath',$ProjectPath,'-Mode','ReadOnly')
+    foreach ($key in @($Bound.Keys)) {
+        if ($key -in @('ProjectPath','Mode','ConfirmLoad','Build','Standalone','Expect','MaxLoads','NoProbeCheck','AllowUnverified')) { continue }
+        $value = $Bound[$key]
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { $readArgs += ('-' + $key) }
+        } elseif ($value -is [array]) {
+            $readArgs += ('-' + $key); $readArgs += (@($value) -join ',')
+        } else {
+            $readArgs += ('-' + $key); $readArgs += [string]$value
+        }
+    }
+    & $pwshExe @readArgs
+    exit $LASTEXITCODE
+}
+
 <#
 SKILL IDENTITY AND PROJECT HYGIENE -- the two things that make "the run went through
 the skill" checkable instead of assumed.
@@ -910,20 +903,36 @@ entry point calls Initialize-SkillRun once, which
      skill directory and its version, so check_project_entry.ps1 -MaxRunAgeMinutes can
      later prove the last operation came from the skill and not from somewhere else.
 
-The version is the first 8 hex of sha256(SKILL.md): it changes when the skill changes,
-so a stale copy of the skill is visible in the record.
+The version is the first 8 hex of a SHA256 over sorted paths and content hashes of
+the entrypoint, runtime scripts, references and maintenance tools. Script-only edits
+therefore change the version too.
 #>
 $script:SkillCopyNamePattern = '^ti_c2000_.*\.(ps1|js)$'
 $script:SkillCopyExact = @('verify_on_target.ps1', 'dss_load_run_read.js', 'run_hold.js')
 
 function Get-SkillIdentity {
-    $skillRoot = Split-Path $PSScriptRoot -Parent
+    param([string]$SkillRoot = '')
+    if (-not $SkillRoot) { $SkillRoot = Split-Path $PSScriptRoot -Parent }
+    $skillRoot = $SkillRoot
     $ver = 'unknown'
     $md = Join-Path $skillRoot 'SKILL.md'
     if (Test-Path -LiteralPath $md) {
         try {
-            $h = (Get-FileHash -LiteralPath $md -Algorithm SHA256).Hash
-            $ver = $h.Substring(0, 8).ToLower()
+            $files = @($md, (Join-Path $skillRoot 'AGENTS.md'))
+            foreach ($sub in @('scripts','references','tools')) {
+                $dir = Join-Path $skillRoot $sub
+                if (Test-Path -LiteralPath $dir) {
+                    $files += @(Get-ChildItem -LiteralPath $dir -Recurse -File | Where-Object { $_.Extension -in @('.ps1','.js','.md','.json') } | ForEach-Object { $_.FullName })
+                }
+            }
+            $manifest = New-Object Text.StringBuilder
+            foreach ($file in @($files | Where-Object { Test-Path -LiteralPath $_ } | Sort-Object -Unique)) {
+                $rel = [IO.Path]::GetRelativePath($skillRoot,$file).Replace('\','/')
+                $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+                [void]$manifest.Append($rel).Append(' ').Append($hash).Append("`n")
+            }
+            $h = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($manifest.ToString()))
+            $ver = [Convert]::ToHexString($h).Substring(0,8).ToLowerInvariant()
         } catch { }
     }
     return [ordered]@{ root = $skillRoot; version = $ver }
@@ -981,7 +990,7 @@ function Initialize-SkillRun {
     )
     if (-not $Script) { $Script = Split-Path -Leaf $PSCommandPath }
     $id = Get-SkillIdentity
-    if (-not $Quiet) { Write-Output ('SKILL   : ti-c2000-ccs-auto@' + $id.version) }
+    Write-Output ('SKILL   : ti-c2000-ccs-auto@' + $id.version)
 
     $copies = Get-SkillScriptCopies -ProjectPath $ProjectPath
     if ($copies.Count -gt 0) {

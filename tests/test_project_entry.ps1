@@ -40,6 +40,7 @@ try {
 
     # ---- 3. a copy of a skill script in the project -------------------------
     Write-Text (Join-Path $proj 'AGENTS.md') $goodDoc
+    Write-Text (Join-Path $proj 'CLAUDE.md') $goodDoc
     $r = Invoke-Script @('-NoProfile', '-File', $check, '-ProjectPath', $proj)
     if ($r.code -ne 0) { throw "a clean project was rejected`n$($r.text)" }
     Write-Text (Join-Path $proj 'Tools/scripts/ti_c2000_runlog.ps1') '# stale copy'

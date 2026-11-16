@@ -88,6 +88,7 @@ function Get-ContractProblems {
     }
 
     $idVar = [string]$c.identity.var
+    if (-not $c.ramProof.counter -or -not $c.ramProof.updater) { $problems.Add('ramProof.counter/updater is required') }
     $hbCands = @($c.heartbeat.candidates | ForEach-Object { [string]$_ })
     $hbKey = (($hbCands | Sort-Object) -join ',')
     $rateVar = [string]$c.rate.var
@@ -95,11 +96,48 @@ function Get-ContractProblems {
     $flagWant = Normalise-Flag $c.frozenBuffer.flagValue
     $seqVar = [string]$c.frozenBuffer.seq
     $arrayVar = [string]$c.frozenBuffer.array
-    $contractNames = @(@($idVar, $rateVar, $flagVar, $seqVar, $arrayVar) + $hbCands | Where-Object { $_ } | Sort-Object -Unique)
+    $contractNames = @(@($idVar, $rateVar, $flagVar, $seqVar, $arrayVar, [string]$c.ramProof.counter) + $hbCands | Where-Object { $_ } | Sort-Object -Unique)
+
+    # Safety policy is part of the contract too. A missing/relaxed gate must be a
+    # contract error, not a silent fallback to whatever an entry script happens to do.
+    if ([int]$c.version -lt 3) { $problems.Add('contract version must be 3 or newer (freshness/response gates required)') }
+    foreach ($key in @('requireProbe','requireLiveSession','requireOutSha256','requireSourceFreshness','requireCompleteDssResponse','requireFirmwareIdentity','requireRam','requireHeartbeat')) {
+        if ($c.readGate.$key -isnot [bool] -or -not $c.readGate.$key) {
+            $problems.Add("readGate.$key must be true")
+        }
+    }
+    foreach ($pair in @(@('minLoadGapMs',5000),@('minReadGapMs',400),@('minReconnectGapMs',400))) {
+        $v = 0
+        if (-not [int]::TryParse([string]$c.timing.($pair[0]),[ref]$v) -or $v -lt [int]$pair[1]) {
+            $problems.Add(('timing.{0} must be at least {1} ms' -f $pair[0],$pair[1]))
+        }
+    }
 
     foreach ($f in (Get-ChildItem -LiteralPath $Scripts -Filter *.ps1 -File)) {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
         if (-not $ast.ParamBlock) { continue }
+
+        if ($f.Name -in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+            $calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] },$true) |
+                ForEach-Object { $_.GetCommandName() })
+            foreach ($required in @('Get-SelectedOutFreshEvidence','Initialize-ReadFailureVerdict','Get-RamProofEvidence')) {
+                if ($calls -notcontains $required) {
+                    $problems.Add(('{0}: required read gate {1} is not called' -f $f.Name,$required))
+                }
+            }
+        }
+
+        # Runtime literals were missed by the original audit. A duplicated fallback
+        # candidate list can drift even when every parameter default agrees.
+        if ($f.Name -in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+            $runtime = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayExpressionAst] -or $n -is [System.Management.Automation.Language.ArrayLiteralAst] }, $true) |
+                Where-Object { $_.Extent.Text -match 'gMsTick' -and $_.Extent.Text -match 'usMainLoop' })
+            foreach ($node in $runtime) {
+                if ($node.Extent.Text -match 'gRunMs') {
+                    $problems.Add(('{0}:{1}: runtime heartbeat list duplicated; call Get-FwContract instead' -f $f.Name,$node.Extent.StartLineNumber))
+                }
+            }
+        }
 
         foreach ($p in $ast.ParamBlock.Parameters) {
             $name = $p.Name.VariablePath.UserPath
@@ -186,6 +224,8 @@ param(
         if ($text -notmatch 'FrozenValue') { $miss += 'FrozenValue drift' }
         if ($text -notmatch 'heartbeat candidates') { $miss += 'heartbeat set drift' }
         if ($text -notmatch 'gSomeOtherId') { $miss += 'symbol outside the contract' }
+        if ($text -notmatch 'readGate.requireSourceFreshness') { $miss += 'missing source freshness gate' }
+        if ($text -notmatch 'readGate.requireCompleteDssResponse') { $miss += 'missing DSS response gate' }
         $noise = @($found | Where-Object { $_ -match 'good\.ps1' })
 
         if ($miss.Count -gt 0) {

@@ -20,7 +20,7 @@ Exit code: 0 clean | 1 violations found | 2 bad arguments
 param(
     [Parameter(Mandatory)][string]$ProjectPath,
     # how many levels above the CCS project folder to look for the entry documents
-    [int]$EntrySearchDepth = 3,
+    [int]$EntrySearchDepth = 0,
     # 0 = do not look at the run log. N > 0 requires the newest entry in
     # readout\skill-runs.jsonl to be at most N minutes old and to come from this skill,
     # i.e. proof that the last operation actually went through the skill.
@@ -31,6 +31,7 @@ param(
 $ErrorActionPreference = 'Continue'
 function Out2($m) { Write-Output $m }
 function Info2($m) { if (-not $Quiet) { Write-Output $m } }
+. (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
 
 if (-not (Test-Path -LiteralPath $ProjectPath)) {
     Out2 'FAILURE: NO_PROJECT'
@@ -70,6 +71,16 @@ if ($copies.Count -gt 0) {
 # (and therefore reads AGENTS.md from) is one level above. Stopping early is exactly how
 # "the document exists but nobody reads it" happens.
 $entryNames = @('AGENTS.md', 'CODEBUDDY.md', 'CLAUDE.md')
+$rootEntries = @($entryNames | ForEach-Object { Join-Path $root $_ })
+$missingRoot = @($rootEntries | Where-Object { -not (Test-Path -LiteralPath $_) })
+if ($missingRoot.Count -gt 0) {
+    $violations.Add(('project root is missing AI entry file(s): ' + (($missingRoot | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') + '; run tools/init_project_entry.ps1 or merge existing instructions'))
+} else {
+    $entryTexts = @($rootEntries | ForEach-Object { [IO.File]::ReadAllText($_) })
+    if (@($entryTexts | Sort-Object -Unique).Count -ne 1) {
+        $violations.Add('project root AGENTS.md / CODEBUDDY.md / CLAUDE.md differ; AI tools would follow different rules')
+    }
+}
 $dir = $root
 $found = @()
 for ($i = 0; $i -le $EntrySearchDepth -and $dir; $i++) {
@@ -119,7 +130,7 @@ if ($found.Count -eq 0) {
 
 # ---------- 3. proof that the last operation came from this skill ----------------
 # Documents ask; the run log proves. Every entry point stamps readout\skill-runs.jsonl
-# with its script, this skill's directory and the sha256 of SKILL.md, so "the last thing
+# with its script, this skill's directory and the content version, so "the last thing
 # that touched this project really was the skill" becomes a fact that can be checked.
 if ($MaxRunAgeMinutes -gt 0) {
     $log = Join-Path $root 'readout\skill-runs.jsonl'
@@ -133,6 +144,8 @@ if ($MaxRunAgeMinutes -gt 0) {
         } catch { }
         if (-not $last) {
             $violations.Add('readout\skill-runs.jsonl exists but the last line is unreadable')
+        } elseif ([string]$last.version -ne (Get-SkillIdentity).version) {
+            $violations.Add(('the newest run used skill version {0}, current installed version is {1}' -f $last.version,(Get-SkillIdentity).version))
         } else {
             $age = $null
             try { $age = ((Get-Date) - [datetime]::ParseExact([string]$last.at, 'yyyy-MM-dd HH:mm:ss', $null)).TotalMinutes } catch { }
@@ -151,7 +164,8 @@ if ($MaxRunAgeMinutes -gt 0) {
 
 # ---------- report ---------------------------------------------------------------
 Info2 ('PROJECT : ' + $root)
-Info2 ('SKILL   : ' + $script:skillToken)
+$skillVersion = (Get-SkillIdentity).version
+Out2 ('SKILL   : ti-c2000-ccs-auto@' + $skillVersion)
 foreach ($n in $notes) { Info2 ('CHECK   : ' + $n) }
 if ($violations.Count -gt 0) {
     foreach ($v in $violations) { Out2 ('VIOLATION: ' + $v) }

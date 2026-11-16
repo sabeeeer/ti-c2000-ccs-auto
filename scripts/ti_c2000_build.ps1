@@ -59,6 +59,8 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'   # native compiler stderr must not abort the loop
+. (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
+Write-Output ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
 if ($Stage -and $NoStage) { Write-Output 'FAILURE: MODE_CONFLICT'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: -Stage and -NoStage cannot be combined'; exit 2 }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 
@@ -707,6 +709,13 @@ if ($ok) {
     if ($Stage -and -not $NoStage) {
         New-Item -ItemType Directory -Force -Path (Split-Path $stagedOut -Parent) | Out-Null
         Copy-Item -LiteralPath $outFile -Destination $stagedOut -Force
+        $linkedMap = Join-Path $OutputDir "$projName.map"
+        if (-not (Test-Path -LiteralPath $linkedMap)) {
+            Write-Output 'FAILURE: MAP_MISSING'; Write-Output 'RESULT: FAIL'
+            Write-Output 'REASON: linker reported success without its map; RAM proof cannot be checked'
+            exit 1
+        }
+        Copy-Item -LiteralPath $linkedMap -Destination ([IO.Path]::ChangeExtension($stagedOut, '.map')) -Force
         Write-Output ("staged    : {0}" -f $stagedOut)
     }
     Write-Output ("log       : {0}" -f $logFile)

@@ -45,15 +45,20 @@ param(
     [int]$Rounds = 10,
     [int]$IntervalMs = 500,
     [int]$RequestTimeoutMs = 15000,
-    [int]$ValueMin = [int]::MinValue,
-    [int]$ValueMax = [int]::MaxValue,
+    [int]$WaitMs = 10000,
+    [Nullable[double]]$ValueMin = $null,
+    [Nullable[double]]$ValueMax = $null,
     [switch]$NoHeartbeat,
+    # This protocol client is internal; the public readers hold the project lock and
+    # complete the probe/image preflight before they launch it.
+    [int]$ParentPid = 0,
     [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Continue'
 function Out2($m) { Write-Output $m }
 function Info2($m) { if (-not $Quiet) { Write-Output $m } }
+. (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
 
 # Compare a firmware flag with the value the caller expects. In C "true" and 1 are the same
 # statement and a flag may surface either way, so normalise both spellings instead of
@@ -85,6 +90,13 @@ if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) {
     Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
 }
 $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
+$owner = Get-TargetLockInfo -ProjectPath $ProjectPath
+if ($ParentPid -le 0 -or -not $owner -or $owner.pid -ne $ParentPid -or $owner.mode -ne 'ReadOnly' -or
+    -not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
+    Out2 'FAILURE: INTERNAL_ONLY'; Out2 'RESULT: FAIL'
+    Out2 'REASON: use ti_c2000_run_read.ps1 or ti_c2000_read_dma.ps1; their preflight owns the ReadOnly lock'
+    exit 2
+}
 $names = @($Variables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if ($names.Count -eq 0 -and -not $ArrayName) {
     Out2 'FAILURE: NEED_REQUEST'; Out2 'RESULT: FAIL'
@@ -94,7 +106,14 @@ if ($names.Count -gt 0 -and $ArrayName) {
     Out2 'FAILURE: AMBIGUOUS_REQUEST'; Out2 'RESULT: FAIL'
     Out2 'REASON: use -Variables or -ArrayName, not both'; exit 2
 }
-if ($NoHeartbeat) { $HeartbeatExpr = '' }
+if ($ArrayName -and -not $FrozenValue.Trim()) {
+    Out2 'FAILURE: FROZEN_VALUE_REQUIRED'; Out2 'RESULT: FAIL'
+    Out2 'REASON: a frozen array requires an explicit completed flag value'; exit 2
+}
+if ($NoHeartbeat) {
+    Out2 'FAILURE: READ_PROOF_BYPASS'; Out2 'RESULT: FAIL'
+    Out2 'REASON: a trusted live read requires a heartbeat'; exit 2
+}
 $heartbeats = @($HeartbeatExpr -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 # the rate variable is read the same way as a heartbeat (own tolerant request), so the
 # counter the caller wants timed does not have to appear in -Variables as well
@@ -149,6 +168,7 @@ function Send-Request([string]$Text, [int]$TimeoutMs) {
         Start-Sleep -Milliseconds 30
     }
     if (Test-Path -LiteralPath $resFile) { return $null }
+    Wait-MinReadGap -ProjectPath $ProjectPath
     # Write the request through a temp file and rename: the service polls cmd.txt with
     # readText(), and a direct WriteAllText truncates it first, so the service can read an
     # empty or half-written command and answer "E unknown command" - which the caller then
@@ -174,13 +194,13 @@ function ConvertFrom-Response([string]$raw) {
     # [object key] and an [int index] overload, so `$arr[[int]$n] = v` silently takes the
     # positional one and throws "index out of range" for every sample. That dropped all
     # 400 values and surfaced as COUNT_MISMATCH "got 0 values, expected 400" (2026-11-15).
-    $o = [ordered]@{ halted = $false; end = $false; vars = [ordered]@{}; arr = @{}; errors = @() }
+    $o = [ordered]@{ halted = $false; statusCount = 0; end = $false; endCount = 0; vars = [ordered]@{}; arr = @{}; errors = @() }
     foreach ($line in ($raw -split "`r?`n")) {
-        if ($line -match '^HALTED ([01])\s*$') { $o.halted = ($Matches[1] -eq '1') }
+        if ($line -match '^HALTED ([01])\s*$') { $o.halted = ($Matches[1] -eq '1'); $o.statusCount++ }
         elseif ($line -match '^V (\S+) (.*)$') { $o.vars[$Matches[1]] = $Matches[2].Trim() }
         elseif ($line -match '^A (\d+) (\S+)\s*$') { $o.arr[[int]$Matches[1]] = $Matches[2] }
         elseif ($line -match '^E (.*)$') { $o.errors += $Matches[1] }
-        elseif ($line -match '^END\s*$') { $o.end = $true }
+        elseif ($line -match '^END\s*$') { $o.end = $true; $o.endCount++ }
     }
     return $o
 }
@@ -192,9 +212,9 @@ function Request([string]$Text) {
         exit 1
     }
     $r = ConvertFrom-Response $raw
-    if (-not $r.end) {
+    if ($r.statusCount -ne 1 -or $r.endCount -ne 1) {
         Out2 'FAILURE: SERVICE_PROTOCOL'; Out2 'RESULT: FAIL'
-        Out2 'REASON: response had no END marker; restart the service'; exit 1
+        Out2 'REASON: response must contain one HALTED status and one END marker'; exit 1
     }
     if ($r.halted) {
         Out2 'FAILURE: TARGET_HALTED_DURING_READ'; Out2 'RESULT: FAIL'
@@ -204,10 +224,8 @@ function Request([string]$Text) {
         Out2 'FAILURE: VALUE_READ_FAILED'; Out2 'RESULT: FAIL'
         Out2 ('REASON: ' + ($r.errors -join '; '))
         $all = ($r.errors -join ' ')
-        # "member 'X' not found" on C2837x almost always means the bitfield was skipped:
-        # ADCPWDNZ lives in ADCCTL1.bit, not in ADCCTL1. Saying so saves a round trip.
         if ($all -match "member '([^']+)' not found") {
-            Out2 ('HINT    : on C2837x a control bit sits in a bitfield - write Reg.BITFIELD.bit.NAME, e.g. AdcaRegs.ADCCTL1.bit.' + $Matches[1])
+            Out2 ('HINT    : member ' + $Matches[1] + ' was not found; check the selected device header and register field path')
         } elseif ($all -match 'identifier not found') {
             Out2 'HINT    : identifier not found - check the exact spelling against the .map of THIS build; a renamed, static or optimised-out symbol looks the same'
         }
@@ -227,7 +245,7 @@ function Request-Soft([string]$Text) {
     $raw = Send-Request $Text $RequestTimeoutMs
     if ($null -eq $raw) { return $null }
     $r = ConvertFrom-Response $raw
-    if (-not $r.end) { return $null }
+    if ($r.statusCount -ne 1 -or $r.endCount -ne 1) { return $null }
     if ($r.halted) { return $null }
     return $r
 }
@@ -236,8 +254,15 @@ $dataDir = Join-Path $ProjectPath 'readout\data'
 $checkDir = Join-Path $ProjectPath 'readout\check'
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 New-Item -ItemType Directory -Path $checkDir -Force | Out-Null
+foreach ($old in @((Join-Path $dataDir 'data.csv'),(Join-Path $dataDir 'array.csv'),(Join-Path $checkDir 'verdict.txt'))) {
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
+}
 $utf8Bom = New-Object Text.UTF8Encoding($true)
 $verdictScript = Join-Path $PSScriptRoot 'ti_c2000_check_read.ps1'
+if (-not (Test-Path -LiteralPath $verdictScript)) {
+    Out2 'FAILURE: ENV_NO_VERDICT_SCRIPT'; Out2 'RESULT: FAIL'
+    Out2 'REASON: mandatory CSV verdict script is missing'; exit 2
+}
 $pwshExe = Join-Path $PSHOME 'pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
 
@@ -256,6 +281,16 @@ Info2 ('OUT     : {0}' -f $state.out)
 # ---------------------------------------------------------------- array ------
 if ($ArrayName) {
     $total = $Rows * $Columns
+    if ($null -eq $ExpectFwId -or -not $FwIdVar) {
+        Out2 'FAILURE: FW_ID_UNREADABLE'; Out2 'RESULT: FAIL'
+        Out2 'REASON: frozen array reads require the loaded firmware identity'; exit 4
+    }
+    $fwBefore = Request ('VARS ' + $FwIdVar)
+    $fwBeforeValue = [string]$fwBefore.vars[$FwIdVar]
+    if (-not (Test-FlagEquals $fwBeforeValue ([string]$ExpectFwId))) {
+        Out2 'FAILURE: FW_ID_MISMATCH'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: firmware identity before array copy was {0}, expected {1}' -f $fwBeforeValue,$ExpectFwId); exit 4
+    }
     if ($FrozenFlag) {
         # a build without the freeze flag has nothing safe to copy; say so plainly
         # instead of failing with a generic symbol error
@@ -275,7 +310,16 @@ if ($ArrayName) {
             Out2 ('REASON: ' + ($probe.errors -join '; ')); exit 1
         }
     }
-    $pre = Request (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|'))
+    $deadline = (Get-Date).AddMilliseconds($WaitMs)
+    do {
+        $pre = Request (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|'))
+        if (Test-FlagEquals ([string]$pre.vars[$FrozenFlag]) $FrozenValue) { break }
+    } while ((Get-Date) -lt $deadline)
+    if (-not (Test-FlagEquals ([string]$pre.vars[$FrozenFlag]) $FrozenValue)) {
+        Out2 'FAILURE: BUFFER_NOT_FROZEN'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: {0} did not reach {1} within {2} ms' -f $FrozenFlag,$FrozenValue,$WaitMs)
+        exit 1
+    }
     $arr = Request ('ARRAY ' + $ArrayName + '|' + $Rows + '|' + $Columns)
     $post = Request (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|'))
 
@@ -289,7 +333,7 @@ if ($ArrayName) {
     if ($FrozenFlag -and -not (Test-FlagEquals $preFlag $FrozenValue)) {
         Out2 'FAILURE: BUFFER_NOT_FROZEN'; Out2 'RESULT: FAIL'
         Out2 ('REASON: {0} = {1}, expected {2} - the buffer is not in its frozen state, so a copy taken now could mix old and new samples' -f $FrozenFlag, $preFlag, $FrozenValue)
-        Out2 'HINT    : wait until the firmware freezes the buffer, or pass -FrozenValue "" to only require that it does not change'
+        Out2 'HINT    : check the firmware freeze protocol and expected completed flag value'
         exit 1
     }
     if ($FrozenFlag -and $preFlag -ne $postFlag) {
@@ -313,7 +357,6 @@ if ($ArrayName) {
     $lines.Add('index,value')
     for ($i = 0; $i -lt $total; $i++) { $lines.Add(('{0},{1}' -f $i, $arr.arr[$i])) }
     $csvPath = Join-Path $dataDir 'array.csv'
-    [IO.File]::WriteAllLines($csvPath, $lines, $utf8Bom)
 
     # anchor: the first element must read the same both ways while the buffer is frozen
     $anchor = Request ('VARS ' + $ArrayName + '[0]')
@@ -322,6 +365,23 @@ if ($ArrayName) {
         Out2 'FAILURE: ARRAY_LAYOUT_MISMATCH'; Out2 'RESULT: FAIL'
         Out2 ('REASON: {0}[0] evaluate={1} readData={2}' -f $ArrayName, $anchorVal, $arr.arr[0]); exit 1
     }
+    $fwAfter = Request ('VARS ' + $FwIdVar)
+    $fwAfterValue = [string]$fwAfter.vars[$FwIdVar]
+    if (-not (Test-FlagEquals $fwAfterValue ([string]$ExpectFwId)) -or -not (Test-FlagEquals $fwAfterValue $fwBeforeValue)) {
+        Out2 'FAILURE: FW_ID_MISMATCH'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: firmware identity changed during array copy ({0} -> {1})' -f $fwBeforeValue,$fwAfterValue); exit 4
+    }
+    $ramAliveAfter = Test-AliveNow -ProjectPath $ProjectPath -Candidates @([string](Get-FwContract).ramProof.counter)
+    if (-not $ramAliveAfter.ok) {
+        Out2 'FAILURE: RAM_PROOF_NOT_ADVANCING'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: RAM updater stopped after the array copy: ' + $ramAliveAfter.reason); exit 4
+    }
+    $appAliveAfter = Test-AliveNow -ProjectPath $ProjectPath -Candidates @((Get-FwContract).heartbeat.candidates)
+    if (-not $appAliveAfter.ok) {
+        Out2 'FAILURE: HEARTBEAT_FAIL'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: application heartbeat stopped after the array copy: ' + $appAliveAfter.reason); exit 4
+    }
+    [IO.File]::WriteAllLines($csvPath, $lines, $utf8Bom)
 
     $mapLines = New-Object System.Collections.Generic.List[string]
     $mapLines.Add('role,name,first,last,delta,status')
@@ -330,8 +390,12 @@ if ($ArrayName) {
     if ($SeqVar) { $mapLines.Add(('sequence,{0},{1},{2},,OK' -f $SeqVar, $pre.vars[$SeqVar], $post.vars[$SeqVar])) }
     [IO.File]::WriteAllLines((Join-Path $checkDir 'variables.csv'), $mapLines, $utf8Bom)
 
-    $vout = & $pwshExe @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $verdictScript,
-        '-CsvPath', $csvPath, '-AllowNoHeartbeat') 2>&1
+    $arrayVerdictArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $verdictScript,
+        '-CsvPath', $csvPath, '-AllowNoHeartbeat', '-ExpectedRows', [string]$total,
+        '-RangeVars', 'value')
+    if ($null -ne $ValueMin) { $arrayVerdictArgs += @('-ValueMin',([double]$ValueMin).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
+    if ($null -ne $ValueMax) { $arrayVerdictArgs += @('-ValueMax',([double]$ValueMax).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
+    $vout = & $pwshExe @arrayVerdictArgs 2>&1
     $vcode = $LASTEXITCODE
     foreach ($l in $vout) { if ([string]$l -notmatch '^RESULT:') { Out2 ([string]$l) } }
     if ($vcode -ne 0) {
@@ -343,6 +407,8 @@ if ($ArrayName) {
         ('service_started: ' + $state.started), ('out: ' + $state.out), ('out_sha256: ' + $state.outSha256),
         ('array: {0} ({1}x{2}={3})' -f $ArrayName, $Rows, $Columns, $total),
         ('frozen: {0} = {1}' -f $FrozenFlag, $preFlag),
+        ('ram_proof_after: {0} {1}->{2}' -f $ramAliveAfter.name,$ramAliveAfter.first,$ramAliveAfter.last),
+        ('heartbeat_after: {0} {1}->{2}' -f $appAliveAfter.name,$appAliveAfter.first,$appAliveAfter.last),
         ('data: ' + $csvPath)
     )
     [IO.File]::WriteAllLines((Join-Path $checkDir 'verdict.txt'), $verdict, $utf8Bom)
@@ -515,8 +581,8 @@ $vargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $verdictScript,
 # re-reading a CSV column (and the column only exists when the user listed the counter
 # in -Variables). So the CSV verdict checks numbers and ranges, not liveness.
 $vargs += '-AllowNoHeartbeat'
-if ($ValueMin -ne [int]::MinValue) { $vargs += @('-ValueMin', [string]$ValueMin) }
-if ($ValueMax -ne [int]::MaxValue) { $vargs += @('-ValueMax', [string]$ValueMax) }
+if ($null -ne $ValueMin) { $vargs += @('-ValueMin',([double]$ValueMin).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
+if ($null -ne $ValueMax) { $vargs += @('-ValueMax',([double]$ValueMax).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
 $vout = & $pwshExe @vargs 2>&1
 $vcode = $LASTEXITCODE
 # HEARTBEAT was already reported above; do not let the verdict repeat it. The verdict's
@@ -529,7 +595,7 @@ foreach ($l in $vout) {
     Out2 $s
 }
 
-$verdictResult = if ($vcode -eq 0 -and $hbOk) { 'OK' } else { 'FAIL' }
+$verdictResult = if ($vcode -eq 0 -and $hbOk -and $fwOk -and $rateOk) { 'OK' } else { 'FAIL' }
 $verdict = @(
     ('result: ' + $verdictResult), 'mode: live-service (no reload)', ('service_pid: ' + $svcPid),
     ('service_started: ' + $state.started), ('out: ' + $state.out), ('out_sha256: ' + $state.outSha256),

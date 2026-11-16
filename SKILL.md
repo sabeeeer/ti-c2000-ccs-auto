@@ -1,168 +1,54 @@
 ---
 name: ti-c2000-ccs-auto
-description: 处理 TI C2000/DSP 的 CCS 工程：两种运行模式（默认单步——只加载一次、常驻、下载前必问用户；用户点名"连续运行"才用连续模式——反复编译下载直到数据对）× 两种读模式（默认只读、零下载、按判据确认跑的是 RAM 镜像；或本次下载一次再读），模式间有互锁，并统计下载次数；共用器件与 CCS、TI 算法库、调试经验三类入口。适用于读取当前板参数/ADC/寄存器，或编写、构建和上板验证 DSP28335、F28379D 等工程。
+description: 审查、编译和调试 TI C2000 CCS 工程。先选单步/连续运行模式与只读/本次加载读模式，再进入器件与 CCS、TI 算法库、调试经验三类资料；错误用独立离线查询模式。读数据保持同一 DSS 会话，下载须用户明确同意。
 ---
 
 # TI C2000 / CCS 工程
 
-**先选运行模式与读法，再从三类资料入口取证。它们共用同一套资料。**确认实际工程、器件、目标核、探针、当前运行固件和任务范围。
+本 skill 有**两种运行模式 × 两种读模式**，共用**三类资料入口**；另有只查记录的 **Error 模式**。模式由脚本互锁，不靠 AI 自觉。选定实际工程、器件、目标核、探针和任务后，先读工程入口文件，再调用本 skill 的脚本。用户没有要求上板时，只做文件与离线测试。
 
-**所有 C2000 板的 DSS 操作前提**：本用户的调试阶段用 RAM 链接与 RAM 变量/缓冲；先核对 `.cmd`/`.map`，不能把 Flash 中的旧程序当作新 RAM 固件。验证新下载程序时，按“一次连接、按需构建与加载一次、运行、在同一会话边运行边读完计划数据”执行。不要把断开会话后的目标运行状态或另起会话读到的数值，自动算作这份新 RAM 固件的证据；断开前必须完成心跳、身份及所需数据检查。**单会话读取不额外编译/下载，但不等于 DSS 建连/断连绝对无扰动；断开后禁止再读。**读数阶段和读数结束不调用 `halt()`；执行模式仅可在加载前按需停核。不同器件/探针的断开行为须实测，不能宣称 DSS 对每颗 DSP 都必然复位；见[DSS 会话边界](references/dss-debug.md#所有器件的操作前提会话边界)。
+> **RAM 读数前提**：通用读路径不读 PC。固件须按[RAM 自证契约](references/ram-proof-firmware.md)提供只由 RAM 函数更新的 `gRamProofTick`；所选 `.map` 与加载时记录的 SHA256 必须一致，`.text`、更新函数和计数器都须定位到 RAM，计数器还要推进。旧固件缺此契约就拒绝只读，不回退到 PC 或固定地址。该机制已通过离线模拟，尚未上板实测；`gFwId` 重复使用仍会削弱版本证明。
 
-## 这个 skill 怎么被调用（与 AI 工具无关）
+## 先让 AI 找到正确入口
 
-**本 skill 不是 CodeBuddy 专属插件**：它是「一份 Markdown + 一组 PowerShell 脚本」，不需要任何专有运行时。任何 AI 只要能读文件、能执行 `pwsh`，就能完整使用它——互锁、四道证明、下载计数全在脚本内部，**不依赖 AI 是否守规矩**。
+在新 CCS 工程创建之初，用 `tools/init_project_entry.ps1 -ProjectPath <工程>` 生成相同的 `AGENTS.md`、`CODEBUDDY.md`、`CLAUDE.md`；它遇到已有不同内容会拒绝覆盖，需人工合并。开始工程操作前，读本文件和工程 `AGENTS.md`，再运行已安装 skill 的 `scripts/check_project_entry.ps1 -ProjectPath <工程>`。只有退出码 0 且 `RESULT: OK` 才继续；先清理工程里的旧 `ti_c2000_*.ps1/.js` 副本。每次脚本输出必须有 `SKILL   : ti-c2000-ccs-auto@<版本>`；版本由入口、运行脚本、资料和维护工具的内容哈希生成，脚本单独变更也会换号。成功还须退出码 0 与 `RESULT: OK` 同时成立。
 
-| 工具 | 它自动读的入口 | 拿不到这个文件时的后果 |
-|---|---|---|
-| CodeBuddy | 项目根 `CODEBUDDY.md`（或本 skill 的 `SKILL.md`） | 会按习惯自创流程，绕过互锁 |
-| **Codex** | **`AGENTS.md`**（仓库/工作目录根） | **完全不知道这个 skill 存在** |
-| Claude Code | `CLAUDE.md` | 同上 |
-| Cursor / Copilot | `.cursor/rules/*.mdc` / `.github/copilot-instructions.md` | 同上 |
+CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源。改完先运行 `tools/sync_platform_copies.ps1 -DryRun` 检查 `PRUNE` 清单，再同步到 Codex 等平台副本；不要直接编辑平台副本。
 
-**所以换工具前必须先确认工程根有 `AGENTS.md`**（Codex 只认这一个文件名），并且它显式写出 skill 的绝对路径与"先读 `SKILL.md` 再动手"。`AGENTS.md` / `CODEBUDDY.md` / `CLAUDE.md` 三份内容必须完全一致，改一处要同步另外两处。
+## 模式、入口与互锁
 
-自检（只读文件，不碰目标）：
-
-```powershell
-pwsh -NoProfile -File scripts/check_project_entry.ps1 -ProjectPath <CCS 工程目录>
-```
-
-它查四件事，任一不满足即 `RESULT: FAIL`（exit 1）并逐条给 `VIOLATION:`：① 工程内没有 skill 脚本副本；② 工程目录或其上层（≤3 层）有入口文档；③ 每份入口文档都提到 `ti-c2000-ccs-auto`；④ 没有哪一行仍在让人去跑已删除的副本。**`RESULT: OK` 才是"这个工程会按 skill 运行"**。
-
-### 三个校验点（"在用这个 skill"必须可证，不能靠声明）
-
-| # | 时机 | 手段 | 失败表现 |
-|---|---|---|---|
-| ① **事前** | 开始操作前 | `check_project_entry.ps1 -ProjectPath <工程>` | `VIOLATION:` 逐条列出：有副本 / 缺入口文档 / 文档没提 skill / 仍指向已删脚本 |
-| ② **事中** | 每次运行 | 每个入口都打印 `SKILL   : ti-c2000-ccs-auto@<ver>`（`<ver>` = `sha256(SKILL.md)` 前 8 位），并追加一行到 `<工程>\readout\skill-runs.jsonl` | 输出里**没有** `SKILL   :` 行 = 这次操作不是本 skill 跑的 |
-| ③ **事后** | 收尾 / 怀疑走偏 | `check_project_entry.ps1 -MaxRunAgeMinutes N` | 最近一次运行过旧，或来自另一个 skill 目录 → `RESULT: FAIL` |
-
-②还兼一个硬门禁：**工程内若存在 skill 脚本副本**，写目标的入口（`service -Start`、`iterate`）直接 `PROJECT_NOT_CLEAN`(2) 拒绝——副本才是实际执行者，不能让它决定一次下载；只读入口只给 `WARN` 并继续（读不会损坏目标）。
-
-### 测试套件（改完 skill 必跑，全部无板卡即可运行）
-
-```powershell
-Get-ChildItem tests\test_*.ps1 | Sort-Object Name | ForEach-Object { pwsh -NoProfile -File $_.FullName }
-```
-
-| 测试 | 覆盖什么 | 为什么需要它 |
-|---|---|---|
-| `test_doc_contract` | 490 条"文档承诺"对账：文档里出现的脚本名必须存在、承诺的 `FAILURE:` 码必须真的会被产生、内部链接必须可解析、命令里的参数必须在该脚本 `param()` 里（AST 比对）、每个脚本必须有 `#requires -Version 7.0` | **AI 是按文档执行的**，文档与代码不一致时"严格照做"反而是错的 |
-| `test_param_matrix` | 30 组非法/冲突参数，逐条断言 `FAILURE:` 分类 + 退出码 + **一次调用只有一条 `RESULT:` 行** | AI 靠 `RESULT:` 与退出码下判断，两条或零条都会让它误判 |
-| `test_state_chaos` | 19 个脏状态：死 pid 的锁/标记必须可接管、活 pid 的锁必须挡住、坏 JSON 的状态必须判"无会话"、坏计数不能崩 | 崩溃、断电、上次强杀都会留下这种状态，绝不能被当成"一切正常" |
-| `test_skill_identity` | 身份行、`skill-runs.jsonl` 记录、副本存在时写路径 `PROJECT_NOT_CLEAN` 拒绝/读路径仅警告 | "走了 skill"必须可证 |
-| `test_project_entry` | 工程入口文档齐全、无脚本副本、文档没指向已删脚本 | 换工具后的第一道闸 |
-| `test_e2e_readonly` | 真机 10 例只读场景 + 下载计数不得 +1；**无探针时自动 SKIP** | 夹具测不到的探针/会话/四道证明组合 |
-| 其余（模式、判据、契约、生成器） | 运行模式互锁、读判据、DSS 生成、序列号探针 | 回归防线 |
-
-**判定标准**：15 个测试两轮全绿 + `PARSE_ERRORS=0` + 可迁移性门禁 0 拦截，才算这个 skill 可用。
-
-### 多平台副本必须同步（这是"换了工具就不按 skill 跑"的常见真因）
-
-有的工具把 skill 放在自己的目录里（如 Codex 的 `%USERPROFILE%\.codex\skills\<name>`），读的是**它自己那份副本**，不会跟着本目录更新。实测 2026-11-14：Codex 那份是几天前的旧版（70 文件 / `SKILL.md` 7479 B，还留着已删除的 `ti_c2000_read_runtime.ps1`），于是"按 skill 跑"实际上跑的是旧规则——**看起来完全正确，比报错更危险**。
-
-```powershell
-pwsh -NoProfile -File tools/sync_platform_copies.ps1 -DryRun   # 先看计划：ADD / UPDATE / KEEP / PRUNE
-pwsh -NoProfile -File tools/sync_platform_copies.ps1            # 执行，并自证同步后完全一致
-```
-
-源永远是 `~/.codebuddy/skills/ti-c2000-ccs-auto`；目标自动发现已存在的平台副本，`PRUNE` 会删掉目标里多出来的旧文件（`-NoPrune` 可保留）。**改完 skill 就要同步一次**，否则别的工具继续跑旧版。
-
-**"审核通过"≠"内容正确"，也不是"内容最新"**。Codex 自带 `skill-creator` 的 `quick_validate.py` 可以复核格式（本 skill 实测 `Skill is valid!`）：
-
-```powershell
-# 只查 frontmatter / 命名（≤64 字符）/ 未完成的脚手架占位符
-$env:PYTHONUTF8 = '1'
-& python "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\quick_validate.py" "$env:USERPROFILE\.codex\skills\ti-c2000-ccs-auto"
-```
-
-那条脚本自己的注释写明：**"it does not prove that the skill makes good decisions"**。它过了只说明"Codex 能识别、能触发"，不说明规则正确、更不说明是最新版。所以它是**第四条旁证**，不能替代上面的三点校验，也不能替代同步。
-
-## 两种运行模式 × 两种读模式（互锁）
-
-**下载是唯一会重启程序、也是唯一在磨损目标的操作，因此被单独管起来。**默认永远是单步；连续模式必须用户点名。
-
-| 运行模式 | 何时使用 | 行为与入口 |
-|---|---|---|
-| **单步运行（默认）** | 日常调试、读数据，以及任何"只想看当前程序"的场合。 | `scripts/ti_c2000_service.ps1 -Start [-Build]` 只加载**一次**并常驻运行，之后所有读都附着。**任何下载都必须先得到用户同意**：调用方只有在用户回答"要编译下载"之后才可加 `-ConfirmLoad`；没加就返回 `FAILURE: LOAD_NOT_CONFIRMED`（exit 4），**不编译、不下载、不重启程序**。 |
-| **连续运行（显式开启）** | 只在用户明确说"反复编译下载直到数据对/实验现象成功"时使用。 | `scripts/ti_c2000_iterate.ps1 -UserApproved -Expect 'gBufSeq>=3','gErr==0'`：每轮「停会话 → 构建下载 → 会话内读 → 判据」，不满足再来一轮，最多 `-MaxLoads`（默认 5，上限 20）。没有 `-UserApproved` 直接 `FAILURE: ITERATE_NOT_APPROVED`（exit 4）。 |
-
-**运行模式和读模式是两个独立维度**：运行模式决定"程序多久上一次板"，读模式决定"这次读要不要重新下载"。两者交叉时由互锁表裁决，见下。
-
-| 读模式 | 何时使用 | 入口 |
-|---|---|---|
-| **`-Mode ReadOnly`（默认）** | 日常读。会话已在跑，只想看当前程序。 | `scripts/ti_c2000_run_read.ps1 -Variables gMsTick,gState`（慢变量）/ `scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName gBuf -Rows 256 -Columns 1`（DMA 冻结窗口）。**绝不下载**：读之前要过四道证明「① 仿真器被 Windows 枚举在线 ② 会话进程活着 ③ `sha256(out)` 与本次构建一致 ④ **"跑的是这份固件、而且真的在跑"** —— 两种做法，**优先前一种**：
-**（推荐）固件自证**：`-ExpectFwId 0x00010001` 读回固件自己声明的 `gFwId` 比对（不匹配 = `FW_ID_MISMATCH`）。**这类符号名只在一个地方声明**：`references\firmware-contract.json`（身份、心跳候选、速率、冻结标志），改固件变量先改它；`tools\audit_fw_contract.ps1` 会发现任何脚本与它不一致，`-RateVar gMsTick -ExpectedRatePerSec 1000` 校验计数器速率（不符 = `HEARTBEAT_RATE`）。**只依赖"能读内存"**，不碰 Flash 基地址、PC、段表、`ofd2000`，换芯片/改 boot/换探针都不受影响。
-**（回退）设备推断**：不给上面两个参数时，读 `PC` 判断是否落在本镜像代码段内（段表来自 `.map` / `ofd2000`；`PC` 读不到 = `TARGET_NOT_CONNECTED`，无开关可绕过）。这条依赖工具链知识，只在拿不到固件变量时用。」，`NO_PROBE`(3) / `NO_SESSION` / `STALE_SERVICE` 不成立就拒绝，不会偷偷烧一次把数据凑出来。**第 ④ 条不同：它报告而不断言**——每次读都打印 `RUNNING : RAM|FLASH   (PC = 0x…, region …)`，区域名取自本工程 `.map` 的 MEMORY 定义（`RAMLS0` / `FLASHA`…），所以换器件、改 boot 都跟着工程走；跑在 Flash 会同时给 `WARN`，因为没烧过这份构建时那些值属于上一份固件。要强制只在 RAM 跑就加 `-RequireRam`（此时非 RAM = `NOT_RAM_IMAGE` exit 4）。`-AllowUnverified` 仍可放过"身份没验证"，`-NoProbeCheck` 可跳过 1 秒的探针枚举。 |
-| **`-Mode LoadRead`（显式）** | 本次读必须从新固件开始（改了代码、要确认新镜像），只下载一次。 | 同一命令加 `-Mode LoadRead -ConfirmLoad`：停常驻会话 → **下载一次** → 读 → 退出。`-MaxLoads N -Expect 'gBufSeq>=3'` 可反复下载到判据满足（等价于连续运行的单次版）。 |
-
-**慢速读只有"轮询"精度，选它之前先对时标**：单轮周期 S ≈ `-IntervalMs` + 50~120 ms（默认 0.5 s → S≈0.55~0.62 s，采样上限约 8~20 Hz）。判据三条：① 被测量变化周期 ≥ 10×S（看趋势 ≥ 3×S）；② 不需要等间隔/精确时刻（测不了频率、相位、占空比）；③ 两次采样之间没有有意义的瞬变。**例：数据 100 ms 一更新（10 Hz），慢速读 1.8 Hz 欠采样 5.5 倍——数值本身是真的，但漏掉 5~6 次更新，画出来是混叠假波形，要看每一点必须用 DMA 冻结缓冲。** 算例、实测方法与自测命令见 [慢速读的时限与适用条件](references/single-session-read.md#慢速读的时限与适用条件轮询不是采样示波器)。
-
-**互锁（调用前就判，一条 `FAILURE:` + 一个退出码，不会崩、不会乱跑）**：
-
-| 组合 | 结果 |
+| 维度 | 入口与行为 |
 |---|---|
-| `ReadOnly` + `-ConfirmLoad` / `-Build` / `-Expect` / `-MaxLoads>1` | `MUTUALLY_EXCLUSIVE` exit 2 |
-| `LoadRead` + `-AllowUnverified` / `-NoProbeCheck`（只属于 ReadOnly） | `MUTUALLY_EXCLUSIVE` exit 2 |
-| `ReadOnly` 但探针没被枚举（拔线/驱动没起来） | `NO_PROBE` exit 3 |
-| `ReadOnly` 且 `-RequireRam`，但核心在 Flash / 跑飞 | `NOT_RAM_IMAGE` exit 4 |
-| `ReadOnly` 但读不到 PC（链路断） | `TARGET_NOT_CONNECTED` exit 4（无开关可绕过） |
-| `ReadOnly` 读前门禁不通过（固件身份不符 / 计数器不动） | `PREFLIGHT_FAILED` exit 4，且清空旧数据与旧结论 |
-| `ReadOnly` 但找不到 `.map` | 不失败：`RUNNING : ?`，位置未知；补建一次或给 `-MapFile` |
-| `LoadRead` 无 `-ConfirmLoad`（含 `-Standalone`） | `LOAD_NOT_CONFIRMED` exit 4 |
-| 连续运行无 `-UserApproved` | `ITERATE_NOT_APPROVED` exit 4 |
-| 连续运行期间外部 `ReadOnly` | `READONLY_IN_ITERATE` exit 4（每轮都重下载，附着读到的运行已经不存在） |
-| 连续运行期间外部 `LoadRead` | `MUTUALLY_EXCLUSIVE` exit 2（同一时刻只允许一个下载者） |
-| 连续运行期间外部 `service -Start/-Stop`、第二个 `iterate` | `ITERATE_IN_PROGRESS` exit 4 |
-| 另一进程正持有目标 | `TARGET_BUSY` exit 5 |
-| `service -Status` | 任何模式下都可查（纯报告） |
+| 单步运行（默认） | `scripts/ti_c2000_service.ps1 -Start -ConfirmLoad [-Build] [-CorePattern <核名匹配式>]`：获准后构建、选定 `.out`、加载一次、运行并保留 DSS 会话。仅在 `.ccxml` 有唯一 CPU 时自动选核；多个 CPU 必须明确指定且只匹配一个，记录实际核名。`-Status` 只报告；`-Stop` 会结束会话，可能使探针重新枚举，只在明确结束/更换镜像时使用。 |
+| 连续运行（用户点名才启用） | `scripts/ti_c2000_iterate.ps1 -UserApproved -Expect ...`：最多 20 轮；每轮构建、加载、运行、读、判据。相邻下载尝试至少隔 5 秒；连接重试和探针恢复应留间隔。运行期间其他读/加载/Stop 由锁拒绝。 |
+| `ReadOnly`（默认读） | `scripts/ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables ...` 读慢变量；`scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady ...` 读固件冻结数组。零构建、零加载、零重连、零因读而 `halt`；附着现有服务，在程序运行时读取。DMA 路径须有固件初始化与冻结/序号协议，目前尚未上板验证。 |
+| `LoadRead`（本次获准加载后读） | 同一公开读入口加 `-Mode LoadRead -ConfirmLoad [-Build]`。若旧会话存在，先明确停止；服务加载新镜像并**留在该会话**，再调用正常 `ReadOnly` 判据；读完不 `halt`/断开。`-Standalone` 是同一路径的旧别名。`-MaxLoads/-Expect` 的循环每轮仍受 5 秒门限。 |
+| Error（离线） | 失败时**先查** `scripts/ti_c2000_error.ps1 -Code <错误码>` 或 `-LogPath <日志>`，再读[错误索引](references/error-index.json)。查询不连接、不构建、不复位、不下载；新故障经实测复盘后录入第三类。 |
 
-**为什么必须常驻**：每次读数都 `connect → load → run` 等于每次都重启程序，两次读到的就不是同一段运行。常驻会话把加载放在启动时，之后所有读都是"附着读取"；反复刷新程序才是"数据肯定不对"的根因。
+下载只能在用户明确同意后传 `-ConfirmLoad`，连续运行还要求用户明确提出反复运行并传 `-UserApproved`。`ReadOnly` 与 `-Build/-ConfirmLoad/-Expect/-MaxLoads>1` 互斥；`-NoProbeCheck/-AllowUnverified/-NoHeartbeat` 的只读绕过已禁用。`RESULT: FAIL`、缺 `RESULT: OK`、非零退出码都不是成功；不得用另一次烧录“凑出”读数。
 
-**只读不是"下载后读"的替代，而是它的后半段**："下载后读"在实现上就是 `service -Start`（下载一次）+ 反复 `ReadOnly`（零下载）。只读真正不可替代的场合：① 连续运行每轮读必须零下载，否则测的不是同一段运行；② 保留现场——跑飞/进 fault 时一读就重下载等于抹掉证据；③ 程序固化在 Flash 运行时不消耗擦写寿命；④ 同一镜像反复对照时每次约 1 s（含探针枚举），而重下载要约 10~30 s 并重启程序（累积计数器被清零）。它唯一的短板是"板上不一定是我刚编的这版"，这正好由第 ③ 道证明（sha256）兜住：对不上就 `STALE_SERVICE` 拒绝，而不是拿旧数据冒充新数据。**只改代码、验收一次就走的场景用 `-Mode LoadRead` 最短**，不需要常驻会话。
+其余入口职责：`scripts/ti_c2000_build.ps1` 只编译；`scripts/ti_c2000_debug.ps1` 只做探针检查或获准的显式加载/运行；`scripts/ti_c2000_readmode.ps1` 管互锁与时间门限；`scripts/ti_c2000_loadcount.ps1` 管成功加载记录；`scripts/ti_c2000_check_read.ps1` 离线核对 CSV。这些脚本不提供另一条绕过常驻服务的读数路径。
 
-**下载计数（必须汇报）**：每次真正写入目标——`service -Start`（`SingleStep`）、`ti_c2000_iterate.ps1` 的每轮（`Iterate`）、`-Mode LoadRead`、`-Standalone`、`ti_c2000_debug.ps1 -Run/-LoadOnly`——都会把 `<工程>\readout\load-count.json` 的 `count` +1，输出显示 `LOAD    : #7 (this is download number 7 for this project)`；`lastMode` 记录这次是单步、连续还是按需读。`-Stop` 不清零，计数跨会话累计。**读输出里的 `LOAD #N` 就是当前会话那一次下载**：两次读之间 N 若变了，中间又烧录过，数据不可比，必须说明。
+## 读前告知、读后判据
 
-**入口职责**：`ti_c2000_build.ps1` 只做编译/链接自检（不需要探针，不下载，认 `RESULT: OK`）；`ti_c2000_service.ps1` 管会话（启动时加载一次 / 停 / 查，并维护下载计数）；`ti_c2000_iterate.ps1` 是连续运行的唯一入口（每轮都是"停会话 + 构建下载 + ReadOnly 读 + 判据"）；`ti_c2000_run_read.ps1`（慢速，标量/状态机）和 `ti_c2000_read_dma.ps1`（DMA 冻结缓冲，数组/波形）默认 **ReadOnly 附着**；`ti_c2000_live_read.ps1` 是会话协议客户端（只读、从不下载）；`ti_c2000_readmode.ps1` 是运行模式 × 读模式的互锁库（标记、RAM 判据、目标锁）；`ti_c2000_loadcount.ps1` 是计数与判据库；`ti_c2000_check_read.ps1` 只拿 CSV 做判读，不连硬件。除这些之外，没有任何别的读数入口。
+读前先报告：所选 `.out/.map` 与 SHA256、工程内源码和构建配置是否比该产物新、目标核与 RAM/Flash 自证、探针是否枚举且可用、DSS 进程与目标连接是否仍有效、运行的固件身份、累计成功加载次数及本会话加载序号、应用心跳是否在推进。工程外链接源码的新旧不能靠工程内时间戳证明，须结合构建记录和唯一 `gFwId`。仅有进程 PID、`connect()` 没抛异常、`isHalted()==false`、符号能解析，任何一项都不构成充分证明。`dssLinkIsUp` 要显式验证 `target.isConnected(true)` 再查询目标。
 
-**脚本只有一个来源**：工程目录里**不得**放本 skill 脚本的副本。副本会抢执行权（实际运行时走副本、不按 skill 的互锁与判据），而且 skill 一更新副本就过期。工程自带的 `Tools/scripts/` 只放**本工程特有**的工具（如串口帧解析、正弦表生成）。发现旧副本（`ti_c2000_*.ps1`、`verify_on_target.ps1`、`dss_load_run_read.js` 之类）直接删除，并把工程入口文档里的调用改成上面的 skill 命令。
+读后还要查：采样轮次完整，心跳/可选速率、固件身份、数值有限性与指定范围；数组另查冻结标志达到完成值、复制前后标志和序号未变、点数与表达式锚点一致。任一证据失败就报告失败，清除旧 `result: OK` 和旧 CSV；不能把“取到数字”写成“数据可靠”。变量轮询不能还原快速波形，µs 级波形由固件先采满、冻结后再传。详细阈值见[读数判据](references/data-read-verdict.md)，DSS 会话边界见[单会话读取](references/single-session-read.md)。
 
-**`-Standalone` 逃生口**：两个读入口都保留 `-Standalone`，它只是 `-Mode LoadRead` 的别名（单进程 load → run → read），同样要求 `-ConfirmLoad`，否则 `FAILURE: LOAD_NOT_CONFIRMED`（exit 4）；只用于没有常驻会话的排障，不是常规用法。
+**时间门限**由 `references/firmware-contract.json` 维护：下载尝试之间至少 5000 ms；连续数据请求之间至少 400 ms；重连至少留 400 ms 且须再次验证探针可用。编译成功后加载的必须是**选定的那份** `.out`，比源文件旧就拒绝。`readout/load-count.json` 记录成功加载次数；失败或部分写入的 `loadProgram` 尝试还需看 DSS 日志，不能把该计数当成所有物理写入次数。
 
-旧的独立只读会话入口（`ti_c2000_read_runtime.ps1` / `ti_c2000_read_array_runtime.ps1`）以及 `ti_c2000_debug.ps1` 里的 `-ReadOnly/-ReadVars/-ReadArray/-WaitFor` **已从 skill 中删除**，不保留“禁用但还在”的空壳：**仿真器断开后再读，一定不是本次 RAM 固件**（F28379D 复位跑 Flash；DSP28335 可能读到 Flash 旧程序）。**仿真器在线 + 单会话**是读取 RAM 运行态数据的前提。低速连续读适用于所有板；高速 DMA 读需要固件配置 ADC+DMA 并冻结缓冲——28335 与 28379D 都有 DMA，按工程配置决定，不是器件差异。CCS GUI 手动实时看仍可行：Realtime Mode + 目标可调试 + 会话保持，Expressions/Watch 开 Continuous Refresh。
+连续运行的当前实现每轮会显式 `-Stop` 再 `-Start`，因此**仍会在不同下载轮次间重连**；它会等待探针可用并遵守间隔，但不能称为零重连。普通连续读保持同一会话，不执行这一流程。若 `-Stop` 未干净退出或探针未恢复，循环立即中止；同会话热重载尚未上板验证，不能用推测替代现有受控流程。
 
-**最大的一次坑（别再犯）**：读数"成功"、`RESULT: OK`、数值也像样，但仿真器早已退出或程序被重新加载，读到的是 Flash 里的旧固件、或者是另一次运行的残值。当场识别信号：心跳量跨轮完全相同、首值是旧读数或全 0、`PC` 落在 Flash 段、只有"目标显示 running"这一条证据。命中任意一条就报告"未验证/读到 Flash"，不要换个参数再试，也不要补一次 `-Run` 把读数凑成成功。判据见[常驻会话读取规则](references/single-session-read.md)。
+## 三类资料入口（两个运行模式共用）
 
-常驻会话的判据与一次性读取不同：**不查"启动窗口 ≤ 10 s"**（会话可能已经跑了几小时），改为查 ①心跳跨轮递增 ②冻结窗口在拷贝期间不变 ③会话持有的 `.out` 与实际磁盘上的 SHA256 一致（`STALE_SERVICE` 会明确拦住换了固件却没重启的会话）。
-
-**表述纠正**：不能写「CCS 完全不支持边运行边读」。CCS 支持运行态读；限制是「会话断开后另起只读」不可靠，以及 µs 级高速数据必须由固件 DMA + 冻结缓冲提供。慢变量、状态机、计数器走低速连续读即可，不需要 DMA。
-
-`ti_c2000_debug.ps1` 现在只做编译/下载/运行（`-Build` / `-Run` / `-LoadOnly` / `-ProbeCheckOnly`），不读任何值；传旧参数会被 `UNKNOWN_ARGUMENT` 明确拒绝（exit 2），不会被静默忽略。单会话内读数时目标必须持续运行；已停机就报告失败，不用 `halt → read → runAsynch`，也不借读数之名重复烧录。
-
-冻结 RAM 缓冲仍是数组读取；它可由 ISR 或 DMA 填充，DMA 不是第三种模式。高速读沿用脚本名 `scripts/ti_c2000_read_dma.ps1`，用 `-FrozenBufferReady` 声明已核对固件会冻结缓冲；标量走 `ti_c2000_run_read.ps1`。两者读的是**同一个常驻会话**，不需要为了读标量再加载一次。
-
-**DSP28335 RAM 工程的实测边界**：另起只读曾得到运行态数值，但 PC 位于 Flash，而本次 `.out` 的入口和主程序位于 RAM；不能把这份读数算作新 RAM 固件的验证。F28379D 的另一现场在 `disconnect()` 后观察到计数归零和目标停机。两者都采用单会话完成本次新固件的加载、运行和全部读取；不要为了补读反复调用会重新加载程序的脚本。具体成因与适用范围见[读取案例](references/debug-cases/dsp28335/2026-11-07-realtime-read-implicit-loadonly.md)和[DSS 说明](references/dss-debug.md)。
-
-用户要求上板运行或下载时，**先问一次「是否编译下载并运行」**（单步模式默认不问不下载），同意后再用 `ti_c2000_debug.ps1 -ProbeCheckOnly` 检查当前探针，然后才执行构建或 CCS 调试调用，并把同意转成 `-ConfirmLoad`。若返回 `NO_PROBE`，停止并询问用户是否已接好探针和目标板；收到回复前不编译、不自动重试，也不跳过检查。纯代码构建任务不需要探针。构建默认使用工程声明的 C2000 编译器版本；找不到时报告，只有用户明确同意才传 `-AllowCompilerFallback`。
-
-## 三类入口：共用同一种执行模式
-
-| 类别 | 什么时候进入 | 先读 |
+| 类别 | 进入时机 | 首先读 |
 |---|---|---|
-| **一、器件与 CCS 工程** | 读取当前芯片 ADC/外设寄存器，或换 DSP28335/F28379D 等器件/板卡；处理探针、CPU1/CPU2、架构、外设配置、`.cproject`、`.ccxml`、编译器、链接和 `.cmd`。 | [器件与工程入口](references/device-platform.md)；写任何外设配置时再读[官方例程模板规则](references/peripheral-examples.md)，从**同器件、同核、同写法**的 TI 源码迁移。 |
-| **二、TI 库与算法** | 读取当前算法参数，或实现控制、DSP、数学、AI、校准、通信功能并准备调用 TI 现成库；DCL、DMC、SolarLib 的 MPPT/控制/测量/PLL 等都在这里。 | [TI 库与算法入口](references/ti-algorithm-libraries.md)：先查本机 Core SDK、controlSUITE 和工程已有实现，读候选库的文档、示例、头文件及链接要求，再决定复用或自研。**做 dq/abc（Clarke/Park/InvPark）变换或逆变器电压定向时另必读 [dq/abc 变换规范](references/dq-transforms.md)**：正反变换必须配套，且 **d=幅值、q=0 才能进入闭环/发波**。 |
-| **三、调试经验** | ADC、串口抓包、SPI、波形异常、原子访问、寄存器读回、超时等症状；以后 eCAP 出现实测故障也归这里。 | [调试经验入口](references/debugging-experience.md)：按现象找已有复盘，保留原始日志/波形，区分实测结论与推测。 |
+| 一、器件与 CCS 工程 | 换 DSP28335、F28379D 或新芯片，处理板、探针、核、`.cproject`、`.ccxml`、编译器、`.cmd/.map`、启动与外设配置。 | [器件与工程](references/device-platform.md)、[RAM/链接](references/ram-and-linker.md)、[TI 同器件外设例程](references/peripheral-examples.md)。探针与器件差异仅放在本类。 |
+| 二、TI 算法库 | 找现成 DCL、DMC、C2000Ware、controlSUITE、SolarLib，或移植控制/测量/PLL 等。 | [库入口](references/ti-algorithm-libraries.md)、[SolarLib 目录](references/solarlib-catalog.md)。SPLL 另读[完整 SolarLib PLL 文档](references/spll-pll-algorithms.md)；dq/abc 另读[变换规范](references/dq-transforms.md)。先查本机库、示例、头文件和链接要求。 |
+| 三、调试经验 | ADC、SCI 串口、SPI、原子访问、eCAP 等任何器件/模块的实测异常。 | [调试经验索引与归档规则](references/debugging-experience.md)、[判据](references/data-read-verdict.md)。保存症状、原始数据/日志、器件和模块、复现条件、根因证据及适用范围；新案例登记索引并运行 `scripts/check_debug_catalog.ps1`。 |
 
-例如读 F28379D 的 eCAP 寄存器走单会话读取与第一类；配置 eCAP 走执行模式与第一类；调用 DCL/SolarLib 先读第二类；排查实测 eCAP 故障再读第三类。已有 DSP28335 + XDS100v1/v2 和 F28379D + XDS100v2 的记录；每块板仍须核对探针与目标核。
+同一任务可查多类，但只把新事实归入其主类：eCAP 配置与官方模板在第一类，eCAP 实测故障在第三类。不能把 DSP28335 或某个 XDS 的现场现象推广到所有芯片/探针。第二类的 SolarLib、DCL、DMC 文档和第一类的 28379D 功能不得因精简入口而删除。
 
-**调试收尾**：按[第三类归档规则](references/debugging-experience.md)检查新证据。新增或可复现的故障进对应器件案例并登记索引，不把经验只留在对话里。
+## 维护与离线复核
 
-## 工作规则
-
-1. `.out` 用于下载到 RAM 并提供符号；读取的是该 `.out` 的 RAM 程序，须与板上运行固件一致。记录原始数值、单位、采样条件和目标核；`isHalted()==false` 不足以证明应用在跑，有心跳变量时检查其前后递增。纯构建不覆盖 `Debug` 下的 `.out`；运行态数组在同一 DSS 会话内分批核对心跳。若试运行态 `readData`，先与表达式锚点和数值范围交叉核对。
-2. 执行模式写外设配置先选**同器件、同核、同 API 风格**的 TI 例程，算法先查现成库。确需修改时做真实编译链接；**只有用户同意后的下载**（`-ConfirmLoad` 的 `-Start`/`-Standalone`、连续模式、`ti_c2000_debug.ps1 -Run`）才加载并运行，读入口默认不加载。周期信号先在固件侧录满并冻结窗口：50 Hz、1 kHz 的 10 周期是 200 帧；JTAG 可在更长时间内传出，目标仍须运行。
-3. 成功同时要求 `RESULT: OK` 与退出码 0；失败记录分类、原因和日志。交付时区分现场实测、源码推断和历史案例，不把某一板的结论推广到其他型号。
-4. µs 级波形由固件采集进 RAM 并冻结，再用 JTAG 传出；不要把逐次读 ADC 寄存器当成连续采样。用[读取判据](references/data-read-verdict.md)分别核对固件身份、运行活性、缓冲冻结状态与数值范围；缺失的证据标为未验证，不把 `RESULT: OK` 理解为算法或硬件功能通过。
-
-**后续更新仍按三类归档**：新器件/外设配置进第一类，新 TI 库或算法进第二类，新实测故障进第三类；维护细则见 `AGENTS.md`。
+先改 `references/firmware-contract.json`，再运行 `tools/audit_fw_contract.ps1`，按其 `VIOLATION` 修改脚本，复跑至 `RESULT: OK`。出错先用 Error 模式，再把新证据放入第三类；新增器件进第一类，新增 TI 库进第二类。改后运行离线 `tests/test_*.ps1`（不运行需真机的 `test_e2e_readonly.ps1`）、`tools/audit_js_identifiers.ps1`、`tools/audit_dead_params.ps1`、`tools/audit_fw_contract.ps1`、`scripts/check_debug_catalog.ps1` 和 Codex `quick_validate.py`，检查输出与退出码。上板结论必须另标“实测”，不能拿离线测试代替。

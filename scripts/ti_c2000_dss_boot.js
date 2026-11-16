@@ -25,7 +25,13 @@ function dssSleepMs(ms) { java.lang.Thread.sleep(ms); }
 // every load attempt operated on a dead link. isHalted() must reach the target, so use it
 // as the proof.
 function dssLinkIsUp(session) {
-    try { session.target.isHalted(); return true; } catch (e) { return false; }
+    try {
+        // DSS exposes an explicit connection query. A successful connect() return alone
+        // is insufficient, and isHalted() by itself only describes debugger state.
+        if (!session.target.isConnected(true)) { return false; }
+        session.target.isHalted();
+        return true;
+    } catch (e) { return false; }
 }
 
 // Error -1138 (the core refusing to enter debug mode) is the only failure that must not be
@@ -56,6 +62,10 @@ function dssConnectVerified(session, log, maxTry) {
             try { session.target.disconnect(); } catch (eX) { }
         } catch (e) {
             log("CONNECT_RETRY " + i + ": " + e);
+            if (dssBoardRefusedDebug(e)) {
+                log("DSS: debug mode refused during connect - not retrying");
+                return false;
+            }
         }
         dssSleepMs(1000 + 500 * i);
     }
@@ -100,7 +110,9 @@ function dssLoadWithRetry(session, outPath, log, attempts) {
     for (var a = 2; a <= n; a++) {
         try { session.target.halt(); } catch (eh) { }
         try { session.target.reset(); } catch (er) { }
-        dssSleepMs(500 * a);
+        // Each loadProgram may already have written part of the image before failing.
+        // Keep the same minimum gap as between full download rounds.
+        dssSleepMs(5000);
         try { session.memory.loadProgram(outPath); log("DSS: loaded on attempt " + a); return true; }
         catch (en) {
             log("DSS: load failed, attempt " + a + ": " + en);
@@ -123,7 +135,14 @@ function dssRunVerified(session, log, settleMs) {
 
 // Halt, wait, disconnect, terminate: the order that keeps the next session loadable.
 function dssShutdown(session, log) {
-    try { if (!session.target.isHalted()) { session.target.halt(); dssSleepMs(150); } } catch (eh) { log("DSS: halt before disconnect failed: " + eh); }
-    try { session.target.disconnect(); log("DSS: disconnected"); } catch (ed) { log("DSS: disconnect failed: " + ed); }
-    try { session.terminate(); } catch (et) { log("DSS: terminate failed: " + et); }
+    var ok = true;
+    try { if (!session.target.isHalted()) { session.target.halt(); dssSleepMs(150); } }
+    catch (eh) { log("DSS: halt before disconnect failed: " + eh); ok = false; }
+    try { session.target.disconnect(); log("DSS: disconnected"); }
+    catch (ed) { log("DSS: disconnect failed: " + ed); ok = false; }
+    try { if (session.target.isConnected(true)) { log("DSS: still connected after disconnect"); ok = false; } }
+    catch (ec) { log("DSS: could not verify disconnect: " + ec); ok = false; }
+    try { session.terminate(); }
+    catch (et) { log("DSS: terminate failed: " + et); ok = false; }
+    return ok;
 }

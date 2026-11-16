@@ -64,7 +64,7 @@
 | TI 模拟器 | 无硬件 | `Texas Instruments Simulator`（tisim_*） | 脚本检测到 simulator 会自动跳过硬件检查，纯软件验证逻辑 |
 
 **决定连什么的是 `.ccxml`，不是脚本**：换仿真器在 CCS 里建/改 target configuration，然后 `-Ccxml <文件>`（默认取 `targetConfigs\` 下第一个）。
-驱动器没枚举出来时：`-NoProbeCheck` 可跳过前置检查（连接失败时 loadti/DSS 仍会明确报错）。
+驱动器没枚举出来时，先排查设备与驱动。可信的 `ReadOnly` 会拒绝 `-NoProbeCheck`；执行模式也应先完成探针检查，再由 DSS 验证目标连接。
 
 ### 3.1 探针版本 ↔ 连接类型互改（v1 / v2 / v3 / XDS110 ...）
 
@@ -243,7 +243,7 @@ ADC/SCI/SPI/watchdog/eCAP 等），全部 `RESULT: OK`。
 ## 4. 双核 / 多核器件怎么办
 
 1. 每个核建自己的工程与 `.out`（cpu1/cpu2 分开）。
-2. 读数入口用 **`-CorePattern ".*CPU1.*"`** 明确选择会话（默认 `.*` 取第一个匹配核心，会误撞 CPU2 或 CLA1）。TI 的 `loadti` CLI 支持 `-cpu/--cpu-name` 指定单个目标核；本技能当前 `ti_c2000_debug.ps1` 未透传这个参数，因此使用包装脚本下载时仍须核对 `.ccxml` 默认核，或为各核准备明确的目标配置。直接使用 `loadti -cpu` 时，CPU 名称须来自实际 `.ccxml`，不可仅按器件型号猜测。下载/复位只用于执行模式，不用于读数。
+2. 在多核 `.ccxml` 中，常驻服务启动时用从 CPU 列表核实过的**精确匹配式**（例如 `-CorePattern ".*C28xx_CPU1$"`）明确选择目标核；脚本通过 DSS 的 CPU 列表要求恰好一个匹配，并记录实际核名。读数附着已有会话，可再用同一参数校验实际核。TI 的 [DSS DebugServer API](https://software-dl.ti.com/ccs/esd/documents/scripting_api/ccs_12.8.0/dss/docs/DS_API/com/ti/debug/engine/scripting/DebugServer.html)提供 `getListOfCPUs()`；[DebugSession API](https://software-dl.ti.com/ccs/esd/documents/scripting_api/ccs_12.8.0/dss/docs/DS_API/com/ti/debug/engine/scripting/DebugSession.html)提供实际 CPU 名。TI 的 `loadti` CLI 支持 `-cpu/--cpu-name` 指定单个目标核；本技能当前 `ti_c2000_debug.ps1` 未透传这个参数，因此使用该显式下载包装脚本时仍须核对 `.ccxml` 默认核，或为各核准备明确的目标配置。直接使用 `loadti -cpu` 时，CPU 名称须来自实际 `.ccxml`，不可仅按器件型号猜测。下载/复位只用于执行模式，不用于读数。
 3. 读变量时 `-Variables` 里的符号必须在**该核**的符号表里；跨核读取要用 IPC/共享内存变量。
 4. F2838x 还有 Cortex-M4 核：它的工程是 ARM 编译器（`ti-cgt-arm*`），本 skill 只覆盖 C28x 侧。
 

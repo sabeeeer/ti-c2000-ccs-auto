@@ -55,6 +55,7 @@ param(
     [string]$Ccxml = '',
     [string]$OutFile = '',
     [string]$CcsRoot = '',
+    [string]$CorePattern = '',
     # continuous mode is about rebuilding as well; -NoBuild only re-downloads
     [switch]$NoBuild,
     [switch]$Quiet
@@ -67,7 +68,7 @@ function Info2($m) { if (-not $Quiet) { Write-Output $m } }
 function Show-KeyLines($arr) {
     foreach ($l in $arr) {
         $s = [string]$l
-        if ($s -match '^(FAILURE|REASON|HINT|LOAD|RUN MODE|SERVICE|EXPECT|JUDGE)') { Out2 $s }
+        if ($s -match '^\s*(FAILURE|REASON|HINT|LOAD|RUN MODE|SERVICE|EXPECT|JUDGE|PREFLIGHT|PROBE|CORE|LOCATION|BUILD|FRESH|LOADS|IMAGE|ALIVE)') { Out2 $s }
     }
 }
 . (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
@@ -110,6 +111,7 @@ $common = @('-ProjectPath', $ProjectPath)
 if ($Ccxml) { $common += @('-Ccxml', $Ccxml) }
 if ($OutFile) { $common += @('-OutFile', $OutFile) }
 if ($CcsRoot) { $common += @('-CcsRoot', $CcsRoot) }
+if ($CorePattern) { $common += @('-CorePattern', $CorePattern) }
 
 $iterDir = Join-Path $ProjectPath 'readout\iterate'
 $dataCsv = Join-Path $ProjectPath 'readout\data\data.csv'
@@ -187,10 +189,10 @@ try {
         $readOut = @(& $pwshExe @readArgs 2>&1)
         $readCode = $LASTEXITCODE
         foreach ($l in $readOut) { $lines.Add('[read] ' + [string]$l) }
+        Show-KeyLines $readOut
         if (Test-Path -LiteralPath $dataCsv) { Copy-Item -LiteralPath $dataCsv -Destination (Join-Path $roundDir 'data.csv') -Force }
 
         if ($readCode -ne 0) {
-            Show-KeyLines $readOut
             $reason = ('round {0}: read failed (exit {1}) - data not usable' -f $i, $readCode)
             $lines.Add('VERDICT: read failed, next round')
             [IO.File]::WriteAllLines($roundLog, $lines, (New-Object Text.UTF8Encoding($false)))

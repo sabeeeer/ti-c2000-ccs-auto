@@ -1,13 +1,11 @@
 #requires -Version 7.0
-# The connect / reset / load / run sequence used to be copy-pasted into three DSS
-# templates. On 2026-11-15 the service learned to verify connect() and to stop on Error
-# -1138 while both one-shot readers kept the old, broken copy. This test makes that
-# class of drift impossible to reintroduce: one shared file, three injection points.
+# Only the retained service owns DSS connect/reset/load/run. Public readers attach
+# through it, so a read cannot end by halting or disconnecting a one-shot session.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $scripts = Join-Path $root 'scripts'
 $boot = Join-Path $scripts 'ti_c2000_dss_boot.js'
-$entries = @('ti_c2000_service.ps1', 'ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1')
+$entries = @('ti_c2000_service.ps1')
 $problems = New-Object System.Collections.Generic.List[string]
 
 # 1. the shared file exists, defines the sequence, and does not contain the marker itself
@@ -40,6 +38,12 @@ foreach ($e in $entries) {
     }
     # exactly one concrete loadProgram call site per generated script: inside the shared file
     if ($t -match 'session\.memory\.loadProgram') { $problems.Add("$e calls session.memory.loadProgram directly - that belongs in dssLoadWithRetry") }
+}
+foreach ($reader in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+    $t = [IO.File]::ReadAllText((Join-Path $scripts $reader))
+    if ($t -notmatch 'Invoke-RetainedLoadRead' -or $t -match 'dssLoadWithRetry|dssShutdown|session\.target\.halt\(') {
+        $problems.Add("$reader must load through the retained service and never shut down DSS after reading")
+    }
 }
 
 # 3b. the two implementations of the cmd.txt/res.txt exchange must stay in step. They live
@@ -128,6 +132,6 @@ if ($problems.Count -gt 0) {
     exit 1
 }
 
-Write-Output ('CHECK   : {0} entry points all inject the shared boot sequence' -f $entries.Count)
+Write-Output 'CHECK   : retained service is the sole DSS loader; both readers use it'
 Write-Output 'RESULT: OK'
 exit 0

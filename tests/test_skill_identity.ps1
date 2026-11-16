@@ -8,6 +8,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $lib = Join-Path $root 'scripts/ti_c2000_readmode.ps1'
+. $lib
 $check = Join-Path $root 'scripts/check_project_entry.ps1'
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('c2000-ident-' + [guid]::NewGuid().ToString('N'))
 $proj = Join-Path $fixture 'Fw'
@@ -57,6 +58,15 @@ try {
     if (-not $rec.version -or $rec.version -eq 'unknown') { throw 'the record has no skill version' }
     if ((Split-Path -Leaf ([string]$rec.skill)) -ne 'ti-c2000-ccs-auto') { throw "the record names another skill: $($rec.skill)" }
 
+    # The version must change for a script-only edit, not just for SKILL.md edits.
+    $fakeSkill = Join-Path $fixture 'fake-skill'
+    Write-Text (Join-Path $fakeSkill 'SKILL.md') '# fixture skill'
+    Write-Text (Join-Path $fakeSkill 'scripts/reader.ps1') 'one'
+    $v1 = (Get-SkillIdentity -SkillRoot $fakeSkill).version
+    Write-Text (Join-Path $fakeSkill 'scripts/reader.ps1') 'two'
+    $v2 = (Get-SkillIdentity -SkillRoot $fakeSkill).version
+    if ($v1 -eq $v2 -or $v1 -eq 'unknown' -or $v2 -eq 'unknown') { throw 'script-only edit did not change the skill version' }
+
     # ---- 3. the run log proves (or disproves) recent skill use --------------
     Remove-Item -LiteralPath (Join-Path $proj 'Tools') -Recurse -Force
     $r = Invoke-Script @('-NoProfile', '-File', $check, '-ProjectPath', $proj, '-MaxRunAgeMinutes', '30')
@@ -68,6 +78,11 @@ try {
     [IO.File]::WriteAllText($log, (($old | ConvertTo-Json -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
     $r = Invoke-Script @('-NoProfile', '-File', $check, '-ProjectPath', $proj, '-MaxRunAgeMinutes', '30')
     if ($r.code -ne 1 -or $r.text -notmatch 'min old') { throw "a stale run was accepted`n$($r.text)" }
+
+    $oldVersion = [ordered]@{ at = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); pid = 1; script = 'y'; mode = 'ReadOnly'; skill = $rec.skill; version = 'deadbeef' }
+    [IO.File]::WriteAllText($log, (($oldVersion | ConvertTo-Json -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    $r = Invoke-Script @('-NoProfile', '-File', $check, '-ProjectPath', $proj, '-MaxRunAgeMinutes', '30')
+    if ($r.code -ne 1 -or $r.text -notmatch 'used skill version') { throw "an old content version was accepted`n$($r.text)" }
 
     # a run recorded by a different skill directory is not proof either
     $other = [ordered]@{ at = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); pid = 1; script = 'y'; mode = 'ReadOnly'; skill = (Join-Path $fixture 'copy-of-skill'); version = $rec.version }

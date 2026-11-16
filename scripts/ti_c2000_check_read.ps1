@@ -43,6 +43,8 @@ param(
 $ErrorActionPreference = 'Continue'
 function Out2($m) { Write-Output $m }
 function Info2($m) { if (-not $Quiet) { Write-Output $m } }
+. (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
+Out2 ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
 
 if (-not (Test-Path -LiteralPath $CsvPath)) {
     Out2 'FAILURE: NO_CSV'; Out2 'RESULT: FAIL'

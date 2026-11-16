@@ -49,8 +49,13 @@ param(
     [switch]$Status,
     [string]$Ccxml = '',
     [string]$OutFile = '',
+    [string]$MapFile = '',
     [string]$CcsRoot = '',
-    [string]$CorePattern = '.*C28xx(?:_CPU1)?$',
+    # Which CPU to open. Not empty by default: getListOfCPUs() on an F28379D returns
+    # several entries (C28xx_CPU1, C28xx_CPU2, CLA1, CLA2 ...), so an empty pattern matches
+    # all of them and every -Start dies with AMBIGUOUS_CORE (measured 2026-11-16).
+    # CPU1 is what a single-core project runs on; override for a CPU2 or CLA target.
+    [string]$CorePattern = '.*C28xx_CPU1$',
     [switch]$Build,
     # set this only after the user answered yes to "compile/download and run?"
     [switch]$ConfirmLoad,
@@ -103,6 +108,8 @@ if ($Start) {
 # -Status is pure reporting and stays available; Start/Stop must not fight a
 # running iterate loop over the same target.
 $runSpec = Resolve-RunModeSpec -RunMode $RunMode -ConfirmLoad:$ConfirmLoad -UserApproved:$UserApproved -MaxLoads 1
+try { if ($CorePattern) { [void][regex]::new($CorePattern) } }
+catch { Out2 'FAILURE: INVALID_CORE_PATTERN'; Out2 'RESULT: FAIL'; exit 2 }
 if (-not $Status) {
     $opName = if ($Start) { 'service -Start' } else { 'service -Stop' }
     Assert-RunModeInterlock -ProjectPath $ProjectPath -What $opName
@@ -115,6 +122,7 @@ $stoppedFile = Join-Path $svcDir 'stopped.txt'
 $errorFile = Join-Path $svcDir 'error.txt'
 $cmdFile = Join-Path $svcDir 'cmd.txt'
 $resFile = Join-Path $svcDir 'res.txt'
+$coreFile = Join-Path $svcDir 'core.txt'
 $logFile = Join-Path $svcDir 'server.log'
 
 function Get-ServiceState {
@@ -170,6 +178,7 @@ if ($Status) {
         Out2 ('LOAD    : #' + $(if ($idx) { $idx } else { '?' }) + ' (this session)')
         Out2 ('LOADS   : #{0} total for this project, last at {1}' -f $cnt.count, $cnt.lastLoad)
         Out2 ('OUT     : {0}' -f $st.out)
+        Out2 ('CORE    : {0}' -f $st.core)
         Out2 ('SHA256  : {0}' -f $st.outSha256)
         Out2 ('DIR     : {0}' -f $svcDir)
         Out2 'RESULT: OK'
@@ -214,15 +223,45 @@ if ($Stop) {
         Start-Sleep -Milliseconds 500
         Info2 'NOTE    : service did not stop on request; process tree killed'
     }
+    $cleanStop = (-not $alive) -and (Test-Path -LiteralPath $stoppedFile)
     foreach ($f in @($cmdFile, $resFile, $readyFile, $stateFile)) {
         if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     }
-    # The DSP process is gone, but Windows/FTDI still holds the USB handle for a moment.
-    # A start issued the instant -Stop returns then dies with "Error -150 ... FTDI driver
-    # functions" (measured 2026-11-15). Give the port time to come back.
-    Start-Sleep -Milliseconds 800
+    # On the observed XDS100 setup, releasing the DSS process also releases the FTDI
+    # handle and the probe temporarily disappears from PnP. Other probes may differ.
+    # Wait for the device adapter to report usable before a new Start can be attempted.
+    $probeBack = $false
+    $debugScript = Join-Path $PSScriptRoot 'ti_c2000_debug.ps1'
+    $probeArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$debugScript,
+        '-ProjectPath',$ProjectPath,'-ProbeCheckOnly','-Quiet')
+    if ($CcsRoot) { $probeArgs += @('-CcsRoot',$CcsRoot) }
+    for ($i = 0; $i -lt 6; $i++) {
+        Start-Sleep -Milliseconds ([Math]::Max(400,[int](Get-FwContract -Quiet).timing.minReconnectGapMs))
+        $probeResult = @(& $pwshExe @probeArgs 2>&1)
+        if ($LASTEXITCODE -eq 0 -and @($probeResult | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
+            $probeBack = $true; break
+        }
+        if ($i -lt 5) { Start-Sleep -Milliseconds 1600 }
+    }
+    if ($probeBack) {
+        Info2 'PROBE   : re-enumerated after the session exited (USB handle released)'
+        Info2 'NOTE    : PnP lists it before its driver is ready - a -Start right now waits up to 12 s, then proceeds'
+    } else {
+        Out2 'WARN    : the probe has not re-enumerated 12 s after the session exited'
+        Out2 'WARN    : check the USB cable; a -Start now would report NO_PROBE'
+    }
     $cnt = Get-LoadCount -ProjectPath $ProjectPath
     Exit-TargetLock -ProjectPath $ProjectPath
+    if (-not $cleanStop) {
+        Out2 'FAILURE: STOP_UNCLEAN'; Out2 'RESULT: FAIL'
+        Out2 'REASON: DSS did not write stopped.txt after disconnect; the process was forced down or exited early'
+        exit 1
+    }
+    if (-not $probeBack) {
+        Out2 'FAILURE: PROBE_NOT_READY'; Out2 'RESULT: FAIL'
+        Out2 'REASON: DSS stopped, but the probe did not pass the usable probe check after reconnection'
+        exit 3
+    }
     Out2 'SERVICE : STOPPED'
     Out2 ('LOADS   : #{0} kept (the next -Start would be load #{1})' -f $cnt.count, ([int]$cnt.count + 1))
     Out2 'RESULT: OK'
@@ -263,22 +302,6 @@ if (-not $ConfirmLoad) {
 # 2026-11-15, a 20:23 .out was loaded at 21:48 while the sources had been edited at
 # 21:42, and every read of the new DMA symbols failed with "identifier not found".
 # Warn loudly instead of letting a stale image look like a code bug.
-if (-not $Build) {
-    $staged = @(Get-ChildItem -LiteralPath (Join-Path $ProjectPath 'Debug') -Filter '*.out' -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending) | Select-Object -First 1
-    if ($staged) {
-        $newestSrc = @(Get-ChildItem -LiteralPath $ProjectPath -Recurse -File -Include *.c, *.h, *.cmd -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\ti\\|\\Debug\\|\\Tools\\' } |
-            Sort-Object LastWriteTime -Descending) | Select-Object -First 1
-        if ($newestSrc -and ($newestSrc.LastWriteTime -gt $staged.LastWriteTime.AddSeconds(2))) {
-            Out2 ('WARN    : {0} is OLDER than {1} - this download would put an outdated image on the target' -f $staged.Name, $newestSrc.Name)
-            Out2 ('WARN    : .out {0}   vs   source {1}' -f $staged.LastWriteTime.ToString('MM-dd HH:mm:ss'), $newestSrc.LastWriteTime.ToString('MM-dd HH:mm:ss'))
-            Out2 'WARN    : reads of symbols added since that build will fail with "identifier not found"'
-            Out2 'HINT    : add -Build (compiles and stages), or run ti_c2000_build.ps1 -Stage first'
-        }
-    }
-}
-
 $projName = Split-Path -Leaf $ProjectPath
 $projectFile = Join-Path $ProjectPath '.project'
 if (Test-Path -LiteralPath $projectFile) {
@@ -299,6 +322,10 @@ if (-not $Ccxml -or -not (Test-Path -LiteralPath $Ccxml)) {
 }
 if (-not $OutFile) { $OutFile = Join-Path $ProjectPath "Debug\$projName.out" }
 
+# Judge the exact image that DSS will load. A different, newer *.out in Debug must
+# never excuse a stale -OutFile (nor condemn a current one).
+if (-not $Build) { Assert-SelectedOutFresh -ProjectPath $ProjectPath -OutFile $OutFile }
+
 $skillRoot = Split-Path $PSScriptRoot -Parent
 $debugScript = Join-Path $skillRoot 'scripts\ti_c2000_debug.ps1'
 if (-not (Test-Path -LiteralPath $debugScript)) {
@@ -308,9 +335,20 @@ if (-not (Test-Path -LiteralPath $debugScript)) {
 
 $probeArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $debugScript, '-ProjectPath', $ProjectPath, '-ProbeCheckOnly')
 if ($CcsRoot) { $probeArgs += @('-CcsRoot', $CcsRoot) }
-$probeOut = & $pwshExe @probeArgs 2>&1
-$probeCode = $LASTEXITCODE
-$probeText = (@($probeOut | ForEach-Object { [string]$_ }) -join "`n")
+# Retry up to 12 s. Right after a session exits, the FTDI device re-enumerates: PnP lists
+# it before the driver can actually open it, so a single check reports NO_PROBE for a probe
+# that answers a couple of seconds later (measured 2026-11-15: "-Stop then -Start" failed
+# every time with a 2 s NO_PROBE, and succeeded when retried by hand).
+$probeOut = @()
+$probeCode = 1
+$probeText = ''
+for ($try = 1; $try -le 6; $try++) {
+    $probeOut = @(& $pwshExe @probeArgs 2>&1)
+    $probeCode = $LASTEXITCODE
+    $probeText = (@($probeOut | ForEach-Object { [string]$_ }) -join "`n")
+    if ($probeCode -eq 0 -and $probeText -match 'RESULT: OK') { break }
+    if ($try -lt 6) { Start-Sleep -Milliseconds 2000 }
+}
 if ($probeCode -ne 0 -or $probeText -notmatch 'RESULT: OK') {
     foreach ($line in $probeOut) { Out2 ([string]$line) }
     if ($probeCode -eq 3 -or $probeText -match 'NO_PROBE') { Out2 'FAILURE: NO_PROBE'; Out2 'RESULT: FAIL'; Out2 'REASON: no debug probe detected'; exit 3 }
@@ -335,6 +373,18 @@ if (-not (Test-Path -LiteralPath $OutFile)) {
     Out2 'FAILURE: NO_OUT_FILE'; Out2 'RESULT: FAIL'
     Out2 "REASON: '$OutFile' not found - add -Build or build/stage first"; exit 2
 }
+Assert-SelectedOutFresh -ProjectPath $ProjectPath -OutFile $OutFile
+if (-not $MapFile) { $MapFile = [IO.Path]::ChangeExtension($OutFile, '.map') }
+if (-not (Test-Path -LiteralPath $MapFile)) {
+    Out2 'FAILURE: MAP_MISSING'; Out2 'RESULT: FAIL'
+    Out2 ('REASON: selected image has no matching linker map: ' + $MapFile); exit 2
+}
+$MapFile = (Get-Item -LiteralPath $MapFile).FullName
+if ([Math]::Abs(((Get-Item -LiteralPath $MapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $OutFile).LastWriteTimeUtc).TotalSeconds) -gt 120) {
+    Out2 'FAILURE: STALE_MAP'; Out2 'RESULT: FAIL'
+    Out2 'REASON: selected .map and .out timestamps differ by more than two minutes; their layouts may describe different builds'; exit 2
+}
+$mapSha = (Get-FileHash -LiteralPath $MapFile -Algorithm SHA256).Hash
 
 $ccsPath = ''
 if ($probeText -match '(?m)^CCS\s*:\s*(.+?)\s+\(v') { $ccsPath = $Matches[1].Trim() }
@@ -348,7 +398,7 @@ New-Item -ItemType Directory -Path $svcDir -Force | Out-Null
 # the image is being written (checked after the cheap build/probe work on purpose)
 $lk = Enter-TargetLock -ProjectPath $ProjectPath -Mode 'Start'
 if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 5 }
-foreach ($f in @($readyFile, $stoppedFile, $errorFile, $cmdFile, $resFile, $stateFile)) {
+foreach ($f in @($readyFile, $stoppedFile, $errorFile, $cmdFile, $resFile, $coreFile, $stateFile)) {
     if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 $outSha = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
@@ -408,7 +458,41 @@ var env = ScriptingEnvironment.instance();
 try { env.setScriptTimeout(0); } catch (eT) { }
 var server = env.getServer("DebugServer.1");
 server.setConfig(CCXML);
-var session = server.openSession(CORE);
+var cpuList = server.getListOfCPUs();
+var cpuMatches = [];
+var cpuPattern = CORE ? new RegExp(CORE) : null;
+for (var ci = 0; ci < cpuList.length; ci++) {
+    if (!cpuPattern || cpuPattern.test("" + cpuList[ci])) { cpuMatches.push("" + cpuList[ci]); }
+}
+if (cpuMatches.length !== 1) {
+    // Name what was actually enumerated: without it the user cannot tell whether the
+    // pattern was too loose or the target simply has several cores.
+    var allNames = [];
+    var c28Count = 0;
+    for (var cn = 0; cn < cpuList.length; cn++) {
+        allNames.push("" + cpuList[cn]);
+        if (("" + cpuList[cn]).indexOf("C28xx") >= 0) { c28Count++; }
+    }
+    var hint = "pass -CorePattern for exactly one target core";
+    if (c28Count > 1) {
+        // Dual-core part (F28379D enumerates C28xx_CPU1 and C28xx_CPU2 plus CLA cores).
+        // Say so, and name the two patterns that matter, instead of a generic complaint.
+        hint = "this is a dual-core device (F28379D): use '.*C28xx_CPU1$' for CPU1 or '.*C28xx_CPU2$' for CPU2";
+    }
+    writeText(WORK + "/error.txt", "AMBIGUOUS_CORE matched " + cpuMatches.length + " of [" + allNames.join(" | ") + "]; " + hint);
+    throw "expected exactly one CPU, got " + cpuMatches.length;
+}
+var session = server.openSession(cpuMatches[0]);
+var actualCpu = "" + session.getCPUName();
+// getListOfCPUs() hands back the short form ("C28xx_CPU1") while getCPUName() returns
+// the full path ("Texas Instruments XDS100v2 USB Debug Probe_0/C28xx_CPU1"), so a strict
+// !== reports CORE_MISMATCH for the very CPU that was just opened (measured 2026-11-16).
+// Accept either direction of substring containment.
+if (actualCpu !== cpuMatches[0] && actualCpu.indexOf(cpuMatches[0]) < 0 && cpuMatches[0].indexOf(actualCpu) < 0) {
+    writeText(WORK + "/error.txt", "CORE_MISMATCH opened " + actualCpu + " instead of " + cpuMatches[0]);
+    throw "DSS opened a different CPU";
+}
+writeText(WORK + "/core.txt", actualCpu);
 session.options.setBoolean("AllowInterruptsWhenHalted", true);
 session.options.setBoolean("PoliteRealtimeMode", true);
 
@@ -448,13 +532,6 @@ while (running) {
     if (cmd.length === 0) { continue; }
     if (cmd === "STOP") {
         running = false;
-        // Halt before breaking out: disconnect() has to remove DSS's debug state (the
-        // breakpoint opcodes it patched into program memory), and that step fails while
-        // the core is free-running. Measured 2026-11-15: after such a stop the NEXT load
-        // failed with "Failed to remove the debug state from the target before
-        // disconnecting ... reset the emulator before you connect".
-        try { session.target.halt(); } catch (eStop) { print("DSS: halt before stop failed: " + eStop); }
-        sleepMs(150);
         break;
     }
 
@@ -463,6 +540,14 @@ while (running) {
     out.push("HALTED " + (halted ? "1" : "0"));
     try {
         if (cmd.indexOf("PING") === 0) {
+            out.push("END");
+        } else if (cmd.indexOf("ADDR ") === 0) {
+            var syms = cmd.substring(5).split("|");
+            for (var si = 0; si < syms.length; si++) {
+                if (!syms[si]) { continue; }
+                try { out.push("P " + syms[si] + " " + session.symbol.getAddress(syms[si])); }
+                catch (eP) { out.push("E " + syms[si] + " " + eP); }
+            }
             out.push("END");
         } else if (cmd.indexOf("VARS ") === 0) {
             var vs = cmd.substring(5).split("|");
@@ -500,13 +585,15 @@ while (running) {
     }
     writeText(WORK + "/res.txt", out.join("\n"));
 }
-// belt and braces: the STOP branch already halted, but dssShutdown halts again if needed,
-// then disconnects and terminates. Terminating the scripting session (not just the link)
-// matters: without it the DSS engine keeps state that makes the NEXT loadProgram fail on
-// the first attempt (measured 2026-11-15: every stop was followed by one failed start).
-dssShutdown(session, print);
-writeText(WORK + "/stopped.txt", "stopped");
-print("SERVICE: STOPPED");
+// Explicit Stop is disruptive; the shared shutdown halts only if needed, then
+// verifies disconnect and terminates. A failed shutdown must not look clean.
+if (dssShutdown(session, print)) {
+    writeText(WORK + "/stopped.txt", "stopped");
+    print("SERVICE: STOPPED");
+} else {
+    writeText(WORK + "/error.txt", "STOP_UNCLEAN disconnect or terminate failed");
+    print("SERVICE: STOP_UNCLEAN");
+}
 '@
 $js = $js.Replace('__WORK__', $workJs).Replace('__CCXML__', $ccxmlJs).Replace('__OUT__', $outJs).Replace('__CORE__', $coreJs)
 $bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))
@@ -525,7 +612,15 @@ Info2 'STEP    : connect -> reset -> load once -> run forever'
 # paths with spaces survive. Output is redirected by cmd itself; Start-Process
 # redirection would tie the log to this process and stop once it exits.
 $cmdLine = '/d /s /c ""' + $dss + '" "' + $jsPath + '" > "' + $logFile + '" 2>&1"'
-$psi = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -PassThru -WindowStyle Hidden
+Wait-MinLoadGap -ProjectPath $ProjectPath
+$psi = $null
+try { $psi = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -PassThru -WindowStyle Hidden -ErrorAction Stop }
+catch {
+    Exit-TargetLock -ProjectPath $ProjectPath
+    Out2 'FAILURE: DSS_START_FAILED'; Out2 'RESULT: FAIL'
+    Out2 ('REASON: could not start the DSS process: ' + $_.Exception.Message)
+    exit 1
+}
 $cmdPid = $psi.Id
 
 $deadline = (Get-Date).AddSeconds($StartTimeoutSec)
@@ -542,25 +637,53 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
     if (Test-Path -LiteralPath $logFile) { $tail = @(Get-Content -LiteralPath $logFile -Tail 12 -ErrorAction SilentlyContinue) }
     if (-not $failReason) { $failReason = 'no ready signal within the startup timeout' }
     & cmd.exe /d /c "taskkill /PID $cmdPid /T /F" 2>&1 | Out-Null
+    Mark-LoadAttemptEnd -ProjectPath $ProjectPath
     Exit-TargetLock -ProjectPath $ProjectPath
     foreach ($line in $tail) { Out2 ([string]$line) }
-    Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
+    # Decide the classification BEFORE printing FAILURE: a -1138 that is about to be retried
+    # in a fresh process is not a failure the caller should see, and printing it first made
+    # a successful retry look like a failed start (measured 2026-11-15).
     # The whole log, not -Tail 12: -1138 appears near the top (GEL output first), and by
     # the time the load retries have run it is dozens of lines above the end.
     $logText = ''
     if (Test-Path -LiteralPath $logFile) { try { $logText = Get-Content -LiteralPath $logFile -Raw -Encoding utf8 } catch { } }
-    if ($logText -match 'Error -1138|Device refused to allow debug mode' -or $failReason -match 'board refused debug mode|Target reset failed') {
-        # Not a software condition: the core will not enter debug mode until power is cycled.
-        # Say exactly that instead of suggesting another -Start that cannot help.
-        Out2 'HINT    : the chip refused debug mode (Error -1138) - this is a board state, not a script problem'
+    if ($failReason -match '^(AMBIGUOUS_CORE|CORE_MISMATCH)\b') {
+        Out2 ('FAILURE: ' + $Matches[1]); Out2 'RESULT: FAIL'
+        Out2 ('REASON: ' + $failReason); exit 4
+    }
+    if ($logText -match 'Error -1138|Device refused to allow debug mode' -or $failReason -match 'board refused debug mode') {
+        # -1138 is intermittent, and a fresh DSS process usually clears it on the first try:
+        # measured 2026-11-15, the very same command failed with -1138 and then succeeded
+        # on the next invocation at loads #35, #37 and #44. Retrying inside one DSS process
+        # is what damages the probe (-1041 -> -150), so the retry here is a NEW process,
+        # exactly once. Only if that also fails is this a board state the user must fix.
+        if (-not $env:TI_C2000_START_RETRY) {
+            Out2 'NOTE    : the chip refused debug mode (Error -1138) - retrying once with a fresh DSS process'
+            $env:TI_C2000_START_RETRY = '1'
+            $retryArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+                '-ProjectPath', $ProjectPath, '-Start', '-ConfirmLoad')
+            if ($Build) { $retryArgs += '-Build' }
+            if ($CcsRoot) { $retryArgs += @('-CcsRoot', $CcsRoot) }
+            if ($Ccxml) { $retryArgs += @('-Ccxml', $Ccxml) }
+            if ($OutFile) { $retryArgs += @('-OutFile', $OutFile) }
+            if ($MapFile) { $retryArgs += @('-MapFile', $MapFile) }
+            if ($Quiet) { $retryArgs += '-Quiet' }
+            try {
+                & pwsh @retryArgs
+                exit $LASTEXITCODE
+            } finally {
+                Remove-Item Env:TI_C2000_START_RETRY -ErrorAction SilentlyContinue
+            }
+        }
+        # Second attempt in a row: the board really is refusing debug mode.
+        Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
+        Out2 'HINT    : the chip refused debug mode (Error -1138) twice in a row - this is a board state, not a script problem'
         Out2 'HINT    : power-cycle the board: unplug the USB cable, wait 3 s, plug it back in'
-        Out2 'HINT    : repeated -1138 without a power cycle is normal; retrying -Start will not clear it'
+        Out2 'HINT    : if a power cycle does not clear it, lower TCLK in the .ccxml and try again'
         exit 3
     }
     if ($tail -join "`n" -match 'Error -150|FTDI driver functions') {
-        # Error -150 comes from the FTDI/USB layer, not from DSS or the image. No amount
-        # of retrying inside DSS fixes it; the port has to come back.
-        Out2 'HINT    : Error -150 is the FTDI/USB layer, not the image: the probe port did not come back after the previous session'
+        Out2 'HINT    : the probe driver did not become usable after the previous session; consult Error mode for this adapter'
         Out2 'HINT    : unplug the USB cable, wait 3 s, plug it back in, then run -Start again'
         Out2 'HINT    : if this repeats, check the cable/port and disable USB selective suspend for this device'
     } elseif ($failReason -match 'Load failed|Failed to remove the debug state') {
@@ -569,21 +692,36 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
         Out2 'HINT    : the target still holds debug state from an earlier session - run -Start again (a fresh DSS process usually clears it)'
         Out2 'HINT    : if it fails twice in a row, power-cycle the board (unplug USB, wait 3 s, plug back in) and start again'
     }
+    Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
     exit 1
 }
 
+$resolvedCore = if (Test-Path -LiteralPath $coreFile) { ([string](Get-Content -LiteralPath $coreFile -Raw)).Trim() } else { '' }
+if (-not $resolvedCore) {
+    & cmd.exe /d /c "taskkill /PID $cmdPid /T /F" 2>&1 | Out-Null
+    Mark-LoadAttemptEnd -ProjectPath $ProjectPath
+    Exit-TargetLock -ProjectPath $ProjectPath
+    Out2 'FAILURE: CORE_UNVERIFIED'; Out2 'RESULT: FAIL'
+    Out2 'REASON: DSS did not report the exact selected target core'; exit 4
+}
+Info2 ('CORE    : selected {0}' -f $resolvedCore)
 $state = [ordered]@{
+    # Store the time of the finished load, so the next round cannot start immediately.
     pid       = $cmdPid
     started   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     project   = $ProjectPath
     out       = $OutFile
     outSha256 = $outSha
+    map       = $MapFile
+    mapSha256 = $mapSha
     ccxml     = (Get-Item -LiteralPath $Ccxml).FullName
-    core      = $CorePattern
+    core      = $resolvedCore
+    corePattern = $CorePattern
     status    = 'RUNNING'
     loadIndex = 0
     runMode   = $runSpec.mode
 }
+Mark-LoadAttemptEnd -ProjectPath $ProjectPath
 Write-JsonAtomic -Path $stateFile -Object $state
 
 # the image is on the target now: this is a real download, so the shared counter

@@ -26,6 +26,7 @@ param(
     [switch]$AllowCompilerFallback,
     [switch]$Run,
     [switch]$LoadOnly,
+    [switch]$ConfirmLoad,
     [switch]$ProbeCheckOnly,
     [switch]$NoProbeCheck,
     [int]$TimeoutSec     = 180,
@@ -37,6 +38,8 @@ param(
 $ErrorActionPreference = 'Continue'
 function Out2($m) { Write-Output $m }
 function Info2($m) { if (-not $Quiet) { Write-Output $m } }
+. (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
+Out2 ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
 
 # A stale caller may still pass -ReadOnly/-ReadVars/-ReadArray/-WaitFor. Under
 # `pwsh -File` those do not fail binding; they land in $args. Say so explicitly
@@ -49,7 +52,7 @@ if ($args.Count -gt 0) {
 }
 # Reject incompatible arguments before a background process, build or loader
 # can start. This script never reads values back.
-if ($ProbeCheckOnly -and ($Build -or $AllowCompilerFallback -or $Run -or $LoadOnly -or $NoProbeCheck)) {
+if ($ProbeCheckOnly -and ($Build -or $AllowCompilerFallback -or $Run -or $LoadOnly -or $NoProbeCheck -or $ConfirmLoad)) {
     Out2 "FAILURE: MODE_CONFLICT"
     Out2 "RESULT: FAIL"
     Out2 "REASON: -ProbeCheckOnly cannot build, access the target or skip the probe check"
@@ -71,6 +74,10 @@ if ($LoadOnly -and $Run) {
     Out2 "RESULT: FAIL"
     Out2 "REASON: choose -Build, -Run, -LoadOnly or -ProbeCheckOnly; no implicit action"
     exit 2
+}
+if (($Run -or $LoadOnly) -and -not $ConfirmLoad) {
+    Out2 'FAILURE: LOAD_NOT_CONFIRMED'; Out2 'RESULT: FAIL'
+    Out2 'REASON: explicit loadti download requires -ConfirmLoad after user approval'; exit 4
 }
 
 # ---------- 0. detached mode ----------
@@ -259,6 +266,10 @@ if (-not (Test-Path -LiteralPath $OutFile)) {
     Out2 "FAILURE: NO_OUT_FILE"
     Out2 "RESULT: FAIL"; Out2 "REASON: $OutFile not found - run the build first (add -Build)"; exit 2
 }
+if ($Run -or $LoadOnly) {
+    . (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
+    Assert-SelectedOutFresh -ProjectPath $ProjectPath -OutFile $OutFile
+}
 if (-not $Ccxml) {
     $c = Get-ChildItem -Path (Join-Path $ProjectPath 'targetConfigs') -Filter '*.ccxml' -ErrorAction SilentlyContinue |
          Select-Object -First 1
@@ -338,6 +349,8 @@ function Quote-CmdArgument([string]$value) {
     if ($value -match '["%\r\n]') { throw "unsupported character in loadti path or argument" }
     return '"' + $value + '"'
 }
+. (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
+Wait-MinLoadGap -ProjectPath $ProjectPath
 try {
     $command = (Quote-CmdArgument $loadti) + ' ' + (($ltArgs | ForEach-Object { Quote-CmdArgument $_ }) -join ' ')
     $start = [Diagnostics.ProcessStartInfo]::new()
@@ -362,6 +375,8 @@ try {
     Out2 "RESULT: FAIL"
     Out2 "REASON: loadti could not be started: $($_.Exception.Message)"
     exit 1
+} finally {
+    Mark-LoadAttemptEnd -ProjectPath $ProjectPath
 }
 if (-not $Quiet) { $out | Select-Object -Last 25 | ForEach-Object { Out2 $_ } }
 $bad    = @($out | Where-Object { $_ -match 'error|failed|cannot|aborted' })

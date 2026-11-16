@@ -3,8 +3,9 @@
 # that (a) the run stops, (b) no data.csv survives, and (c) verdict.txt says FAIL.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$read = Join-Path $root 'scripts\ti_c2000_run_read.ps1'
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('c2000-preflight-' + [guid]::NewGuid().ToString('N'))
+$scripts = Join-Path $fixture 'skill/scripts'
+$read = Join-Path $scripts 'ti_c2000_run_read.ps1'
 $proj = Join-Path $fixture 'proj'
 $svc = Join-Path $proj 'readout\.service'
 $data = Join-Path $proj 'readout\data'
@@ -25,18 +26,28 @@ function Reset-Stale {
 }
 
 try {
-    New-Item -ItemType Directory -Force -Path $svc, $data, $check, (Join-Path $proj 'targetConfigs'), (Join-Path $proj 'Debug') | Out-Null
+    New-Item -ItemType Directory -Force -Path $svc, $data, $check, $scripts, (Join-Path $fixture 'skill/references'), (Join-Path $proj 'targetConfigs'), (Join-Path $proj 'Debug') | Out-Null
+    Copy-Item (Join-Path $root 'scripts/*') $scripts -Recurse -Force
+    Copy-Item (Join-Path $root 'references/firmware-contract.json') (Join-Path $fixture 'skill/references')
+    @'
+param([string]$ProjectPath,[string]$CcsRoot,[switch]$ProbeCheckOnly)
+Write-Output 'RESULT: OK'
+exit 0
+'@ | Set-Content (Join-Path $scripts 'ti_c2000_debug.ps1') -Encoding utf8
     [IO.File]::WriteAllText((Join-Path $proj '.cproject'), '<project/>')
     [IO.File]::WriteAllText((Join-Path $proj 'targetConfigs\x.ccxml'), '<configurations/>')
 
     # the reader compares sha256(.out) with the session record first
     $outFile = Join-Path $proj 'Debug\proj.out'
     [IO.File]::WriteAllBytes($outFile, [byte[]](1..64))
+    $mapFile = Join-Path $proj 'Debug/proj.map'
+    [IO.File]::WriteAllText($mapFile, "MEMORY CONFIGURATION`nPAGE 0:`n  RAMLS0   00008000   00001000   00000000   00001000  RWIX`nSECTION ALLOCATION MAP`n  .text  0  00008000  00000100`n")
     $sha = (Get-FileHash -LiteralPath $outFile -Algorithm SHA256).Hash
+    $mapSha = (Get-FileHash -LiteralPath $mapFile -Algorithm SHA256).Hash
 
     # the session says it loaded firmware 65537; each case makes the stub answer something
     # different, which is exactly "the board is running another build"
-    $state = @{ pid = $PID; started = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); outSha256 = $sha; out = $outFile; runMode = 'SingleStep'; loadIndex = 3; fwId = '65537' } | ConvertTo-Json
+    $state = @{ pid = $PID; started = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); outSha256 = $sha; out = $outFile; map = $mapFile; mapSha256 = $mapSha; core = 'CPU1'; runMode = 'SingleStep'; loadIndex = 3; fwId = '65537' } | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $svc 'state.json'), $state)
     [IO.File]::WriteAllText((Join-Path $svc 'ready.txt'), 'ready')
 
@@ -53,12 +64,20 @@ while ($true) {
         $c = (Get-Content $cmd -Raw).Trim()
         if (-not (Test-Path $res)) {
             $lines = @('HALTED 0')
-            if ($c -like 'VARS *') {
+            if ($c -like 'ADDR *') {
+                foreach ($n in ($c.Substring(5) -split '\|')) {
+                    switch ($n) {
+                        'TiC2000_RamProofTick' { $lines += 'P TiC2000_RamProofTick 32960' }
+                        'gRamProofTick' { $lines += 'P gRamProofTick 32964' }
+                        default { $lines += ('E ' + $n + ' identifier not found') }
+                    }
+                }
+            } elseif ($c -like 'VARS *') {
                 foreach ($n in ($c.Substring(5) -split '\|')) {
                     switch ($n) {
                         'gFwId' { $lines += ('V gFwId ' + $Fw) }
                         'gMsTick' { $lines += ('V gMsTick ' + $tick); $tick += $Step }
-                        'PC' { $lines += 'V PC 32972' }
+                        'gRamProofTick' { $lines += ('V gRamProofTick ' + $tick); $tick += $Step }
                         default { $lines += ('E ' + $n + ' identifier not found: ' + $n) }
                     }
                 }
@@ -77,8 +96,7 @@ while ($true) {
 '@ | Set-Content -Path $stub -Encoding utf8
 
     function Run-Read([string]$fw, [int]$step) {
-        $p = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -PassThru -WindowStyle Hidden `
-            -ArgumentList (@('-NoProfile', '-File', $stub, '-Dir', $svc, '-Fw', $fw, '-Step', [string]$step))
+        $p = Start-ThreadJob -FilePath $stub -ArgumentList @($svc,$fw,$step)
         $ready = Join-Path $svc 'stub-ready.txt'
         if (Test-Path $ready) { Remove-Item $ready -Force -ErrorAction SilentlyContinue }
         $waited = 0
@@ -89,14 +107,14 @@ while ($true) {
         Start-Sleep -Milliseconds 600
         try {
             $argv = @('-NoProfile', '-File', $read, '-ProjectPath', $proj, '-Variables', 'gMsTick',
-                '-Mode', 'ReadOnly', '-Rounds', '2', '-IntervalMs', '200', '-NoProbeCheck')
+                '-Mode', 'ReadOnly', '-Rounds', '2', '-IntervalMs', '200')
             $out = @(& pwsh @argv 2>&1)
             return [ordered]@{ code = $LASTEXITCODE; text = (@($out | ForEach-Object { [string]$_ }) -join "`n") }
         } finally {
             # kill first, then clear: a stub still running would answer the next case's
             # requests with the previous firmware value
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            try { $p.WaitForExit(2000) | Out-Null } catch { }
+            Stop-Job -Job $p -ErrorAction SilentlyContinue
+            Remove-Job -Job $p -Force -ErrorAction SilentlyContinue
             foreach ($n in @('res.txt', 'cmd.txt', 'stub-ready.txt')) {
                 Remove-Item (Join-Path $svc $n) -Force -ErrorAction SilentlyContinue
             }
@@ -125,6 +143,16 @@ while ($true) {
     Check 'PREFLIGHT reports location' ($r.text -match 'LOCATION : ') 'no LOCATION line'
     Check 'PREFLIGHT reports LOADS' ($r.text -match 'LOADS    : #') 'no LOADS line'
     Check 'PREFLIGHT reports identity' ($r.text -match 'IMAGE    : gFwId = 65537') 'no IMAGE line'
+
+    # 4. a source edit after the load must not be presented as the newest firmware
+    $editedSource = Join-Path $proj 'new_logic.c'
+    [IO.File]::WriteAllText($editedSource, 'void changed(void) {}')
+    (Get-Item -LiteralPath $editedSource).LastWriteTimeUtc = (Get-Item -LiteralPath $outFile).LastWriteTimeUtc.AddSeconds(10)
+    Reset-Stale
+    $r = Run-Read '65537' 900
+    Check 'newer source blocks stale image' ($r.code -eq 4 -and $r.text -match 'selected image is stale') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
+    Check 'stale image clears previous CSV' (-not (Test-Path (Join-Path $data 'data.csv'))) 'data.csv survived a stale-image refusal'
+    Remove-Item -LiteralPath $editedSource -Force
 
     # One automatic re-run. Each case drives an external stub process over files in %TEMP%,
     # and on this machine such a request is occasionally lost to process-startup jitter

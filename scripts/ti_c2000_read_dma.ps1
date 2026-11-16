@@ -4,11 +4,9 @@ ti_c2000_read_dma.ps1 -- read a firmware-frozen RAM buffer. Two read modes, one
 execution mode (ti_c2000_service.ps1 loads once and keeps running).
 
   -Mode ReadOnly (default) : never downloads. Attaches to the live session after
-        four proofs (probe enumerated, session alive, sha256(out) == state.outSha256,
-        entry symbol below 0x080000 = RAM not Flash), waits for the freeze and copies
-        one frozen window. Unprovable RAM is a refusal, not a pass; -NoProbeCheck and
-        -AllowUnverified are the explicit ways around each proof.
-  -Mode LoadRead           : downloads once, runs, waits, copies, exits. Requires
+        probe, session/target, image/map hashes and firmware RAM proof, then waits
+        for the freeze and copies one frozen window. Unprovable RAM is a refusal.
+  -Mode LoadRead           : downloads once, runs, waits, copies, retains session. Requires
         -ConfirmLoad; -MaxLoads N repeats the cycle until -Expect passes.
   -Standalone              : legacy alias of -Mode LoadRead.
 
@@ -51,16 +49,13 @@ param(
     [switch]$DmaReady,
     [string[]]$Variables = @(),
     [string]$HeartbeatExpr = 'gMsTick,gRunMs,usMainLoop',
-    [string]$OutRoot = '',
-    [string]$OutputPath = '',
     [int]$WaitMs = 10000,
     [Nullable[double]]$ValueMin = $null,
     [Nullable[double]]$ValueMax = $null,
     [string]$Ccxml = '',
     [string]$OutFile = '',
     [string]$CcsRoot = '',
-    [string]$CorePattern = '.*C28xx(?:_CPU1)?$',
-    [int]$TimeoutSec = 600,
+    [string]$CorePattern = '',
     [switch]$Build,
     [switch]$Quiet,
     # ReadOnly: attach to the live session, never download. LoadRead: download once.
@@ -78,9 +73,6 @@ param(
     [switch]$NoProbeCheck,
     # ReadOnly: copy even when the entry symbol cannot be read, i.e. RAM is unproven
     [switch]$AllowUnverified,
-    # Flash debugging is legitimate, so the default only REPORTS where the core runs;
-    # -RequireRam turns "running in Flash" into a refusal
-    [switch]$RequireRam,
     [string]$MapFile = ''
 )
 
@@ -96,6 +88,13 @@ function Complete-Run { Out2 'RESULT: OK'; exit 0 }
 # there is exactly one state, then let the interlock validate the combination.
 if ($Standalone) { $Mode = 'LoadRead' }
 $spec = Resolve-ReadModeSpec -Mode $Mode -ConfirmLoad:$ConfirmLoad -Build:$Build -Expect $Expect -MaxLoads $MaxLoads -NoProbeCheck:$NoProbeCheck -AllowUnverified:$AllowUnverified
+try { if ($CorePattern) { [void][regex]::new($CorePattern) } }
+catch { Out2 'FAILURE: INVALID_CORE_PATTERN'; Out2 'RESULT: FAIL'; exit 2 }
+if ($spec.mode -eq 'ReadOnly' -and ($NoProbeCheck -or $AllowUnverified)) {
+    Out2 'FAILURE: READ_PROOF_BYPASS'; Out2 'RESULT: FAIL'
+    Out2 'REASON: ReadOnly requires the probe and RAM image proofs; bypass switches are disabled'
+    exit 2
+}
 
 if (-not ($FrozenBufferReady -or $DmaReady)) {
     Out2 'FAILURE: BUFFER_NOT_CONFIRMED'
@@ -127,7 +126,7 @@ $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
 
 # stamp the run with this skill's identity (a read cannot damage anything, so a
 # leftover copy is only reported); see ti_c2000_readmode.ps1 Initialize-SkillRun
-Initialize-SkillRun -ProjectPath $ProjectPath -Script 'ti_c2000_read_dma.ps1' -Mode $spec.mode -Quiet:$Quiet
+Initialize-SkillRun -ProjectPath $ProjectPath -Script 'ti_c2000_read_dma.ps1' -Mode $spec.mode -Block -Quiet:$Quiet
 
 # a continuous run owns the target while it lasts (see ti_c2000_readmode.ps1)
 Assert-RunModeInterlock -ProjectPath $ProjectPath -ReadMode $spec.mode
@@ -167,6 +166,9 @@ if ($spec.maxLoads -gt 1 -and -not $env:TI_C2000_LOADREAD_CHILD) {
     Out2 'HINT    : attempts are kept under readout\loadread - decide whether the firmware or the expectation is wrong'
     exit 1
 }
+if ($spec.mode -eq 'LoadRead') {
+    Invoke-RetainedLoadRead -ScriptPath $PSCommandPath -Bound $PSBoundParameters -ProjectPath $ProjectPath -Quiet:$Quiet
+}
 
 # ---------- ReadOnly: attach to the one live session, never load -----------------
 # A reconnecting reader would reset the target and reload the program, so the
@@ -181,6 +183,10 @@ if ($spec.mode -eq 'ReadOnly') {
         Out2 'HINT    : a frozen buffer only exists in the running session; ask the user, then use -Mode LoadRead -ConfirmLoad'
         Out2 ('          (that would be download #' + ([int]$cnt.count + 1) + ' for this project)')
         exit 4
+    }
+    if (-not $s.state.core -or ($CorePattern -and [string]$s.state.core -notmatch $CorePattern)) {
+        Out2 'FAILURE: CORE_UNVERIFIED'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: retained session core {0} does not match the requested core pattern {1}' -f $s.state.core,$CorePattern); exit 4
     }
     # same rule as the polled reader: an unplugged probe leaves a live pid behind,
     # so the enumeration is part of "can this session answer at all"
@@ -200,631 +206,64 @@ if ($spec.mode -eq 'ReadOnly') {
     $lk = Enter-TargetLock -ProjectPath $ProjectPath -Mode 'ReadOnly'
     if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 5 }
     try {
+        Initialize-ReadFailureVerdict -ProjectPath $ProjectPath
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
         Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
+        $fresh = Get-SelectedOutFreshEvidence -ProjectPath $ProjectPath -OutFile $OutFile
+        if (-not $fresh.ok) {
+            Out2 'FAILURE: STALE_ARTEFACT'; Out2 'RESULT: FAIL'
+            Out2 ('REASON: {0}: {1}' -f $fresh.reason,$fresh.file); exit 4
+        }
         # Report where the core runs; refuse only when the caller demands RAM.
         # A frozen buffer read in Flash is a legitimate mode, but it must be labelled.
-        $loc = Get-RunLocation -ProjectPath $ProjectPath -OutFile $OutFile -MapFile $MapFile
+        $loc = Get-RamProofEvidence -ProjectPath $ProjectPath -OutFile $OutFile -MapFile $MapFile -SessionState $s.state
         if ($loc.code -eq 'TARGET_NOT_CONNECTED') {
             Out2 'FAILURE: TARGET_NOT_CONNECTED'; Out2 'RESULT: FAIL'
-            Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a register read - the JTAG link is gone'
+            Out2 'REASON: the session process is alive and the probe is enumerated, but the target does not answer a symbol-address request - the JTAG link is gone'
             Out2 'HINT    : run -Stop then -Start -ConfirmLoad; a live session cannot reconnect to a board that disappeared and came back'
             Out2 'HINT    : this is an environment fault, so -AllowUnverified does not apply'
             exit 4
         }
-        if ($loc.code -eq 'LOCATION_UNKNOWN') {
-            Info2 ('JUDGE   : location unknown - ' + $loc.text)
-            Info2 'JUDGE   : build the project once so a .map exists, or pass -MapFile, to get RAM/Flash reporting'
-        } else {
-            Info2 ('RUNNING : {0}   (PC = {1}, region {2})' -f $loc.kind, $loc.pc, $loc.region)
-            if ($loc.kind -eq 'FLASH') {
-                Out2 'WARN    : the core is executing from FLASH, not from the image this session loaded into RAM'
-                Out2 'WARN    : if you did not flash this build yourself, this buffer belongs to whatever firmware was last flashed'
-                Out2 'HINT    : pass -RequireRam to refuse this, or -ExpectFwId so the firmware confirms its own build'
-            } elseif ($loc.kind -eq 'OTHER') {
-                Out2 'WARN    : the program counter is outside RAM and Flash - the core may have run away'
-            }
-            if ($RequireRam -and $loc.kind -ne 'RAM') {
-                Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
-                Out2 ('REASON: -RequireRam was given, but the core is executing from {0} ({1})' -f $loc.kind, $loc.region)
-                Out2 'HINT    : start the session again with -Start -ConfirmLoad to run the RAM image, or drop -RequireRam'
-                exit 4
-            }
+        Info2 ('RUNNING : {0}   ({1})' -f $loc.kind,$loc.text)
+        if (-not $loc.ok) {
+            Out2 'FAILURE: NOT_RAM_IMAGE'; Out2 'RESULT: FAIL'
+            Out2 ('REASON: RAM execution proof failed: {0} ({1})' -f $loc.code,$loc.text)
+            exit 4
         }
+        $idName = [string](Get-FwContract).identity.var
+        $idLines = Get-SessionExpressions -ProjectPath $ProjectPath -Exprs @($idName)
+        $idNow = ''
+        foreach ($line in $idLines) {
+            $m = [regex]::Match([string]$line,('^V\s+' + [regex]::Escape($idName) + '\s+(\S+)\s*$'))
+            if ($m.Success) { $idNow = $m.Groups[1].Value; break }
+        }
+        if (-not $idNow -or -not $s.state.fwId -or $idNow -ne [string]$s.state.fwId) {
+            Out2 'FAILURE: FW_ID_UNREADABLE'; Out2 'RESULT: FAIL'
+            Out2 ('REASON: firmware identity is missing or differs from the load record ({0} vs {1})' -f $idNow,$s.state.fwId)
+            exit 4
+        }
+        $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates @((Get-FwContract).heartbeat.candidates)
+        if (-not $alive.ok) {
+            Out2 'FAILURE: HEARTBEAT_FAIL'; Out2 'RESULT: FAIL'
+            Out2 ('REASON: ' + $alive.reason); exit 4
+        }
+        $cnt = Get-LoadCount -ProjectPath $ProjectPath
+        Out2 ('FRESH   : project inputs are no newer than selected .out ({0})' -f $fresh.file)
+        Out2 ('PREFLIGHT: probe online; core {0}; session pid {1}; RAM image {2}; SHA256 {3}; firmware {4}={5}; heartbeat {6} advanced; loads #{7}; reading' -f `
+            $s.state.core,$s.state.pid,$loc.region,$curSha.Substring(0,16),$idName,$idNow,$alive.name,$cnt.count)
         $largs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'ti_c2000_live_read.ps1'),
             '-ProjectPath', $ProjectPath, '-ArrayName', $ArrayName,
             '-Rows', [string]$Rows, '-Columns', [string]$Columns,
             '-FrozenFlag', $FrozenFlag, '-FrozenValue', $FrozenValue, '-SeqVar', $SeqVar,
-            '-HeartbeatExpr', $HeartbeatExpr)
-        if ($ValueMin -ne $null) { $largs += @('-ValueMin', [string][int]$ValueMin) }
-        if ($ValueMax -ne $null) { $largs += @('-ValueMax', [string][int]$ValueMax) }
+            '-HeartbeatExpr', $HeartbeatExpr, '-ParentPid', [string]$PID,
+            '-WaitMs', [string]$WaitMs)
+        if ($null -ne $ValueMin) { $largs += @('-ValueMin',([double]$ValueMin).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
+        if ($null -ne $ValueMax) { $largs += @('-ValueMax',([double]$ValueMax).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
         if ($Quiet) { $largs += '-Quiet' }
+        $largs += @('-ExpectFwId',[string]$idNow,'-FwIdVar',$idName)
         & $pwshExe @largs
         exit $LASTEXITCODE
     } finally {
         Exit-TargetLock -ProjectPath $ProjectPath
     }
-}
-
-# ---------- LoadRead: this path DOES load (confirmed by the caller) --------------
-# A live session owns the probe: stop it so only one image can exist at a time.
-$liveNow = Get-LiveSessionInfo -ProjectPath $ProjectPath
-if ($liveNow.alive) {
-    Info2 'STEP    : stop the live session first (a download needs the probe)'
-    $stopArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'ti_c2000_service.ps1'),
-        '-ProjectPath', $ProjectPath, '-Stop', '-Quiet')
-    $stopOut = & $pwshExe @stopArgs 2>&1
-    foreach ($line in $stopOut) { if ([string]$line -match '^FAILURE:') { Out2 ([string]$line) } }
-}
-$lk = Enter-TargetLock -ProjectPath $ProjectPath -Mode 'LoadRead'
-if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 5 }
-# everything below owns the target; the finally at the end releases the lock
-try {
-
-$probeArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $debugScript, '-ProjectPath', $ProjectPath, '-ProbeCheckOnly')
-if ($CcsRoot) { $probeArgs += @('-CcsRoot', $CcsRoot) }
-$probeOut = & $pwshExe @probeArgs 2>&1
-$probeCode = $LASTEXITCODE
-$probeText = (@($probeOut | ForEach-Object { [string]$_ }) -join "`n")
-if ($probeCode -ne 0 -or $probeText -notmatch 'RESULT: OK') {
-    foreach ($line in $probeOut) { Out2 ([string]$line) }
-    if ($probeCode -eq 3 -or $probeText -match 'NO_PROBE') { Out2 'FAILURE: NO_PROBE'; Out2 'RESULT: FAIL'; Out2 'REASON: no debug probe detected'; exit 3 }
-    Out2 'FAILURE: PROBE_CHECK_FAILED'; Out2 'RESULT: FAIL'; Out2 'REASON: probe pre-check did not return RESULT: OK'; exit 2
-}
-if ($Build) {
-    $buildScript = Join-Path $skillRoot 'scripts\ti_c2000_build.ps1'
-    $bargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $buildScript, '-ProjectPath', $ProjectPath, '-Stage', '-KeepLaunches')
-    if ($CcsRoot) { $bargs += @('-CcsRoot', $CcsRoot) }
-    Info2 'STEP    : build'
-    $bout = & $pwshExe @bargs 2>&1
-    $bcode = $LASTEXITCODE
-    foreach ($line in $bout) { if (-not $Quiet) { Out2 ([string]$line) } }
-    if ($bcode -ne 0 -or -not @($bout | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
-        $bfail = @($bout | Where-Object { $_ -match '^FAILURE: ' }) | Select-Object -First 1
-        if (-not $bfail) { $bfail = 'FAILURE: BUILD_FAILED' }
-        Out2 $bfail; Out2 'RESULT: FAIL'; Out2 'REASON: build failed - DMA read aborted'; exit 1
-    }
-}
-if (-not (Test-Path -LiteralPath $OutFile)) { Out2 'FAILURE: NO_OUT_FILE'; Out2 'RESULT: FAIL'; Out2 "REASON: '$OutFile' not found - add -Build or build/stage first"; exit 2 }
-$outShaBefore = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
-# Create the readout only after preflight, build and .out resolution succeed.
-# One fixed folder; each read refreshes check/ and data/ in place.
-if (-not $OutRoot) { $OutRoot = $ProjectPath }
-$runDir = Join-Path $OutRoot 'readout'
-$dataDir = Join-Path $runDir 'data'
-$checkDir = Join-Path $runDir 'check'
-New-Item -ItemType Directory -Force -Path $dataDir, $checkDir | Out-Null
-$extraOutputPath = $OutputPath
-$OutputPath = Join-Path $dataDir 'array.csv'
-if ($extraOutputPath -and (Test-Path -LiteralPath $extraOutputPath)) {
-    Out2 'FAILURE: OUTPUT_EXISTS'; Out2 'RESULT: FAIL'
-    Out2 "REASON: refusing to overwrite '$extraOutputPath' before loading the target"; exit 2
-}
-$extraOutputParent = if ($extraOutputPath) { Split-Path -Path $extraOutputPath -Parent } else { '' }
-if ($extraOutputPath -and -not $extraOutputParent) { $extraOutputParent = (Get-Location).Path }
-if ($extraOutputPath -and -not (Test-Path -LiteralPath $extraOutputParent -PathType Container)) {
-    Out2 'FAILURE: NO_OUTPUT_DIR'; Out2 'RESULT: FAIL'
-    Out2 "REASON: parent of '$extraOutputPath' does not exist"; exit 2
-}
-
-# ---------------------------------------------------------------------------
-# failed-read publisher, defined before the first possible read failure so a
-# failed DMA read never leaves the previous run's "result: OK" verdict and its
-# array.csv behind. Only the last RESULT line of this run decides usability.
-# ---------------------------------------------------------------------------
-$utf8Bom = New-Object System.Text.UTF8Encoding($true)
-$verdictPath = Join-Path $checkDir 'verdict.txt'
-function Fail-Readout([string]$code, [string]$reason) {
-    foreach ($f in @($OutputPath, (Join-Path $dataDir 'variables.csv'), (Join-Path $checkDir 'variables.csv'))) {
-        Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
-    }
-    $lines = @(
-        'TI C2000 frozen-buffer readout',
-        ('created   : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
-        ('project   : ' + $ProjectPath),
-        ('ccxml     : ' + $Ccxml),
-        ('out       : ' + $OutFile),
-        ('out sha256: ' + $outShaBefore),
-        'mode      : single session, firmware-frozen RAM buffer',
-        ('array     : {0} ({1} x {2})' -f $ArrayName, $Rows, $Columns),
-        ('data csv  : ' + $OutputPath),
-        'checker   : SKIPPED',
-        'result    : FAIL',
-        ('failure   : ' + $code),
-        ('reason    : ' + $reason)
-    )
-    try { [IO.File]::WriteAllLines($verdictPath, $lines, $utf8Bom) } catch { }
-}
-$ccsPath = ''
-if ($probeText -match '(?m)^CCS\s*:\s*(.+?)\s+\(v') { $ccsPath = $Matches[1].Trim() }
-if (-not $ccsPath -and $CcsRoot -and (Test-Path (Join-Path $CcsRoot 'ccs_base'))) { $ccsPath = (Get-Item -LiteralPath $CcsRoot).FullName }
-if (-not $ccsPath) { Out2 'FAILURE: ENV_NO_CCS'; Out2 'RESULT: FAIL'; Out2 'REASON: cannot resolve CCS; pass -CcsRoot'; exit 2 }
-$dss = Join-Path $ccsPath 'ccs_base\scripting\bin\dss.bat'
-if (-not (Test-Path -LiteralPath $dss)) { Out2 'FAILURE: ENV_NO_DSS'; Out2 'RESULT: FAIL'; Out2 "REASON: dss.bat not found under '$ccsPath'"; exit 2 }
-
-Info2 "PROJECT : $ProjectPath"
-Info2 "CCS     : $ccsPath"
-Info2 "CCXML   : $Ccxml"
-Info2 "OUT     : $OutFile"
-Info2 "ARRAY   : $ArrayName ($Rows x $Columns = $total)"
-Info2 "OUTPUT  : $OutputPath"
-
-function Escape-Js([string]$v) { return $v.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n') }
-$extraJs = ($extraNames | ForEach-Object { '"' + (Escape-Js $_) + '"' }) -join ','
-$jsPath = Join-Path $env:TEMP ('ti_c2000_dma_{0}.js' -f (Get-Random))
-$js = @"
-importPackage(Packages.com.ti.debug.engine.scripting);
-importPackage(Packages.com.ti.ccstudio.scripting.environment);
-importPackage(Packages.java.lang);
-
-var CCXML  = "$(Escape-Js $Ccxml)";
-var OUT    = "$(Escape-Js $OutFile)";
-var ARRAY  = "$(Escape-Js $ArrayName)";
-var ROWS   = $Rows;
-var COLS   = $Columns;
-var FROZEN = "$(Escape-Js $FrozenFlag)";
-var FROZEN_EXPECTED = "$(Escape-Js $FrozenValue)";
-var SEQ    = "$(Escape-Js $SeqVar)";
-var WAIT   = $WaitMs;
-var CORE   = "$(Escape-Js $CorePattern)";
-var HB_CANDS = "$(Escape-Js $HeartbeatExpr)".split(",");
-var EXTRAS = [$extraJs];
-
-function sleepMs(ms) { java.lang.Thread.sleep(ms); }
-function flagMatches(value) {
-    var actual = ("" + value).toLowerCase();
-    if (actual === FROZEN_EXPECTED.toLowerCase()) { return true; }
-    var a = Number(actual), expected = Number(FROZEN_EXPECTED);
-    return !isNaN(a) && !isNaN(expected) && a === expected;
-}
-
-var env = ScriptingEnvironment.instance();
-try { env.setScriptTimeout($($TimeoutSec * 1000)); } catch (e) {}
-var server = env.getServer("DebugServer.1");
-server.setConfig(CCXML);
-var session = server.openSession(CORE);
-session.options.setBoolean("AllowInterruptsWhenHalted", true);
-session.options.setBoolean("PoliteRealtimeMode", true);
-
-//__BOOT__
-// connect / reset / load / run come from ti_c2000_dss_boot.js, shared by all three
-// entry points (this file used to carry its own copy, which drifted).
-if (!dssConnectVerified(session, print)) {
-    print("FAILURE: CONNECT_FAILED"); print("REASON: target.connect did not produce a usable link after 5 attempts"); print("RESULT: FAIL"); throw "connect failed";
-}
-if (!dssResetVerified(session, print)) {
-    print("FAILURE: RESET_FAILED"); print("REASON: the target refused reset - see HINT in the parent process"); print("RESULT: FAIL"); throw "reset failed";
-}
-if (!dssLoadWithRetry(session, OUT, print)) {
-    print("FAILURE: LOAD_FAILED"); print("REASON: memory.loadProgram failed after 3 attempts"); print("RESULT: FAIL"); throw "load failed";
-}
-// 300 ms is the settle time the shared helper needs; this template has no -WarmupMs
-// parameter, and referring to one that does not exist threw a Rhino ReferenceError
-// before a single byte was read (found 2026-11-15 by reviewing every call site).
-if (!dssRunVerified(session, print, 300)) {
-    print("FAILURE: TARGET_HALTED_AFTER_RUN"); print("RESULT: FAIL"); throw "target halted after run";
-}
-print("DSS: running");
-var hbNames = [];
-var hbBefore = {};
-for (var h = 0; h < HB_CANDS.length; h++) {
-    var hbName = HB_CANDS[h].replace(/^\s+|\s+$/g, "");
-    if (hbName.length === 0) { continue; }
-    try {
-        hbBefore[hbName] = Number(session.expression.evaluate(hbName));
-        if (isFinite(hbBefore[hbName])) { hbNames.push(hbName); }
-    } catch (eH) { }
-}
-if (hbNames.length === 0) { print("FAILURE: NO_HEARTBEAT"); print("RESULT: FAIL"); throw "no application heartbeat"; }
-
-/* wait for the firmware to freeze the capture */
-var frozen = false;
-var waited = 0;
-var lastFlag = "";
-while (waited < WAIT) {
-    if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_DURING_READ"); print("RESULT: FAIL"); throw "target halted while waiting for buffer"; }
-    try {
-        lastFlag = "" + session.expression.evaluate(FROZEN);
-        if (flagMatches(lastFlag)) { frozen = true; break; }
-    } catch (eF) {
-        print("FAILURE: NO_FROZEN_FLAG");
-        print("REASON: cannot read '" + FROZEN + "': " + eF);
-        print("RESULT: FAIL");
-        throw "frozen flag unreadable";
-    }
-    sleepMs(100); waited += 100;
-}
-if (!frozen) {
-    print("FAILURE: BUF_NOT_READY");
-    print("REASON: '" + FROZEN + "' did not reach " + FROZEN_EXPECTED + " within " + WAIT + " ms; last=" + lastFlag);
-    print("RESULT: FAIL");
-    throw "buffer not ready";
-}
-print("DSS: frozen after " + waited + " ms, " + FROZEN + " = " + lastFlag);
-for (var ex = 0; ex < EXTRAS.length; ex++) {
-    try { print("EXTRA " + EXTRAS[ex] + " before = " + session.expression.evaluate(EXTRAS[ex])); }
-    catch (eX) { print("FAILURE: EXTRA_READ_FAILED"); print("REASON: " + EXTRAS[ex] + ": " + eX); print("RESULT: FAIL"); throw "extra read failed"; }
-}
-
-var seqBefore = "";
-if (SEQ.length > 0) {
-    try { seqBefore = "" + session.expression.evaluate(SEQ); }
-    catch (eS) { print("FAILURE: NO_SEQ"); print("REASON: cannot read '" + SEQ + "': " + eS); print("RESULT: FAIL"); throw "seq unreadable"; }
-    print("DSS: seq before = " + seqBefore);
-}
-
-var base = null;
-try { base = Number(session.symbol.getAddress(ARRAY)); } catch (eB) { base = null; }
-if (base === null || base === undefined || isNaN(base)) {
-    print("FAILURE: NO_ARRAY");
-    print("REASON: cannot resolve address of '" + ARRAY + "'");
-    print("RESULT: FAIL");
-    throw "array address unresolved";
-}
-print("DSS: array base = " + base);
-
-var total = ROWS * COLS;
-var anchorIndex = [0, total - 1];
-if (ROWS > 1) { anchorIndex.push(COLS); }
-var anchorValues = {};
-for (var offset = 0; offset < total; offset += 2000) {
-    if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_DURING_READ"); print("RESULT: FAIL"); throw "target halted during read"; }
-    var count = Math.min(2000, total - offset);
-    var vals = null;
-    try { vals = session.memory.readData(1, base + offset, 16, count); }
-    catch (eR) { print("FAILURE: READDATA_ERROR"); print("REASON: " + eR); print("RESULT: FAIL"); throw "readData failed"; }
-    if (vals === null || vals === undefined || vals.length !== count) {
-        print("FAILURE: COUNT_MISMATCH");
-        print("REASON: readData returned " + (vals ? vals.length : 0) + ", expected " + count);
-        print("RESULT: FAIL");
-        throw "count mismatch";
-    }
-    for (var j = 0; j < count; j++) {
-        var linear = offset + j;
-        var row = Math.floor(linear / COLS);
-        var column = linear % COLS;
-        var name = ROWS === 1 ? ARRAY + "[" + column + "]" : ARRAY + "[" + row + "][" + column + "]";
-        print("VAR " + name + " = " + vals[j]);
-        for (var ai = 0; ai < anchorIndex.length; ai++) {
-            if (linear === anchorIndex[ai]) { anchorValues[linear] = Number(vals[j]); }
-        }
-    }
-    print("BATCH: " + (Math.floor(offset / 2000) + 1) + " values=" + count + " endIndex=" + (offset + count - 1));
-    if (session.target.isHalted()) { print("FAILURE: TARGET_HALTED_DURING_READ"); print("RESULT: FAIL"); throw "target halted during read"; }
-}
-for (var a = 0; a < anchorIndex.length; a++) {
-    var ix = anchorIndex[a];
-    var ar = Math.floor(ix / COLS), ac = ix % COLS;
-    var expr = ROWS === 1 ? ARRAY + "[" + ac + "]" : ARRAY + "[" + ar + "][" + ac + "]";
-    var expressionValue = Number(session.expression.evaluate(expr));
-    if (isNaN(expressionValue) || isNaN(anchorValues[ix]) ||
-        (expressionValue & 0xFFFF) !== (anchorValues[ix] & 0xFFFF)) {
-        print("FAILURE: ARRAY_LAYOUT_MISMATCH");
-        print("REASON: " + expr + " evaluate=" + expressionValue + " readData=" + anchorValues[ix]);
-        print("RESULT: FAIL");
-        throw "array layout or data format mismatch";
-    }
-}
-print("DSS: readData anchors matched expressions");
-
-var finalFlag = "";
-try { finalFlag = "" + session.expression.evaluate(FROZEN); }
-catch (eF2) { print("FAILURE: NO_FROZEN_FLAG"); print("REASON: post-read flag: " + eF2); print("RESULT: FAIL"); throw "frozen flag unreadable after read"; }
-print("DSS: frozen after read = " + finalFlag);
-if (!flagMatches(finalFlag)) {
-    print("FAILURE: BUF_CHANGED"); print("REASON: frozen flag changed during read (" + lastFlag + " -> " + finalFlag + ")");
-    print("RESULT: FAIL"); throw "buffer no longer frozen";
-}
-
-if (SEQ.length > 0) {
-    var seqAfter = "";
-    try { seqAfter = "" + session.expression.evaluate(SEQ); }
-    catch (eS2) { print("FAILURE: NO_SEQ"); print("REASON: " + eS2); print("RESULT: FAIL"); throw "seq unreadable"; }
-    print("DSS: seq after = " + seqAfter);
-    if (seqAfter !== seqBefore) {
-        print("FAILURE: BUF_CHANGED");
-        print("REASON: '" + SEQ + "' changed while reading (" + seqBefore + " -> " + seqAfter + ")");
-        print("RESULT: FAIL");
-        throw "buffer changed";
-    }
-}
-
-for (var ex2 = 0; ex2 < EXTRAS.length; ex2++) {
-    try { print("EXTRA " + EXTRAS[ex2] + " after = " + session.expression.evaluate(EXTRAS[ex2])); }
-    catch (eX2) { print("FAILURE: EXTRA_READ_FAILED"); print("REASON: " + EXTRAS[ex2] + ": " + eX2); print("RESULT: FAIL"); throw "extra read failed"; }
-}
-for (var h2 = 0; h2 < hbNames.length; h2++) {
-    var hName = hbNames[h2];
-    var hAfter = Number(session.expression.evaluate(hName));
-    print("HB " + hName + " before = " + hbBefore[hName]);
-    print("HB " + hName + " after = " + hAfter);
-    if (!isFinite(hAfter) || hAfter <= hbBefore[hName]) {
-        print("FAILURE: HEARTBEAT_NOT_ADVANCING"); print("RESULT: FAIL"); throw "application heartbeat did not advance";
-    }
-}
-// Halt first: disconnect() has to strip the breakpoint opcodes DSS patched into program
-// memory, and it fails while the core is free-running - the next load then dies with
-// "Failed to remove the debug state from the target before disconnecting" (measured
-// 2026-11-15 on the service path; a one-shot reader leaves the same debris behind).
-// halt -> settle -> disconnect -> terminate, shared with the other two entry points
-dssShutdown(session, print);
-print("RESULT: OK");
-"@
-$bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))
-if ($js.Contains('//__BOOT__')) { $js = $js.Replace('//__BOOT__', $bootJs) }
-else { Write-Output 'FAILURE: DSS_BOOT_MISSING'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: the DSS template has no //__BOOT__ placeholder, so connect/reset/load would run unshared code'; exit 2 }
-[IO.File]::WriteAllText($jsPath, $js, [Text.Encoding]::ASCII)
-Info2 "JS      : $jsPath"
-
-$dout = & cmd.exe /d /c $dss $jsPath 2>&1
-$dcode = $LASTEXITCODE
-# FAILURE lines are published once below (with a REASON); echoing them here as
-# well made one failure look like two separate failures.
-foreach ($line in $dout) { if ($line -match '^(DSS:|VAR |EXTRA |BATCH:|CONNECT_RETRY)') { Out2 ([string]$line) } }
-Remove-Item -LiteralPath $jsPath -Force -ErrorAction SilentlyContinue
-
-$text = (@($dout | ForEach-Object { [string]$_ }) -join "`n")
-$hbBefore = [ordered]@{}
-$hbAfter = [ordered]@{}
-$extraBefore = [ordered]@{}
-$extraAfter = [ordered]@{}
-foreach ($line in $dout) {
-    if ([string]$line -match '^HB\s+(\S+)\s+(before|after)\s+=\s+(.+)$') {
-        if ($Matches[2] -eq 'before') { $hbBefore[$Matches[1]] = $Matches[3] }
-        else { $hbAfter[$Matches[1]] = $Matches[3] }
-    }
-    if ([string]$line -match '^EXTRA\s+(\S+)\s+(before|after)\s+=\s+(.+)$') {
-        if ($Matches[2] -eq 'before') { $extraBefore[$Matches[1]] = $Matches[3] }
-        else { $extraAfter[$Matches[1]] = $Matches[3] }
-    }
-}
-$varLines = @($dout | Where-Object { $_ -match '^VAR .+ = ' -and $_ -notmatch '<ERROR' })
-if ($dcode -ne 0 -or $text -notmatch 'RESULT: OK' -or $varLines.Count -ne $total -or
-    $text -notmatch 'DSS: frozen after read = ' -or
-    $hbBefore.Count -eq 0 -or $hbAfter.Count -ne $hbBefore.Count -or
-    $extraBefore.Count -ne $extraNames.Count -or $extraAfter.Count -ne $extraNames.Count) {
-    $failCode = 'DMA_READ_INCOMPLETE'; $failReason = ("values={0}/{1}" -f $varLines.Count, $total)
-    # The DSS script names its own failure; keep that identity instead of
-    # guessing from keywords (NO_FROZEN_FLAG, TARGET_HALTED_*, ... all count).
-    $jsFail = @($dout | Where-Object { [string]$_ -match '^FAILURE: [A-Z0-9_]+' }) | Select-Object -First 1
-    if ($jsFail -and ([string]$jsFail -match '^FAILURE: ([A-Z0-9_]+)')) {
-        $failCode = $Matches[1]
-        $jsReason = @($dout | Where-Object { [string]$_ -match '^REASON: ' }) | Select-Object -First 1
-        if ($jsReason -and ([string]$jsReason -match '^REASON: (.+)$')) { $failReason = $Matches[1] }
-        else { $failReason = 'see the DSS failure above' }
-    }
-    elseif ($text -match 'BUF_NOT_READY') { $failCode = 'BUF_NOT_READY'; $failReason = 'frozen flag never asserted' }
-    elseif ($text -match 'BUF_CHANGED') { $failCode = 'BUF_CHANGED'; $failReason = 'sequence changed during the read' }
-    elseif ($text -match 'NO_SEQ') { $failCode = 'NO_SEQ'; $failReason = 'sequence counter unreadable' }
-    elseif ($text -match 'COUNT_MISMATCH') { $failCode = 'COUNT_MISMATCH'; $failReason = 'readData returned the wrong count' }
-    elseif ($text -match 'NO_ARRAY') { $failCode = 'NO_ARRAY'; $failReason = 'array symbol not found' }
-    elseif ($text -match 'ARRAY_LAYOUT_MISMATCH') { $failCode = 'ARRAY_LAYOUT_MISMATCH'; $failReason = 'readData disagreed with expression anchors' }
-    elseif ($text -match 'CONNECT_FAILED') { $failCode = 'CONNECT_FAILED'; $failReason = 'could not take over the target' }
-    elseif ($text -match 'LOAD_FAILED') { $failCode = 'LOAD_FAILED'; $failReason = 'memory.loadProgram failed' }
-    elseif ($text -match 'EXTRA_READ_FAILED' -or $extraBefore.Count -ne $extraNames.Count -or $extraAfter.Count -ne $extraNames.Count) { $failCode = 'EXTRA_READ_FAILED'; $failReason = 'requested scalar read was incomplete' }
-    elseif ($text -match 'HEARTBEAT_NOT_ADVANCING') { $failCode = 'HEARTBEAT_NOT_ADVANCING'; $failReason = 'application counter did not advance during buffer read' }
-    elseif ($hbBefore.Count -eq 0 -or $hbAfter.Count -ne $hbBefore.Count) { $failCode = 'NO_LIVENESS_EVIDENCE'; $failReason = 'heartbeat pair missing' }
-    Fail-Readout $failCode $failReason
-    Out2 ('FAILURE: ' + $failCode); Out2 ('REASON: ' + $failReason)
-    # the DSS script printed the same FAILURE/REASON pair; echo only the context
-    # lines so one failure is reported once, not twice
-    $dupPattern = '^(RESULT|REASON):|^(DSS:|VAR |EXTRA |BATCH:|CONNECT_RETRY)'
-    if ($failCode) { $dupPattern += '|^FAILURE: ' + [regex]::Escape([string]$failCode) + '$' }
-    foreach ($line in (@($dout | Where-Object { [string]$_ -notmatch $dupPattern }) | Select-Object -Last 8)) { Out2 ([string]$line) }
-    Out2 'RESULT: FAIL'
-    exit 1
-}
-foreach ($hbName in $hbBefore.Keys) {
-    $before = 0.0; $after = 0.0
-    $numericBefore = [double]::TryParse([string]$hbBefore[$hbName], [Globalization.NumberStyles]::Float,
-        [Globalization.CultureInfo]::InvariantCulture, [ref]$before)
-    $numericAfter = $hbAfter.Contains($hbName) -and
-        [double]::TryParse([string]$hbAfter[$hbName], [Globalization.NumberStyles]::Float,
-            [Globalization.CultureInfo]::InvariantCulture, [ref]$after)
-    if (-not $numericBefore -or -not $numericAfter -or
-        [double]::IsNaN($before) -or [double]::IsInfinity($before) -or
-        [double]::IsNaN($after) -or [double]::IsInfinity($after) -or $after -le $before) {
-        $rr = ("{0}: {1} -> {2} is not a finite increase" -f $hbName, $hbBefore[$hbName], $hbAfter[$hbName])
-        Fail-Readout 'HEARTBEAT_NOT_ADVANCING' $rr
-        Out2 'FAILURE: HEARTBEAT_NOT_ADVANCING'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $rr); exit 1
-    }
-}
-if ((Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash -ne $outShaBefore) {
-    Fail-Readout 'OUT_CHANGED_DURING_READ' 'the .out file changed between load and result packaging'
-    Out2 'FAILURE: OUT_CHANGED_DURING_READ'; Out2 'RESULT: FAIL'
-    Out2 'REASON: the .out file changed between load and result packaging'; exit 1
-}
-
-# ---------- write CSV ----------
-$records = New-Object System.Collections.ArrayList
-foreach ($line in $varLines) {
-    if ([string]$line -match '^VAR\s+(.+?)\s+=\s+(.+)$') {
-        $index = $records.Count
-        $row = [int][Math]::Floor($index / $Columns)
-        $column = [int]($index % $Columns)
-        $expected = if ($Rows -eq 1) { '{0}[{1}]' -f $ArrayName, $column }
-                    else { '{0}[{1}][{2}]' -f $ArrayName, $row, $column }
-        if ($Matches[1] -cne $expected) {
-            $rr = ("index {0} expected {1}, got {2}" -f $index, $expected, $Matches[1])
-            Fail-Readout 'ARRAY_ORDER_MISMATCH' $rr
-            Out2 'FAILURE: ARRAY_ORDER_MISMATCH'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $rr); exit 1
-        }
-        [void]$records.Add([pscustomobject]@{ expression = $Matches[1]; value = $Matches[2] })
-    }
-}
-if ($records.Count -ne $total) {
-    $rr = ("parsed {0}/{1}" -f $records.Count, $total)
-    Fail-Readout 'PARSE_FAILED' $rr
-    Out2 'FAILURE: PARSE_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $rr); exit 1
-}
-foreach ($record in $records) {
-    $numericValue = 0.0
-    if (-not [double]::TryParse([string]$record.value, [ref]$numericValue) -or
-        [double]::IsNaN($numericValue) -or [double]::IsInfinity($numericValue)) {
-        $rr = ("{0} = {1}" -f $record.expression, $record.value)
-        Fail-Readout 'VALUE_NOT_NUMERIC' $rr
-        Out2 'FAILURE: VALUE_NOT_NUMERIC'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $rr); exit 1
-    }
-}
-$records | Export-Csv -LiteralPath $OutputPath -NoTypeInformation -Encoding UTF8
-$extraCsv = Join-Path $dataDir 'variables.csv'
-if ($extraNames.Count -gt 0) {
-    @($extraNames | ForEach-Object {
-        [pscustomobject]@{ expression = $_; before = $extraBefore[$_]; after = $extraAfter[$_] }
-    }) | Export-Csv -LiteralPath $extraCsv -NoTypeInformation -Encoding UTF8
-}
-
-$utf8Bom = New-Object System.Text.UTF8Encoding($true)
-$dataReadme = @(
-    '本文件夹存放实际读到的数据。',
-    '  array.csv      长表：expression(元素表达式，如 gAdcBuf[0]), value(数值)',
-    '  variables.csv  可选：同一 DSS 会话在数组搬运前后读取的标量'
-)
-[IO.File]::WriteAllLines((Join-Path $dataDir 'README.txt'), $dataReadme, $utf8Bom)
-
-# ---------- verdict: count + range (level 3/4 of data-read-verdict.md) ----------
-$rangeOk = $true
-$minSeen = $null; $maxSeen = $null
-if ($null -ne $ValueMin -or $null -ne $ValueMax) {
-    foreach ($r in $records) {
-        $d = 0.0
-        if ([double]::TryParse([string]$r.value, [ref]$d)) {
-            if ($null -eq $minSeen -or $d -lt $minSeen) { $minSeen = $d }
-            if ($null -eq $maxSeen -or $d -gt $maxSeen) { $maxSeen = $d }
-            if (($null -ne $ValueMin -and $d -lt $ValueMin) -or ($null -ne $ValueMax -and $d -gt $ValueMax)) { $rangeOk = $false }
-        }
-    }
-}
-Out2 'CHECK FROZEN: OK'
-if ($SeqVar) { Out2 'CHECK SEQ: OK' } else { Out2 'CHECK SEQ: SKIPPED' }
-Out2 ("CHECK COUNT: OK ({0})" -f $records.Count)
-if ($null -eq $ValueMin -and $null -eq $ValueMax) {
-    Out2 'CHECK RANGE: SKIPPED (no -ValueMin/-ValueMax)'
-} elseif ($rangeOk) {
-    Out2 ("CHECK RANGE: OK ({0} .. {1})" -f $minSeen, $maxSeen)
-} else {
-    Out2 ("CHECK RANGE: FAIL ({0} .. {1}, expected {2} .. {3})" -f $minSeen, $maxSeen, $ValueMin, $ValueMax)
-}
-
-# ---------- check/variables.csv + check/verdict.txt ----------
-$frozenVal = ''; $frozenAfterVal = ''; $seqBefore = ''; $seqAfter = ''
-if ($text -match 'DSS: frozen after [0-9]+ ms, .+ = (.+)') { $frozenVal = $Matches[1].Trim() }
-if ($text -match 'DSS: frozen after read = (.+)') { $frozenAfterVal = $Matches[1].Trim() }
-if ($text -match 'DSS: seq before = (.+)') { $seqBefore = $Matches[1].Trim() }
-if ($text -match 'DSS: seq after = (.+)') { $seqAfter = $Matches[1].Trim() }
-$utf8Bom = New-Object System.Text.UTF8Encoding($true)
-$mapLines = @('role,name,first,last,delta,status')
-$mapLines += ('frozen,{0},{1},{2},,OK' -f $FrozenFlag, $frozenVal, $frozenAfterVal)
-$mapLines += ('sequence,{0},{1},{2},,{3}' -f $SeqVar, $seqBefore, $seqAfter, $(if ($seqBefore) { 'OK' } else { 'SKIPPED' }))
-$mapLines += ('array,{0},,,{1},OK' -f $ArrayName, $records.Count)
-foreach ($hbName in $hbBefore.Keys) {
-    $mapLines += ('heartbeat,{0},{1},{2},{3},OK' -f $hbName, $hbBefore[$hbName], $hbAfter[$hbName], ([double]$hbAfter[$hbName] - [double]$hbBefore[$hbName]))
-}
-foreach ($extraName in $extraNames) {
-    $mapLines += ('scalar,{0},{1},{2},,OK' -f $extraName, $extraBefore[$extraName], $extraAfter[$extraName])
-}
-[IO.File]::WriteAllLines((Join-Path $checkDir 'variables.csv'), $mapLines, $utf8Bom)
-
-$verdict = @(
-    'TI C2000 frozen-buffer readout',
-    ('created   : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
-    ('project   : ' + $ProjectPath),
-    ('ccxml     : ' + $Ccxml),
-    ('out       : ' + $OutFile),
-    ('out sha256: ' + $outShaBefore),
-    ('mode      : single session, firmware-frozen RAM buffer'),
-    ('identity  : SAME_SESSION_LOAD (out hash stable)'),
-    ('array     : {0} ({1} x {2})' -f $ArrayName, $Rows, $Columns),
-    ('frozen    : {0} = {1} -> {2} (expected {3})' -f $FrozenFlag, $frozenVal, $frozenAfterVal, $FrozenValue),
-    ('sequence  : {0}' -f $(if ($seqBefore) { "$seqBefore -> $seqAfter" } else { 'SKIPPED' })),
-    ('values    : {0}' -f $records.Count),
-    ('heartbeat : {0}' -f (@($hbBefore.Keys) -join ', ')),
-    ('scalars   : {0}' -f ($extraNames -join ', ')),
-    ('range     : ' + $(if ($null -eq $ValueMin -and $null -eq $ValueMax) { 'SKIPPED' } elseif ($rangeOk) { 'OK' } else { 'FAIL' })),
-    ('data csv  : ' + $OutputPath)
-)
-[IO.File]::WriteAllLines((Join-Path $checkDir 'verdict.txt'), $verdict, $utf8Bom)
-
-$checkReadme = @(
-    '本文件夹存放校验与判据，用于确认数据可信，不参与数据处理。',
-    '  variables.csv  校验变量映射：role, name, first, last, delta, status；不适用的数值留空',
-    '  verdict.txt    判据结论：固件 SHA256、数组名/尺寸、冻结标志值、序号前后、点数、范围判据'
-)
-[IO.File]::WriteAllLines((Join-Path $checkDir 'README.txt'), $checkReadme, $utf8Bom)
-
-$readme = @(
-    'TI C2000 readout (frozen RAM buffer)',
-    '==================================',
-    '',
-    '本目录由 ti_c2000_read_dma.ps1 自动生成：固件用 ISR 或 DMA 采满并冻结后，DSS 搬运整块缓冲。',
-    '',
-    'check/   校验与判据（辅助确认数据可信，不参与数据处理）',
-    '  variables.csv  校验变量映射：role, name, first, last, delta, status；不适用的数值留空',
-    '  verdict.txt    判据结论：固件 SHA256、数组名/尺寸、冻结标志值、序号前后、点数、范围判据',
-    '',
-    'data/    实际读到的数据',
-    '  array.csv      长表：expression(元素表达式，如 gAdcBuf[0]), value(数值)',
-    '  variables.csv  可选：同一会话的标量前后值'
-)
-[IO.File]::WriteAllLines((Join-Path $runDir 'README.txt'), $readme, $utf8Bom)
-
-$verdictPath = Join-Path $checkDir 'verdict.txt'
-function Publish-Readout([string]$result, [string]$reason, [string]$checker = 'SKIPPED') {
-    try {
-        [IO.File]::WriteAllLines($verdictPath, (@($verdict) + @("checker   : $checker", "result    : $result", "reason    : $reason")), $utf8Bom)
-    } catch {
-        Out2 'FAILURE: READOUT_PUBLISH_FAILED'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: ' + $_.Exception.Message); exit 1
-    }
-}
-
-Out2 ("OUTDIR  : {0}" -f $runDir)
-Out2 ("DATA    : {0}" -f $OutputPath)
-Out2 ("CHECK   : {0}" -f (Join-Path $checkDir 'variables.csv'))
-Out2 ("VERDICT : {0}" -f (Join-Path $checkDir 'verdict.txt'))
-Out2 ("VALUES  : {0}" -f $records.Count)
-
-# ---------- mandatory verdict: no read may return OK without it ----------
-$verdictScript = Join-Path $PSScriptRoot 'ti_c2000_check_read.ps1'
-if (-not (Test-Path -LiteralPath $verdictScript)) {
-    Publish-Readout 'FAIL' 'mandatory verdict script missing' 'MISSING'
-    Out2 'FAILURE: ENV_NO_VERDICT_SCRIPT'; Out2 'RESULT: FAIL'
-    Out2 'REASON: ti_c2000_check_read.ps1 is missing; reads are not allowed without the verdict'; exit 2
-}
-$vargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $verdictScript,
-           '-CsvPath', $OutputPath, '-AllowNoHeartbeat', '-ExpectedRows', [string]$records.Count,
-           '-RangeVars', 'value')
-if ($null -ne $ValueMin -or $null -ne $ValueMax) {
-    if ($null -ne $ValueMin) { $vargs += @('-ValueMin', [string]$ValueMin) }
-    if ($null -ne $ValueMax) { $vargs += @('-ValueMax', [string]$ValueMax) }
-}
-$pwshExe = Join-Path $PSHOME 'pwsh.exe'
-if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
-$vout = & $pwshExe @vargs 2>&1
-$vcode = $LASTEXITCODE
-foreach ($l in $vout) { if ([string]$l -notmatch '^RESULT:') { Out2 ([string]$l) } }
-if ($vcode -ne 0 -or -not @($vout | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count -or -not $rangeOk) {
-    Publish-Readout 'FAIL' 'mandatory array verdict or range check failed' 'FAIL'
-    Out2 'FAILURE: VERDICT_FAILED'
-    Out2 'REASON: array.csv did not pass the mandatory verdict (references/data-read-verdict.md)'
-    Out2 'RESULT: FAIL'
-    exit 1
-}
-
-if ($extraOutputPath) {
-    try {
-        Copy-Item -LiteralPath $OutputPath -Destination $extraOutputPath -ErrorAction Stop
-        if ((Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $extraOutputPath -Algorithm SHA256).Hash) { throw 'extra output differs' }
-        Out2 ("EXTRA   : {0}" -f $extraOutputPath)
-    } catch {
-        Publish-Readout 'FAIL' ('extra output failed: ' + $_.Exception.Message)
-        Out2 'FAILURE: EXTRA_OUTPUT_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $_.Exception.Message); exit 1
-    }
-}
-Publish-Readout 'OK' 'mandatory array verdict passed' 'OK'
-$rec = Add-LoadRecord -ProjectPath $ProjectPath -Mode 'LoadRead' -Out $OutFile -Sha256 $outShaBefore
-Info2 ('LOAD    : #{0} (LoadRead: this call downloaded the image and restarted the program)' -f $rec.count)
-Complete-Run
-} finally {
-    Exit-TargetLock -ProjectPath $ProjectPath
 }

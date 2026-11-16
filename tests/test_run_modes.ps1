@@ -38,9 +38,12 @@ New-Item -ItemType Directory -Force -Path $scripts, $project, (Join-Path $projec
 
 try {
     foreach ($n in @('ti_c2000_service.ps1', 'ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1',
-                     'ti_c2000_iterate.ps1', 'ti_c2000_loadcount.ps1', 'ti_c2000_readmode.ps1')) {
+                     'ti_c2000_iterate.ps1', 'ti_c2000_loadcount.ps1', 'ti_c2000_readmode.ps1',
+                     'ti_c2000_fwcontract.ps1')) {
         Copy-Item -LiteralPath (Join-Path $root "scripts/$n") -Destination $scripts
     }
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixture 'skill/references') | Out-Null
+    Copy-Item (Join-Path $root 'references/firmware-contract.json') (Join-Path $fixture 'skill/references')
     # stub only: every case below must stop before any probe/DSS work happens
     '# stub' | Set-Content (Join-Path $scripts 'ti_c2000_debug.ps1') -Encoding UTF8
     '<project/>' | Set-Content (Join-Path $project '.cproject') -Encoding UTF8
@@ -144,11 +147,12 @@ try {
     if ($r.code -eq 4 -or $r.text -match 'LOAD_NOT_CONFIRMED|MUTUALLY_EXCLUSIVE|ITERATE_IN_PROGRESS') {
         throw "an approved LoadRead was refused before the probe check`n$($r.text)"
     }
-    Expect 'approved LoadRead reaches the probe check' $r 2 'PROBE_CHECK_FAILED'
+    Expect 'approved LoadRead reaches the probe check' $r 1 'probe pre-check did not return RESULT: OK'
     if (Test-Path -LiteralPath (Join-Path $svcDir 'target.lock')) { throw 'the target lock was left behind after a failed LoadRead' }
     if ((Get-Count $project) -ne $before) { throw 'a read that never reached the target counted a download' }
 
     Write-Output 'PASS: SingleStep/Iterate and ReadOnly/LoadRead are gated separately, cross-locked while Iterate runs, and no refusal downloads anything'
+    Write-Output 'RESULT: OK'
 } finally {
     Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
 }

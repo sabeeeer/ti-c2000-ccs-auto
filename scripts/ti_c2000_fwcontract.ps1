@@ -12,8 +12,8 @@ Everything else about the target - memory map, Flash base, section layout, probe
 discovered at run time, never assumed. That distinction is the point: a contract you can
 audit (tools/audit_fw_contract.ps1) versus knowledge that must be guessed.
 
-Fallbacks are built in so a missing or broken contract file degrades to the documented
-defaults with a warning instead of taking every reader offline.
+The contract is mandatory at runtime. A missing or malformed file is a refusal: silently
+using defaults would undo the audit and could weaken a read gate after a partial install.
 #>
 
 $script:FwContractCache = $null
@@ -23,7 +23,6 @@ function Get-FwContractPaths {
     $root = Split-Path $PSScriptRoot -Parent
     return @(
         (Join-Path $root 'references\firmware-contract.json')
-        (Join-Path $PSScriptRoot 'firmware-contract.json')
     )
 }
 
@@ -42,38 +41,48 @@ function Get-FwContract {
     # documented defaults: what the file would say if it existed
     $default = [ordered]@{
         identity     = [ordered]@{ var = 'gFwId' }
+        ramProof     = [ordered]@{ counter = 'gRamProofTick'; updater = 'TiC2000_RamProofTick' }
         heartbeat    = [ordered]@{ candidates = @('gMsTick', 'usMainLoop', 'gRunMs') }
         rate         = [ordered]@{ var = 'gMsTick'; perSec = 1000; tolerancePct = 20 }
-        frozenBuffer = [ordered]@{ array = 'gBuf'; flag = 'gBufFull'; flagValue = '1'; seq = 'gBufSeq' }
+        frozenBuffer = [ordered]@{ array = 'gDmaFrameA'; flag = 'gDmaReady'; flagValue = '1'; seq = 'gDmaSeq' }
+        readGate     = [ordered]@{ requireProbe = $true; requireLiveSession = $true; requireOutSha256 = $true; requireSourceFreshness = $true; requireCompleteDssResponse = $true; requireFirmwareIdentity = $true; requireRam = $true; requireHeartbeat = $true }
+        timing       = [ordered]@{ minLoadGapMs = 5000; minReadGapMs = 400; minReconnectGapMs = 400 }
         source       = '(built-in defaults)'
     }
 
     $path = @(Get-FwContractPaths) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $path) {
-        if (-not $script:FwContractWarned -and -not $Quiet) {
-            Write-Output 'WARN    : references\firmware-contract.json is missing - using built-in firmware defaults'
-            Write-Output ('WARN    : ' + ($default.identity.var) + ', ' + ($default.heartbeat.candidates -join ', ') + ' - create the file to make this explicit')
-        }
-        $script:FwContractWarned = $true
-        $script:FwContractCache = $default
-        return $script:FwContractCache
+        Write-Output 'FAILURE: FW_CONTRACT_MISSING'; Write-Output 'RESULT: FAIL'
+        Write-Output 'REASON: references\firmware-contract.json is required'; exit 2
     }
 
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
     } catch {
-        if (-not $script:FwContractWarned -and -not $Quiet) {
-            Write-Output ('WARN    : ' + (Split-Path $path -Leaf) + ' is not valid JSON - using built-in firmware defaults')
-            Write-Output ('WARN    : ' + $_.Exception.Message)
+        Write-Output 'FAILURE: FW_CONTRACT_INVALID'; Write-Output 'RESULT: FAIL'
+        Write-Output ('REASON: ' + $_.Exception.Message); exit 2
+    }
+    $invalid = New-Object System.Collections.Generic.List[string]
+    if ([int]$raw.version -lt 3) { $invalid.Add('version < 3') }
+    if (-not $raw.ramProof.counter -or -not $raw.ramProof.updater) { $invalid.Add('ramProof.counter/updater') }
+    foreach ($key in @('requireProbe','requireLiveSession','requireOutSha256','requireSourceFreshness','requireCompleteDssResponse','requireFirmwareIdentity','requireRam','requireHeartbeat')) {
+        if ($raw.readGate.$key -isnot [bool] -or -not $raw.readGate.$key) { $invalid.Add("readGate.$key") }
+    }
+    foreach ($pair in @(@('minLoadGapMs',5000),@('minReadGapMs',400),@('minReconnectGapMs',400))) {
+        $v = 0
+        if (-not [int]::TryParse([string]$raw.timing.($pair[0]),[ref]$v) -or $v -lt [int]$pair[1]) {
+            $invalid.Add("timing.$($pair[0])")
         }
-        $script:FwContractWarned = $true
-        $script:FwContractCache = $default
-        return $script:FwContractCache
+    }
+    if ($invalid.Count -gt 0) {
+        Write-Output 'FAILURE: FW_CONTRACT_INVALID'; Write-Output 'RESULT: FAIL'
+        Write-Output ('REASON: missing or unsafe fields: ' + ($invalid -join ', ')); exit 2
     }
 
     # merge over the defaults, so a partial file still yields a complete shape
     $c = [ordered]@{
         identity = [ordered]@{ var = $(if ($raw.identity.var) { [string]$raw.identity.var } else { $default.identity.var }) }
+        ramProof = [ordered]@{ counter = [string]$raw.ramProof.counter; updater = [string]$raw.ramProof.updater }
         heartbeat = [ordered]@{ candidates = @() }
         rate = [ordered]@{
             var          = $(if ($raw.rate.var) { [string]$raw.rate.var } else { $default.rate.var })
@@ -86,11 +95,29 @@ function Get-FwContract {
             flagValue  = $(if ($null -ne $raw.frozenBuffer.flagValue) { [string]$raw.frozenBuffer.flagValue } else { $default.frozenBuffer.flagValue })
             seq        = $(if ($raw.frozenBuffer.seq) { [string]$raw.frozenBuffer.seq } else { $default.frozenBuffer.seq })
         }
+        readGate = [ordered]@{
+            requireProbe            = $true
+            requireLiveSession      = $true
+            requireOutSha256        = $true
+            requireSourceFreshness  = $true
+            requireCompleteDssResponse = $true
+            requireFirmwareIdentity = $true
+            requireRam              = $true
+            requireHeartbeat        = $true
+        }
+        timing = [ordered]@{
+            minLoadGapMs      = [int]$raw.timing.minLoadGapMs
+            minReadGapMs      = [int]$raw.timing.minReadGapMs
+            minReconnectGapMs = [int]$raw.timing.minReconnectGapMs
+        }
         source = (Split-Path $path -Leaf)
     }
 
     $cands = @($raw.heartbeat.candidates | Where-Object { $_ } | ForEach-Object { [string]$_ })
     $c.heartbeat.candidates = $(if ($cands.Count) { $cands } else { $default.heartbeat.candidates })
+    foreach ($key in @('minLoadGapMs','minReadGapMs','minReconnectGapMs')) {
+        if ($c.timing[$key] -le 0) { $c.timing[$key] = $default.timing[$key] }
+    }
 
     $script:FwContractCache = $c
     return $script:FwContractCache

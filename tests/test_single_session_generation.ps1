@@ -1,92 +1,47 @@
 #requires -Version 7.0
+# Generate the retained service DSS script with a fake executable; no board or
+# actual load occurs. Public readers must not generate their own DSS program.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('c2000-single-session-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ('c2000-service-js-' + [guid]::NewGuid().ToString('N'))
 $scripts = Join-Path $fixture 'skill/scripts'
-$project = Join-Path $fixture 'folder'
+$refs = Join-Path $fixture 'skill/references'
+$project = Join-Path $fixture 'project'
 $ccs = Join-Path $fixture 'ccs'
 $dssDir = Join-Path $ccs 'ccs_base/scripting/bin'
-New-Item -ItemType Directory -Force -Path $scripts, $project, $dssDir, (Join-Path $project 'Debug'), (Join-Path $project 'targetConfigs') | Out-Null
-
 try {
-    # copy the whole scripts folder, not just *.ps1: listing files by hand means every new
-    # helper silently breaks the fixture, and the DSS bootstrap is a .js file injected at
-    # run time (ti_c2000_dss_boot.js), so a .ps1-only copy fails with "could not find file"
+    New-Item -ItemType Directory -Force -Path $scripts,$refs,$project,$dssDir,(Join-Path $project 'Debug'),(Join-Path $project 'targetConfigs') | Out-Null
     Copy-Item (Join-Path $root 'scripts/*') $scripts -Recurse -Force
-    # the readers dot-source the mode library, so ti_c2000_debug.ps1 must be a stub
-    # AFTER the copy or it would overwrite the real one
-    Remove-Item (Join-Path $scripts 'ti_c2000_debug.ps1') -Force -ErrorAction SilentlyContinue
+    Copy-Item (Join-Path $root 'references/firmware-contract.json') $refs
     @'
-param([string]$ProjectPath, [string]$CcsRoot, [switch]$ProbeCheckOnly)
+param([string]$ProjectPath,[string]$CcsRoot,[switch]$ProbeCheckOnly)
 Write-Output 'RESULT: OK'
 exit 0
-'@ | Set-Content (Join-Path $scripts 'ti_c2000_debug.ps1') -Encoding UTF8
-    '<project/>' | Set-Content (Join-Path $project '.cproject') -Encoding UTF8
-    '<projectDescription><name>DemoImage</name></projectDescription>' | Set-Content (Join-Path $project '.project') -Encoding UTF8
-    '<config/>' | Set-Content (Join-Path $project 'targetConfigs/target.ccxml') -Encoding UTF8
-    'fake' | Set-Content (Join-Path $project 'Debug/DemoImage.out') -Encoding ASCII
-
-    # default path: both readers must attach to the live session, not load again
-    foreach ($name in @('ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1')) {
-        $text = Get-Content -LiteralPath (Join-Path $root "scripts/$name") -Raw
-        if ($text -notmatch 'ti_c2000_live_read\.ps1') { throw "$name does not read through the live session by default" }
-        if ($text -notmatch '\$Standalone') { throw "$name lost its -Standalone escape hatch" }
-    }
-
-    foreach ($mode in @('scalar','array')) {
-        $capture = Join-Path $fixture "$mode.js"
-        @"
+'@ | Set-Content (Join-Path $scripts 'ti_c2000_debug.ps1') -Encoding utf8
+    '<project/>' | Set-Content (Join-Path $project '.cproject')
+    '<projectDescription><name>DemoImage</name></projectDescription>' | Set-Content (Join-Path $project '.project')
+    '<configurations/>' | Set-Content (Join-Path $project 'targetConfigs/target.ccxml')
+    'fake' | Set-Content (Join-Path $project 'Debug/DemoImage.out')
+    "MEMORY CONFIGURATION`nPAGE 0:`n  RAMLS0   00008000   00001000   00000000   00001000 RWIX`nSECTION ALLOCATION MAP`n  .text  0  00008000  00000010`n" | Set-Content (Join-Path $project 'Debug/DemoImage.map')
+    $capture = Join-Path $fixture 'service.js'
+    @"
 @echo off
 copy /Y "%~1" "$capture" >nul
-echo RESULT: FAIL
 exit /b 1
 "@ | Set-Content (Join-Path $dssDir 'dss.bat') -Encoding ASCII
-
-        $args = @('-NoProfile', '-File', (Join-Path $scripts $(if ($mode -eq 'scalar') {'ti_c2000_run_read.ps1'} else {'ti_c2000_read_dma.ps1'})), '-ProjectPath', $project, '-CcsRoot', $ccs, '-Standalone', '-ConfirmLoad')
-        if ($mode -eq 'scalar') { $args += @('-Variables', 'gRunMs,ClAdcCtrl.usResult[0]') }
-        else { $args += @('-FrozenBufferReady', '-ArrayName', 'gAdcAllBuf', '-Rows', '16', '-Columns', '400', '-FrozenFlag', 'gAdcBufFull', '-FrozenValue', '2', '-SeqVar', '', '-HeartbeatExpr', 'gRunMs', '-Variables', 'gBootStage,EPwm1Regs.TBPRD') }
-        $output = @(& pwsh @args 2>&1)
-        if ($LASTEXITCODE -eq 0 -or -not (Test-Path $capture)) { throw "$mode fake DSS did not capture a script: $($output -join '; ')" }
-        $js = Get-Content -LiteralPath $capture -Raw
-        # "loads exactly once per session" is now expressed by the shared call: the concrete
-    # loadProgram lives inside ti_c2000_dss_boot.js, so count the call that reaches it.
-    if ($js -notmatch 'DemoImage\.out' -or @([regex]::Matches($js, 'dssLoadWithRetry\(session, OUT')).Count -ne 1 -or
-            $js -notmatch 'session\.target\.runAsynch\(\)' -or $js -notmatch 'session\.target\.isHalted\(\)') {
-            throw "$mode script lacks the resolved .out, one load, run, or running-state check"
-        }
-        if ($js -match '\{\{[^}]+\}\}' -or $js -notmatch 'server\.openSession\(CORE\)') {
-            throw "$mode generated JavaScript has an unresolved template token or no DSS session"
-        }
-        if ($mode -eq 'array' -and ($js -notmatch 'var EXTRAS = \["gBootStage","EPwm1Regs\.TBPRD"\]' -or $js -notmatch 'EXTRA.*before' -or $js -notmatch 'EXTRA.*after' -or $js -notmatch 'ARRAY_LAYOUT_MISMATCH' -or $js -notmatch 'var FROZEN_EXPECTED = "2"' -or $js -notmatch 'isFinite\(hAfter\)')) {
-            throw 'Frozen-buffer reader omitted same-session scalars or address anchors'
-        }
-        # The array reader used to call dssRunVerified(..., WARMUP) while its template never
-        # defined WARMUP: Rhino threw ReferenceError before reading a byte, and PowerShell
-        # could not see it (found 2026-11-15). Assert on the GENERATED script, so the check
-        # covers the real artifact rather than the source that produces it.
-        # Note: USING WARMUP is fine when the same script defines it (run_read has
-        # -WarmupMs); only "use without definition" is the bug.
-        if ($js -match 'dssRunVerified\(session, print, WARMUP\)' -and $js -notmatch 'var WARMUP\s*=') {
-            throw "$mode uses WARMUP without defining it - Rhino would throw ReferenceError before reading a byte"
-        }
-        if ($js -notmatch 'dssRunVerified\(session, print, (300|WARMUP)\)') {
-            throw "$mode does not pass a settle time to dssRunVerified"
-        }
-        # and nothing else undefined either
-        if ($js -notmatch 'function dssRunVerified') {
-            throw "$mode generated JavaScript has no boot sequence injected"
-        }
+    $result = @(& pwsh -NoProfile -File (Join-Path $scripts 'ti_c2000_service.ps1') -ProjectPath $project -CcsRoot $ccs -Start -ConfirmLoad -StartTimeoutSec 3 2>&1)
+    $generated = Join-Path $project 'readout/.service/server.js'
+    if ($LASTEXITCODE -eq 0 -or -not (Test-Path -LiteralPath $generated)) { throw "fake service did not generate DSS: $($result -join '; ')" }
+    $js = [IO.File]::ReadAllText($generated)
+    foreach ($needed in @('getListOfCPUs()','cpuMatches.length !== 1','server.openSession(cpuMatches[0])','session.getCPUName()','core.txt','dssConnectVerified(session','dssResetVerified(session','dssLoadWithRetry(session, OUT','dssRunVerified(session','isConnected(true)','SERVICE: READY')) {
+        if (-not $js.Contains($needed)) { throw "generated service lacks $needed" }
     }
-    Write-Output 'PASS: both execution readers generate DSS scripts, resolve .project output name, and load once per session'
-    Write-Output 'RESULT: OK'
-    exit 0
+    if ([regex]::Matches($js,'dssLoadWithRetry\(session, OUT').Count -ne 1) { throw 'generated service has multiple load call sites' }
+    Write-Output 'CHECK   : one generated retained DSS loader; connect verification and single load call present'
+    Write-Output 'RESULT: OK'; exit 0
 } catch {
-    Write-Output ('FAIL: ' + $_.Exception.Message)
-    Write-Output 'RESULT: FAIL'
-    exit 1
+    Write-Output 'FAILURE: TEST_FAILED'; Write-Output ('REASON: ' + $_.Exception.Message)
+    Write-Output 'RESULT: FAIL'; exit 1
 } finally {
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    if ([IO.Path]::GetFileName($fixture) -like 'c2000-single-session-*' -and $fixture.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        Remove-Item -LiteralPath $fixture -Recurse -Force
-    }
+    Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
 }

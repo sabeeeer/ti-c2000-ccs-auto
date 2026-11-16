@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "purpose": "Offline lookup before retrying a failed CCS/DSS operation. A lookup never connects, halts, resets, builds or loads.",
+  "errors": {
+    "NO_PROBE": "Check the selected .ccxml and Windows probe enumeration. Wait for the same probe to be usable before another connection attempt.",
+    "CONNECT_FAILED": "A normal return from connect is insufficient. Require target.isConnected(true) and a target query; wait before reconnecting.",
+    "AMBIGUOUS_CORE": "The selected .ccxml exposes zero or multiple matching CPUs. Use a CorePattern that matches exactly one configured core, then verify the reported actual CPU name.",
+    "CORE_UNVERIFIED": "The retained DSS service did not record an exact CPU name, or the read requested another CPU. Refuse the read; select one core explicitly for a new approved load.",
+    "CORE_MISMATCH": "DSS opened a CPU different from the one selected from the target configuration. Refuse the load and inspect the .ccxml and core pattern.",
+    "-1138": "Device refused debug mode. Stop automatic retries; inspect board power, target configuration and the DSS log.",
+    "-1041": "The emulator lost target access. Stop the load loop, release the DSS session cleanly and verify the probe before retrying.",
+    "-150": "Probe/driver is not ready. Allow re-enumeration and a usable probe check; do not immediately reconnect.",
+    "RESET_FAILED": "A reset exception alone is recoverable: if the connection is still valid, attempt halt once and proceed to load. Refuse only if both paths fail.",
+    "STOP_UNCLEAN": "The DSS stop marker was not written. Treat the session as failed and do not start another load automatically.",
+    "PROBE_NOT_READY": "DSS exited but the probe has not passed the usable probe check. Wait; do not equate initial PnP appearance with readiness.",
+    "STALE_ARTEFACT": "The exact selected .out predates a project source, linker input or build configuration. Rebuild and stage that output; also verify linked sources outside the project.",
+    "STALE_MAP": "The linker map changed after the retained load or cannot be paired with the selected .out. Refuse RAM claims until a fresh matching build is loaded.",
+    "RAM_PROOF_UNAVAILABLE": "The selected image lacks a pinned map, RAM updater symbol or RAM counter. Integrate the firmware contract and rebuild before a trusted read.",
+    "RAM_PROOF_NOT_ADVANCING": "The RAM updater counter did not advance. The target may be halted or the required updater was not called; refuse the data.",
+    "READ_INCOMPLETE": "A read began but did not finish all checks. Do not reuse the previous CSV or success verdict; inspect the child log and retry only after diagnosing the cause.",
+    "STALE_SERVICE": "The running session's recorded .out SHA256 differs from the selected file. Refuse the read and require an explicitly approved new load.",
+    "TARGET_NOT_CONNECTED": "A live DSS process is not proof of an accessible target. Refuse the read and diagnose the link.",
+    "FW_ID_MISMATCH": "The live firmware identity differs from the one recorded at load. Refuse the data; verify the compiled image and selected core.",
+    "FW_ID_UNREADABLE": "Firmware identity is unavailable. Refuse a trusted read until the image contract supplies it.",
+    "HEARTBEAT_FAIL": "The application counter is not advancing. Refuse stale readings and diagnose whether the program is halted or stuck.",
+    "NOT_RAM_IMAGE": "RAM execution has not been established for this session. Refuse debug-stage data rather than interpreting Flash values.",
+    "BUF_CHANGED": "A supposedly frozen capture changed during transfer. Discard the frame and check the firmware's freeze/sequence protocol."
+  }
+}

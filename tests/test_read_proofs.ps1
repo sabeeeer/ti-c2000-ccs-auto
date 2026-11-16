@@ -1,6 +1,5 @@
 #requires -Version 7.0
-# The four proofs ReadOnly has to make before it reports a number:
-#   probe online | session alive | sha256(out) == state | entry symbol below 0x080000
+# The read gate must refuse missing session/probe/link and forbidden bypasses.
 # Two rules that must never regress:
 #   1. "cannot prove RAM" is a REFUSAL, not a pass (stale Flash data must not look fresh)
 #   2. an unplugged probe is NO_PROBE (exit 3), not a timeout halfway through a read
@@ -29,6 +28,9 @@ try {
     foreach ($n in @('ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1', 'ti_c2000_readmode.ps1', 'ti_c2000_loadcount.ps1')) {
         Copy-Item -LiteralPath (Join-Path $root "scripts/$n") -Destination $scripts
     }
+    Copy-Item -LiteralPath (Join-Path $root 'scripts/ti_c2000_fwcontract.ps1') -Destination $scripts
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixture 'skill/references') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'references/firmware-contract.json') -Destination (Join-Path $fixture 'skill/references')
     '# stub: every case below stops before probe/DSS work' | Set-Content (Join-Path $scripts 'ti_c2000_debug.ps1') -Encoding UTF8
 
     # --- 1. the two weakening switches belong to ReadOnly only -------------------
@@ -40,27 +42,21 @@ try {
         '-ProjectPath', $project, '-ArrayName', 'gBuf', '-FrozenBufferReady', '-Mode', 'LoadRead', '-ConfirmLoad', '-NoProbeCheck')
     Expect 'LoadRead+NoProbeCheck' $r 2 'FAILURE: MUTUALLY_EXCLUSIVE'
 
-    # --- 2. ReadOnly accepts them (and then fails for the honest reason) --------
+    # --- 2. ReadOnly refuses weakened proofs before any session work --------
     $r = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_run_read.ps1'),
         '-ProjectPath', $project, '-Variables', 'gMsTick', '-Mode', 'ReadOnly', '-AllowUnverified', '-NoProbeCheck')
-    Expect 'ReadOnly+AllowUnverified' $r 4 'FAILURE: NO_SESSION'
+    Expect 'ReadOnly+AllowUnverified' $r 2 'FAILURE: READ_PROOF_BYPASS'
 
-    # --- 3. RAM proof is fail-closed -------------------------------------------
+    # --- 3. missing pinned map is fail-closed without a PC read ----------
     $lib = Join-Path $scripts 'ti_c2000_readmode.ps1'
-    # PC decides both questions at once: an unreadable PC means the link is gone, and
-    # that is an environment fault, not an unverified image - so -AllowUnverified must
-    # NOT pass it (measured 2026-11-15: symbol lookup still worked with the link down).
     $ramOut = @(& pwsh -NoProfile -Command @"
 . '$lib'
-`$r = Test-RamImageEvidence -ProjectPath '$empty'
-'ok=' + `$r.ok + ' verified=' + `$r.verified + ' code=' + `$r.code + ' text=' + `$r.text
-`$r2 = Test-RamImageEvidence -ProjectPath '$empty' -AllowUnverified
-'allow ok=' + `$r2.ok + ' code=' + `$r2.code
+`$r = Get-RamProofEvidence -ProjectPath '$empty' -OutFile '$empty/x.out' -SessionState @{ map=''; mapSha256='' }
+'ok=' + `$r.ok + ' code=' + `$r.code + ' text=' + `$r.text
 "@ 2>&1) | ForEach-Object { [string]$_ }
     $ramText = ($ramOut -join "`n")
-    if ($ramText -notmatch 'ok=False verified=False code=TARGET_NOT_CONNECTED') { throw "a dead link must be named as such`n$ramText" }
-    if ($ramText -notmatch 'allow ok=False code=TARGET_NOT_CONNECTED') { throw "-AllowUnverified must not excuse an unplugged board`n$ramText" }
-    if ($ramText -notmatch 'NOT connected') { throw "the refusal must name the reason`n$ramText" }
+    if ($ramText -notmatch 'ok=False code=RAM_PROOF_UNAVAILABLE') { throw "a missing map must be refused`n$ramText" }
+    if ($ramText -notmatch 'no linker map') { throw "the refusal must name the reason`n$ramText" }
 
     # --- 4. probe gate: a probe-less target is NO_PROBE / exit 3 ---------------
     $fake = Join-Path $fixture 'no_probe.ps1'
@@ -78,7 +74,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $connProj '.cproject'), '<project/>', (New-Object Text.UTF8Encoding($false)))
     [IO.File]::WriteAllText((Join-Path $connProj 'targetConfigs/x.ccxml'), '<configurations/>', (New-Object Text.UTF8Encoding($false)))
     $c = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_run_read.ps1'),
-        '-ProjectPath', $connProj, '-Variables', 'gMsTick', '-Mode', 'ReadOnly', '-NoProbeCheck')
+        '-ProjectPath', $connProj, '-Variables', 'gMsTick', '-Mode', 'ReadOnly')
     # no session here, so NO_SESSION comes first; what matters is that it never reads and
     # never reports a RAM image
     if ($c.code -ne 4) { throw "a project with no session must exit 4, got $($c.code)`n$($c.text)" }

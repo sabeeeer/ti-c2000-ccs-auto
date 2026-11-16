@@ -70,7 +70,8 @@ try {
     Case 'read: readonly + build' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick', '-Build') 2 'FAILURE: MUTUALLY_EXCLUSIVE'
     Case 'read: readonly + expect' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick', '-Expect', 'gMsTick>0') 2 'FAILURE: MUTUALLY_EXCLUSIVE'
     Case 'read: readonly + maxloads' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick', '-MaxLoads', '2') 2 'FAILURE: MUTUALLY_EXCLUSIVE'
-    Case 'read: readonly no session' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick', '-NoProbeCheck') 4 'FAILURE: NO_SESSION'
+    Case 'read: readonly no session' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick') 4 'FAILURE: NO_SESSION'
+    Case 'read: readonly bypass refused' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick', '-NoProbeCheck') 2 'FAILURE: READ_PROOF_BYPASS'
 
     # ---------------- ti_c2000_read_dma.ps1 -------------------------------------
     $dma = Join-Path $sc 'ti_c2000_read_dma.ps1'

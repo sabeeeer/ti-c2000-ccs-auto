@@ -20,7 +20,7 @@ it looks correct.
 Usage:
   pwsh -NoProfile -File tools/sync_platform_copies.ps1 -DryRun     # show the plan
   pwsh -NoProfile -File tools/sync_platform_copies.ps1             # apply
-  pwsh -NoProfile -File tools/sync_platform_copies.ps1 -Targets D:\x\.claude\skills\ti-c2000-ccs-auto
+  pwsh -NoProfile -File tools/sync_platform_copies.ps1 -Targets $env:USERPROFILE\.claude\skills\ti-c2000-ccs-auto
 
 Exit code: 0 in sync (after applying) | 1 differences remain / error | 2 bad arguments
 #>
