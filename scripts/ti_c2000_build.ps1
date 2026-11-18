@@ -631,25 +631,22 @@ if ($compileErrors.Count -eq 0) {
     $lflags = @("-v$siliconVer", '-g', '--display_error_number', '--diag_warning=225', '--diag_wrap=off', '-z',
                "-m$OutputDir\$projName.map", "--stack_size=$stackSz", '--warn_sections',
                "-i$cgRoot\lib", "-i$cgRoot\include", '--reread_libs', $romModel)
-    # 入口点：`.cproject` 声明了就必须照它传，并且必须校验真的生效（见下方 map 校验块）。
+    # ENTRY_POINT from .cproject: NOT passed unless the caller asks for it.
     #
-    # 2026-11-15 的旧结论（"十六次 _c_int00 成功，加了 -e 就全失败 → 不要传 -EntryPoint"）
-    # 已被 2026-11-18 推翻：那次失败不是"传了入口"造成的，而是**短形式 `-e <symbol>` 在
-    # `-z ... --reread_libs` 之后被 cl2000 吞掉**——日志打印 "overridden to code_start"，
-    # 实际 .out 入口是 _c_int00（0x942d，落在 .text 内）。loadProgram 写完 BEGIN 就把 PC 指到
-    # 尚未写入的 .text，CPU 跑飞占总线，首块写 0x8000 报 Error -1041 + FTDI -150。
-    # 换成 --entry_point= 长形式并加 map 校验之后，同一工程 LOAD #116 一次成功。
-    # 因此：**不要回退成不传入口**，也**不要用短形式**。
+    # History that matters here: adding `-e code_start` (the value .cproject declares) was
+    # the ONLY build change made after the last successful download on 2026-11-15
+    # (LOAD #27 at 20:20:08, built with the linker default _c_int00), and after it every
+    # single -Start failed. Sixteen loads had succeeded with _c_int00 that same day.
+    # So mirroring that one option is not safe for this project: the user's CCS
+    # configuration may apply it to a different build configuration than the RAM one this
+    # script builds. DO NOT pass -EntryPoint code_start for a RAM download: measured again on
+    # 2026-11-18, that image writes .text in 0x800 pieces, fails -1041 + FTDI -150 on the first
+    # block, and leaves the core needing a retry (see references/ram-and-linker.md "入口点").
+    # service.ps1 refuses such an image at -Start before the board is touched.
     $declaredEntry = Get-OptionValue 'linkerID.ENTRY_POINT'
-    if (-not $EntryPoint -and $declaredEntry) {
-        # 调用方没指定时，采用 .cproject 的声明值，避免产出与 CCS GUI 不一致的镜像。
-        $EntryPoint = $declaredEntry
-        Info ('LINK    : entry point taken from .cproject = {0}' -f $EntryPoint)
-    }
     if ($EntryPoint) {
-        # 必须用 --entry_point= 长形式：短形式 `-e <symbol>` 实测被吞（2026-11-18，见上）。
-        $lflags += "--entry_point=$EntryPoint"
-        Info ('LINK    : entry point requested = {0} (declared in .cproject: {1})' -f $EntryPoint, $(if ($declaredEntry) { $declaredEntry } else { 'none' }))
+        $lflags += @('-e', $EntryPoint)
+        Info ('LINK    : entry point overridden to {0} (declared in .cproject: {1})' -f $EntryPoint, $(if ($declaredEntry) { $declaredEntry } else { 'none' }))
     } elseif ($declaredEntry) {
         Info ('LINK    : .cproject declares ENTRY_POINT={0}; NOT applied (use -EntryPoint {0} to force it)' -f $declaredEntry)
     }
@@ -690,26 +687,6 @@ if ($compileErrors.Count -eq 0) {
             if ($linkErrors -notcontains $short) { $linkErrors += $short }
         }
     }
-    # 闭环校验：请求了 -EntryPoint 就必须在 .map 里看到同名 ENTRY POINT SYMBOL。
-    # 2026-11-18 事故：短形式 `-e <symbol>` 追加在 `-z ... --reread_libs` 之后被 cl2000 吞掉，
-    # 日志仍打印 "overridden to code_start"，实际 .out 入口退化成 _c_int00（0x942d），
-    # 下载时 loadProgram 在写完 .text 之前就把 PC 指过去，CPU 跑飞 → Error -1041。
-    # 所以这里不信日志、只信 map；不一致就让构建失败，绝不留给下载阶段去发现。
-    if ($code -eq 0 -and (Test-Path -LiteralPath $outFile) -and $EntryPoint) {
-        $entryActual = ''
-        try {
-            $mapCheck = [IO.File]::ReadAllText("$OutputDir\$projName.map")
-            $emCheck = [regex]::Match($mapCheck, 'ENTRY POINT SYMBOL:\s*"([^"]+)"')
-            if ($emCheck.Success) { $entryActual = $emCheck.Groups[1].Value }
-        } catch { }
-        if ($entryActual -and $entryActual -ne $EntryPoint) {
-            $linkErrors += ("ENTRY_POINT_NOT_APPLIED requested=$EntryPoint actual=$entryActual")
-            $log.Add("error: entry point requested as $EntryPoint but the map records $entryActual")
-            Info ("LINK    : ENTRY POINT MISMATCH - requested $EntryPoint, map has $entryActual")
-        } elseif ($entryActual) {
-            Info ("LINK    : entry point verified in map = $entryActual")
-        }
-    }
     if ($code -ne 0 -or -not (Test-Path -LiteralPath $outFile)) { $linkErrors += "LINK FAILED (exit $code)" }
 }
 
@@ -746,23 +723,6 @@ if ($ok) {
         Write-Output ("staged    : {0}" -f $stagedOut)
     }
     Write-Output ("log       : {0}" -f $logFile)
-    # 工程改动留痕（工程 AGENTS.md 硬性规则⑤）。成功才写，失败由调用方决定是否记录，
-    # 避免把"编译失败"刷成噪音。文件不存在时先建（check_project_entry.ps1 也会建）。
-    try {
-        $chgLog = Join-Path $ProjectPath 'BUILD_VERIFICATION.txt'
-        if (-not (Test-Path -LiteralPath $chgLog)) {
-            [IO.File]::WriteAllText($chgLog, ("工程改动留痕（BUILD_VERIFICATION.txt）`r`n`r`n只追加，不覆盖。`r`n--------------------------------------------------------------------------------`r`n"), (New-Object Text.UTF8Encoding($false)))
-        }
-        $oe = Join-Path $OutputDir "$projName.out"
-        $oLen = if (Test-Path -LiteralPath $oe) { (Get-Item -LiteralPath $oe).Length } else { 0 }
-        $entryNote = if ($EntryPoint) { "entry=$EntryPoint" } else { 'entry=default' }
-        $rec = ('  {0} | build | config {1}, compile OK, link OK, {2} warning(s), {3} source(s) | out {4:N0} B, {5}' -f `
-                (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $cfgName, $warningCount, $cfiles.Count, $oLen, $entryNote)
-        [IO.File]::AppendAllText($chgLog, $rec + "`r`n", (New-Object Text.UTF8Encoding($false)))
-        Write-Output ("chglog    : appended to BUILD_VERIFICATION.txt")
-    } catch {
-        Write-Output ('NOTE    : BUILD_VERIFICATION.txt append failed: ' + $_.Exception.Message)
-    }
     Write-Output "RESULT: OK"
     exit 0
 } else {

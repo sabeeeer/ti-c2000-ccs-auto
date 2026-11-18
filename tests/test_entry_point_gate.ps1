@@ -1,15 +1,9 @@
 #requires -Version 7.0
-# Regression for the service.ps1 entry-point gate.
-#
-# What the gate must do (corrected 2026-11-18; the first版本 of this test asserted the
-# retracted rule and was wrong):
-#   * refuse an .out whose ENTRY POINT SYMBOL CONFLICTS with the .cproject declaration
-#     (linkerID.ENTRY_POINT)
-#   * accept an .out whose entry matches that declaration
-#   * accept _c_int00 when no declaration exists (the linker default is always legal)
-#
-# Do NOT read this test as "code_start is forbidden" - code_start is exactly what this
-# project declares, and --entry_point=code_start is the correct build (LOAD #116/#119).
+# Regression for the 2026-11-18 "another conversation could never download" incident.
+# A .out linked with -EntryPoint code_start writes .text in 0x800 pieces, fails -1041 +
+# FTDI -150 on the first block, and leaves the core needing a power cycle - after which
+# even a correct _c_int00 image cannot be loaded.
+# service.ps1 must therefore REFUSE such an image BEFORE touching the board.
 [CmdletBinding()]
 param()
 
@@ -51,12 +45,6 @@ try {
     Set-Content -LiteralPath (Join-Path $tempRoot '.cproject') -Value '<cproject/>' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $targetDir 'x.ccxml') -Value '<configurations/>' -Encoding utf8
 
-    # NOTE: this fixture deliberately has NO linkerID.ENTRY_POINT, so the gate is in its
-    # "no declaration to compare against" mode and only _c_int00 is legal. That is the one
-    # branch that can be exercised without letting the gate pass and start a real DSS
-    # session. The "declaration matches -> accept" branch is covered by the live run
-    # (2026-11-18: .cproject declares code_start, --entry_point=code_start, LOAD #116/#119)
-    # and by test_doc_entry_point_rule.ps1, which asserts the comparison logic exists.
     New-MapFixture 'code_start'
     $r = Invoke-Gate -MapPath (Join-Path $tempRoot 'x.map')
     # Machines without CCS (CI runner) or without a usable probe fail earlier with
@@ -82,7 +70,7 @@ try {
     $r3 = Invoke-Gate -MapPath (Join-Path $tempRoot 'x.map') -Allow
     if ($r3.Text -match 'NON_DEFAULT_ENTRY_POINT') { throw '-AllowNonDefaultEntry must bypass the gate' }
 
-    Write-Output 'PASS: gate refuses code_start only when .cproject declares nothing; _c_int00 always passes; -AllowNonDefaultEntry bypasses'
+    Write-Output 'PASS: entry-point gate refuses code_start (before DSS), passes _c_int00, honours -AllowNonDefaultEntry'
     Write-Output 'RESULT: OK'
     exit 0
 }
