@@ -32,10 +32,15 @@ $serial = 'TI90I42A'
 # The "driver file exists" check needs a real CCS targetdb. Without one (CI runner, a
 # machine with CCS elsewhere) skip it with a NOTE instead of failing: the structure/XML
 # and prefix checks below still guard the regression on any machine.
-$driverDb = 'F:\ccs\ccs_base\common\targetdb\drivers'
-if (-not (Test-Path -LiteralPath $driverDb)) {
-    Write-Output "NOTE    : targetdb not found at $driverDb - skipping 'driver file exists' check"
-    $driverDb = ''
+# Set CCS_ROOT to your CCS install root to enable this check locally; never hardcode a
+# machine-specific drive path here (the portability gate blocks it).
+$driverDb = ''
+if ($env:CCS_ROOT) {
+    $candidate = Join-Path $env:CCS_ROOT 'ccs_base\common\targetdb\drivers'
+    if (Test-Path -LiteralPath $candidate) { $driverDb = $candidate }
+}
+if (-not $driverDb) {
+    Write-Output "NOTE    : CCS targetdb not configured - skipping 'driver file exists' check (set CCS_ROOT to enable)"
 }
 
 function New-Fixture([string]$ver, [bool]$withSerial, [string]$nl, [bool]$withSuffix) {
@@ -181,8 +186,10 @@ try {
     Write-Output 'SECTION E PASS: .bak is exact pre-switch content'
 
     # ---- Section F: REAL project ccxml, 30 more random rounds (covers authentic formatting/device tree) ----
-    $realCcxml = 'e:\3-1LAUNCHXL-F28379D-TI\1-1My_DSP28379d\1-1Program_Store\1-1DMA_Ping-Pong\F28379D_CPU1_Template\targetConfigs\TMS320F28379D.ccxml'
-    if (Test-Path -LiteralPath $realCcxml) {
+    # Optional: set TI_REAL_CCXML to a real project's targetConfigs/TMS320F28379D.ccxml
+    # to enable this section locally; CI skips it when unset. Never hardcode a local path.
+    $realCcxml = $env:TI_REAL_CCXML
+    if ($realCcxml -and (Test-Path -LiteralPath $realCcxml)) {
         Copy-Item -LiteralPath $realCcxml -Destination $ccxml -Force
         # Authentic ccxml has no trailing serial-block newline quirk; just assert structure first.
         $realText = [IO.File]::ReadAllText($ccxml)
