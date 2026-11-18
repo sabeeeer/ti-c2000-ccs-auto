@@ -35,10 +35,29 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 JTAG 在 DMA/ISR 持续覆写内存的同时直读，实测会读到接缝甚至掉链路（见
 [读模式](references/single-session-read.md) 的原始数据），**所以不在运行时直读是硬约束，不是偏好。**
 
-**`run_read.ps1 -Variables` 不是数据读法。** 它只轮询**心跳与状态**
-（`gMsTick`、`gAmpFb`、`gCtrlLogFrozen`），每秒最多 2~3 次，
-**不能还原 100 ms 级序列，也不能量相位或频率**。判定"程序还在跑"用它；
-**交付数据必须用上面两种冻结读法之一。**
+**`run_read.ps1 -Variables` 是「交付数据前的前提校验」（preflight）—— 不是数据读法，但必须做，不能跳。**
+
+**顺序固定为「先验活、再取数」：**
+
+```powershell
+# 第 1 步（前提校验，缺了它下面的数据不可信）
+ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,gAmpFb,gCtrlLogFrozen -Mode ReadOnly
+#   要看到：HEARTBEAT: OK（gMsTick 跨采样递增）、gCtrlLogFrozen=1（数组确实冻结了）、
+#           以及 verdict.txt 里固件身份与本次会话记录一致
+
+# 第 2 步（取数，只有冻结数组才可信）
+ti_c2000_read_dma.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
+```
+
+**为什么它是前提而不是可选项**：不先确认心跳，第 2 步读到的数字可能来自
+① 早已停机、② 上一轮的残留数组、③ 加载的是另一份固件。**这三种情况下数字都"看起来正常"。**
+所以「有数字」不等于「数据可信」——**心跳/身份校验是判断"这批数据属于当次运行"的唯一依据**。
+
+**它本身的局限（所以只能用做校验，不能用来取数）**：每秒最多 2~3 次采样，
+**不能还原 100 ms 级序列，也不能量相位或频率**。
+
+完整的读前证据清单（探针、会话 PID、`.out` 与源文件新旧、RAM 自证、加载序号）见
+[读模式](references/single-session-read.md)「读前必须呈现的证据」。
 
 **`LoadRead` ≠ 连续录波。**
 `LoadRead` 只是"本次允许下载一次、然后读"，属于**交易模式**；

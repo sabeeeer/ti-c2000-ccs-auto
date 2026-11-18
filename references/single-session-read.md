@@ -31,6 +31,19 @@
 
 ## 两种冻结读法：连续录波（取波形）与冻结小数组（快速验证）
 
+**读数组之前必须先过心跳校验 —— 这是前提，不是可选项。**
+
+```powershell
+# 前提：确认程序在跑、数组确实冻结（缺这步，下面的数字不可信）
+ti_c2000_run_read.ps1 -Variables gMsTick,gAmpFb,gCtrlLogFrozen -Mode ReadOnly   # 要 HEARTBEAT: OK
+# 取数：
+ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
+```
+
+不先验活就直接读数组，数字可能来自「早已停机」「上一轮残留数组」「另一份固件」，
+而**这三种情况下数字都看起来正常**。心跳（`gMsTick` 递增）+ 冻结标志（`gCtrlLogFrozen=1`）
++ 固件身份一致，是判断"这批数据属于当次运行"的唯一依据。
+
 **数据只有这一条路：先冻结、再读。** 规模不同，机制相同——都是「ISR 采满 → 置冻结标志 →
 ISR 停止写入 → JTAG 读静态数组」。按用途分两种：
 
