@@ -32,12 +32,23 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 ## 一次成功下载的固定顺序（2026-11-18 F28379D/CPU1 + XDS100v2 实测）
 
 ```powershell
-pwsh -NoProfile -File scripts\ti_c2000_build.ps1   -ProjectPath <工程> -Stage -EntryPoint code_start
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1   -ProjectPath <工程>            # 不要传 -EntryPoint
 pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -ConfirmLoad
 pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables <变量,寄存器>   # 只读附着，不重烧
 ```
 
-成功必须三条同时成立，缺一不得写"下载成功"：`.map` 里 `FLASHA~FLASHN` 的 used 全为 0 且入口打印 `code_start`；日志出现 `DSS: loaded`（即 `memory.loadProgram` 成功）；`runAsynch` 后应用计数器跨轮递增。**不加 `-EntryPoint code_start` 时 `.map` 会是 `_c_int00`**，`codestart` 里的关狗分支被跳过（原因与判据见[RAM 与链接](references/ram-and-linker.md)「入口点」）。
+**入口点必须是 `_c_int00`。绝不能传 `-EntryPoint code_start`**（2026-11-18 两次实测，代价是整个下午）：
+
+| 构建方式 | `.out` | `.map` 入口 | 首块写入 | 结果 |
+|---|---|---|---|---|
+| 不传（默认） | 592642 B | `_c_int00` | `0x16a8` 整块 | LOAD #103/#104 `RESULT: OK` |
+| `-EntryPoint code_start` | 592810 B | `code_start` | `0x800`（一个 RAMLS 块） | `-1041` + FTDI `-150`，且把 CPU 推进不可调试状态 |
+
+`.cproject` 里的 `ENTRY_POINT=code_start` 是给 **Flash 构建**用的；强加给 RAM 下载会让加载器分片写。
+`service.ps1` 现在下载前检查 `.map` 的 `ENTRY POINT SYMBOL`，非 `_c_int00` 直接
+`FAILURE: NON_DEFAULT_ENTRY_POINT`（exit 4）拒绝、不碰板子；逃生需显式 `-AllowNonDefaultEntry`。
+
+成功必须三条同时成立，缺一不得写"下载成功"：`.map` 里 `FLASHA~FLASHN` 的 used 全为 0 **且 `ENTRY POINT SYMBOL: "_c_int00"`**；日志出现 `DSS: loaded`（即 `memory.loadProgram` 成功）；`runAsynch` 后应用计数器跨轮递增。入口走 `_c_int00` 会跳过 `codestart` 里的 `WD_DISABLE` 分支，本工程由 `InitSysCtrl()` 内的 `DisableDog()` 兜底（104 次加载无看门狗复位），细节见[RAM 与链接](references/ram-and-linker.md)「入口点」。
 
 失败先看 `<工程>\readout\.service\server.log`，不要先怀疑硬件：
 

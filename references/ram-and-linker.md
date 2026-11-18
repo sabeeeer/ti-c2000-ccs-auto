@@ -126,28 +126,43 @@ SECTIONS
    ```
    若有 `#pragma DATA_SECTION(buf,"DMARAML6")` 之类，说明那个块被 DMA 借用，不能挪（或要同步改宏）。
 
-### 入口点：`-e code_start` 不是可选项（2026-11-18 实测）
+### 入口点：RAM 下载必须是 `_c_int00`，**不要**传 `-e code_start`（2026-11-18 两次实测）
 
-`.cproject` 里写着 `ENTRY_POINT=code_start` **不等于**链接时会用上它。用本 skill 的构建脚本时，不传 `-EntryPoint code_start` 的输出是：
+> ⚠️ **本节曾在 2026-11-18 被写反过一次**，直接导致另一个对话反复下载失败。
+> 当时的结论是"必须传 `-EntryPoint code_start`"，那条是错的。下面是实测结果。
+
+`.cproject` 里写着 `ENTRY_POINT=code_start` **不等于** RAM 下载要用它。用本 skill 的构建脚本时，**不传** `-EntryPoint` 的输出是：
 
 ```text
 LINK    : .cproject declares ENTRY_POINT=code_start; NOT applied (use -EntryPoint code_start to force it)
-ENTRY POINT SYMBOL: "_c_int00" address: 000088e2
+ENTRY POINT SYMBOL: "_c_int00" address: 0000942d
 ```
 
-传了之后：
+**这就是能下载的形态**（`.out` 592642 B，`.text` 整块 `0x16a8`，LOAD #103/#104 实测通过）。
+
+一旦显式传 `-EntryPoint code_start`：
 
 ```text
 ENTRY POINT SYMBOL: "code_start" address: 00000000
 ```
 
-差别不只是一个地址：`F2837xD_CodeStartBranch.asm` 的 `codestart` 里带 `WD_DISABLE` 分支（`LB wd_disable` → 写 `WDCR` → `LB _c_int00`）。入口直接是 `_c_int00` 就**跳过关狗**，只能指望后面的 `InitSysCtrl()`（其中也有 `DisableDog`）足够早。本工程靠后者没出事，但这是运气，不是设计。
+`.out` 变成 592810 B，加载器把 `.text` 按 `0x800`（一个 RAMLS 块）分片写，**第一片就 `-1041` + FTDI `-150`**，
+并把 CPU 推进不可调试状态（随后连正确镜像也会 `Target reset failed. Error: -1`，重试一次才恢复）。
 
-**判据（下载 RAM 镜像时必须看）**：`.map` 出现 `ENTRY POINT SYMBOL: "code_start"`，且 `codestart` 落在 `BEGIN`（`0x000000`）。构建命令固定写：
+**为什么当初会写反**：`F2837xD_CodeStartBranch.asm` 的 `codestart` 里带 `WD_DISABLE` 分支
+（`LB wd_disable` → 写 `WDCR` → `LB _c_int00`），入口直接是 `_c_int00` 会**跳过关狗**。
+这个担忧本身成立，但它不是"必须传 code_start"的理由——本工程由 `InitSysCtrl()` 里的
+`DisableDog()` 兜底，104 次加载没有一次看门狗复位。**下载可行性优先于入口形式。**
+
+**判据（下载 RAM 镜像时必须看）**：`.map` 出现 `ENTRY POINT SYMBOL: "_c_int00"`。
+若看到 `"code_start"`，**重新编译且不传 `-EntryPoint`**，不要试图直接下载（`service.ps1` 会以
+`FAILURE: NON_DEFAULT_ENTRY_POINT` exit 4 拒绝）。
 
 ```powershell
-pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -Stage -EntryPoint code_start
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -Stage      # 就这样，别加 -EntryPoint
 ```
+
+`code_start` 属于 **Flash 启动**的构建形态（另一套链接脚本 + `-D_FLASH`），不能拿来下 RAM。
 
 ---
 

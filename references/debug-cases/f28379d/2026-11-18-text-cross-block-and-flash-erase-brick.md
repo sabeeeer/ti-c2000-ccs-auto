@@ -115,8 +115,9 @@ $work = %TEMP%\blinky_baseline
   （工作副本不在原位置，相对路径会失效）
 
 ti_c2000_build.ps1 -ProjectPath $work -CcsRoot F:\ccs `
-  -LinkCmd "<root>\common\cmd\2837xD_RAM_lnk_cpu1.cmd,<root>\headers\cmd\F2837xD_Headers_nonBIOS_cpu1.cmd" `
-  -EntryPoint code_start
+  -LinkCmd "<root>\common\cmd\2837xD_RAM_lnk_cpu1.cmd,<root>\headers\cmd\F2837xD_Headers_nonBIOS_cpu1.cmd"
+  # 注意：不要加 -EntryPoint code_start（本文件当时的命令带了它，是当日稍后被推翻的做法；
+  # 传了会让 .text 按 0x800 分片写并 -1041，见 2026-11-18-code-start-entry-point-blocks-download.md）
 ```
 
 结果：**`SOURCES : 10`、0 警告、`RESULT: OK`**，与另一份记录里的"10 源文件"一致。

@@ -14,7 +14,7 @@
 - 复现条件与最小步骤：
 
 ```powershell
-pwsh -NoProfile -File scripts\ti_c2000_build.ps1   -ProjectPath <工程> -Stage -EntryPoint code_start
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1   -ProjectPath <工程>          # 不要传 -EntryPoint（见下方修正）
 pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -ConfirmLoad
 pwsh -NoProfile -Command "& 'scripts\ti_c2000_run_read.ps1' -ProjectPath '<工程>' -Variables usMainLoop,EPwm1Regs.TBPRD -Rounds 4 -IntervalMs 400"
 ```
@@ -57,7 +57,7 @@ pwsh -NoProfile -Command "& 'scripts\ti_c2000_run_read.ps1' -ProjectPath '<工�
 |---|---|---|---|---|
 | 1 | `PROBE : NOT FOUND` → `FAILURE: NO_PROBE` → `REASON: no JTAG probe enumerated by Windows (checked: XDS*, Spectrum Digital, Blackhawk, SEGGER, Debug Probe)`，exit 3 | 探针检查 | 当时探针确实没被枚举（用户尚未插好/驱动尚未完成枚举） | 不是结论。插好后**同一条命令**变成 `PROBE : XDS100 Class Debug Port` / `XDS100 Class Auxiliary Port` / `XDS100 Class USB Serial Port (COM11)` + `RESULT: OK`。一次 `NO_PROBE` 不得推出"硬件坏了" |
 | 2 | `VIOLATION: project root is missing AI entry file(s): AGENTS.md, CODEBUDDY.md, CLAUDE.md` / `RESULT: FAIL`，exit 1 | 工程入口检查 | 工程是从未接过 skill 的新工程 | `tools/init_project_entry.ps1 -ProjectPath <工程>` 生成三份相同入口文件，复检 `RESULT: OK`（3 份、0 副本） |
-| 3 | `LINK : .cproject declares ENTRY_POINT=code_start; NOT applied (use -EntryPoint code_start to force it)`，随后 `.map` 写 `ENTRY POINT SYMBOL: "_c_int00" address: 000088e2` | 构建 | `.cproject` 的 `ENTRY_POINT` 不被构建脚本自动透传，链接器用了默认入口 `_c_int00` | 加 `-EntryPoint code_start`；改后 `.map` 变成 `ENTRY POINT SYMBOL: "code_start" address: 00000000`。后果：默认入口会**跳过 `codestart` 里的 `WD_DISABLE`**（本工程靠 `InitSysCtrl()` 关狗才没出问题，不能依赖） |
+| 3 | `LINK : .cproject declares ENTRY_POINT=code_start; NOT applied (use -EntryPoint code_start to force it)`，随后 `.map` 写 `ENTRY POINT SYMBOL: "_c_int00" address: 000088e2` | 构建 | `.cproject` 的 `ENTRY_POINT` 不被构建脚本自动透传，链接器用了默认入口 `_c_int00` | **不要理它，这是正确形态**。⚠️ 本条原写"加 `-EntryPoint code_start`"，是 2026-11-18 的错误结论：实测传了会得到 592810 B 的镜像、`.text` 按 `0x800` 分片写、`-1041` + `-150` 并把 CPU 推进不可调试状态（详见 [code-start-entry-point-blocks-download](2026-11-18-code-start-entry-point-blocks-download.md)）。默认入口跳过 `codestart` 的 `WD_DISABLE` 本工程由 `InitSysCtrl()` 的 `DisableDog()` 兜底 |
 | 4 | `USAGE: INVALID_READ_REQUEST` / `REASON: use simple read paths, at least two rounds and nonnegative timing values`，exit 2，连续两次（换变量集也一样） | 读命令解析 | `pwsh -File ... -Variables 'gFwId','usMainLoop'` 把**带单引号的一整串**当**一个**参数传入 | 用临时脚本实测确认：`COUNT=1`、`ITEM=['gFwId','usMainLoop']`（引号是字面量）。改 `-Variables gFwId,usMainLoop`（不加引号）或 `& 脚本.ps1 -Variables 'a','b'` |
 | 5 | `FAILURE: VALUE_READ_FAILED` / `REASON: AdcRegs.ADCTRL1.all JavaException: ... Error evaluating "AdcRegs.ADCTRL1.all": identifier not found: AdcRegs` / `HINT : identifier not found - check the exact spelling against the .map of THIS build` | 读回 | F2837xD 没有 `AdcRegs`（那是 2833x 的单一 ADC 包装） | 用实例名 `AdcaRegs`（B/C/D 同理）；同时 F2837xD 也没有 `ADCTRL1/ADCTRL2` |
 | 6 | `FAILURE: VALUE_READ_FAILED` / `REASON: AdcaRegs.ADCTRL1.all ... member 'ADCTRL1' not found` / `HINT : member ADCTRL1 was not found; check the selected device header and register field path` | 读回 | 同上：`ADCTRL1` 是 2833x 名字 | F2837xD 用 `ADCCTL1`、`ADCCTL2`、`ADCSOC0CTL`；本次实测 `AdcaRegs.ADCCTL1.all = 900 (0x384)`、`ADCCTL2.all = 6`、`ADCSOC0CTL.all = 0x50000E` |

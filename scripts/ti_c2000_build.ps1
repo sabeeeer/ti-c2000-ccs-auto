@@ -639,7 +639,10 @@ if ($compileErrors.Count -eq 0) {
     # single -Start failed. Sixteen loads had succeeded with _c_int00 that same day.
     # So mirroring that one option is not safe for this project: the user's CCS
     # configuration may apply it to a different build configuration than the RAM one this
-    # script builds. -EntryPoint code_start reproduces the old behaviour if you verify it.
+    # script builds. DO NOT pass -EntryPoint code_start for a RAM download: measured again on
+    # 2026-11-18, that image writes .text in 0x800 pieces, fails -1041 + FTDI -150 on the first
+    # block, and leaves the core needing a retry (see references/ram-and-linker.md "入口点").
+    # service.ps1 refuses such an image at -Start before the board is touched.
     $declaredEntry = Get-OptionValue 'linkerID.ENTRY_POINT'
     if ($EntryPoint) {
         $lflags += @('-e', $EntryPoint)

@@ -1,0 +1,76 @@
+#requires -Version 7.0
+# Regression for the 2026-11-18 "another conversation could never download" incident.
+# A .out linked with -EntryPoint code_start writes .text in 0x800 pieces, fails -1041 +
+# FTDI -150 on the first block, and leaves the core needing a power cycle - after which
+# even a correct _c_int00 image cannot be loaded.
+# service.ps1 must therefore REFUSE such an image BEFORE touching the board.
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$skillRoot = Split-Path $PSScriptRoot -Parent
+$scriptPath = Join-Path $skillRoot 'scripts/ti_c2000_service.ps1'
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('c2000-entry-gate-' + [guid]::NewGuid().ToString('N'))
+$targetDir = Join-Path $tempRoot 'targetConfigs'
+New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+
+function New-MapFixture([string]$entrySymbol) {
+    $nl = "`r`n"
+    @(
+        '******************************************************************************'
+        '             TMS320C2000 Linker PC v15.12.1'
+        '******************************************************************************'
+        '>> Linked Wed Nov 18 17:57:55 2026'
+        ''
+        'OUTPUT FILE NAME:   <C:\Temp\x.out>'
+        ('ENTRY POINT SYMBOL: "{0}"  address: 00000000' -f $entrySymbol)
+        ''
+        'MEMORY CONFIGURATION'
+    ) -join $nl | Set-Content -LiteralPath (Join-Path $tempRoot 'x.map') -Encoding utf8 -NoNewline
+}
+
+function Invoke-Gate {
+    param([string]$MapPath, [switch]$Allow)
+    $args = @('-NoProfile', '-File', $scriptPath, '-ProjectPath', $tempRoot, '-Start', '-ConfirmLoad',
+              '-OutFile', (Join-Path $tempRoot 'x.out'), '-MapFile', $MapPath)
+    if ($Allow) { $args += '-AllowNonDefaultEntry' }
+    $out = & pwsh @args 2>&1 | Out-String
+    return [pscustomobject]@{ Code = $LASTEXITCODE; Text = $out }
+}
+
+try {
+    # A .out is required to exist before the gate runs; content does not matter for the gate.
+    Set-Content -LiteralPath (Join-Path $tempRoot 'x.out') -Value 'placeholder' -Encoding utf8
+    # ...and the entry checks run before the gate, so the project must look like a CCS project.
+    Set-Content -LiteralPath (Join-Path $tempRoot '.cproject') -Value '<cproject/>' -Encoding utf8
+    Set-Content -LiteralPath (Join-Path $targetDir 'x.ccxml') -Value '<configurations/>' -Encoding utf8
+
+    New-MapFixture 'code_start'
+    $r = Invoke-Gate -MapPath (Join-Path $tempRoot 'x.map')
+    if ($r.Code -ne 4) { throw "code_start must be refused with exit 4, got $($r.Code): $($r.Text)" }
+    if ($r.Text -notmatch 'FAILURE: NON_DEFAULT_ENTRY_POINT') { throw "missing NON_DEFAULT_ENTRY_POINT: $($r.Text)" }
+    if ($r.Text -notmatch 'RESULT: FAIL') { throw 'refusal must print RESULT: FAIL' }
+    # The refusal must happen before any DSS work: no session/log artefacts may appear.
+    if (Test-Path (Join-Path $tempRoot 'readout\.service\server.log')) { throw 'gate ran after DSS started (server.log exists)' }
+
+    New-MapFixture '_c_int00'
+    $r2 = Invoke-Gate -MapPath (Join-Path $tempRoot 'x.map')
+    if ($r2.Text -match 'NON_DEFAULT_ENTRY_POINT') { throw "_c_int00 must not be refused: $($r2.Text)" }
+    if ($r2.Text -notmatch 'ENTRY    : _c_int00') { throw "_c_int00 pass should be reported: $($r2.Text)" }
+
+    New-MapFixture 'code_start'
+    $r3 = Invoke-Gate -MapPath (Join-Path $tempRoot 'x.map') -Allow
+    if ($r3.Text -match 'NON_DEFAULT_ENTRY_POINT') { throw '-AllowNonDefaultEntry must bypass the gate' }
+
+    Write-Output 'PASS: entry-point gate refuses code_start (before DSS), passes _c_int00, honours -AllowNonDefaultEntry'
+    Write-Output 'RESULT: OK'
+    exit 0
+}
+catch {
+    Write-Output "FAIL: $($_.Exception.Message)"
+    Write-Output 'RESULT: FAIL'
+    exit 1
+}
+finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

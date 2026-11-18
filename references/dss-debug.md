@@ -26,7 +26,7 @@
 工程 `F28379D_CPU1_BareMetal`（`CPU1_RAM` 配置、21 个源文件、COFF、`ti-cgt-c2000_15.12.1.LTS`）从"从未构建过"到"RAM 运行并被只读验证"一次跑通，命令只有三条：
 
 ```powershell
-pwsh -NoProfile -File <skill>\scripts\ti_c2000_build.ps1   -ProjectPath <工程> -Stage -EntryPoint code_start
+pwsh -NoProfile -File <skill>\scripts\ti_c2000_build.ps1   -ProjectPath <工程>          # 不要传 -EntryPoint
 pwsh -NoProfile -File <skill>\scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -ConfirmLoad
 pwsh -NoProfile -Command "& '<skill>\scripts\ti_c2000_run_read.ps1' -ProjectPath '<工程>' -Variables usMainLoop,EPwm1Regs.TBPRD -Rounds 4 -IntervalMs 400"
 ```
@@ -66,7 +66,7 @@ SERVICE: READY
 - `-1133` 是实时选项（`PoliteRealtimeMode=true` 供运行态读用）被拒绝；`loadti` 从不设这些选项，所以"loadti 能下、自己写的 DSS 下不进"的差异就在这里。**这条错误在本工程里是 skill 自己的连接选项造成的，修好降级逻辑后消失**，不要记成 Flash/硬件状态。
 - `-150` 判据不是"出现位置"而是"影响"：本次 `DSS: connected` **之前**出现 3 次（GEL 试探读），链路建立后**又出现 1 次** `JTAG Communication Error`，两次都没阻止最终 `DSS: loaded`。要做的操作还能成功 → 瞬时 FTDI 噪声；同一操作反复失败 → 才查探针/驱动。
 - `reset()` 报 `-6310`（PRSC 读失败）或 `Target reset failed. Error: -1` 时不要当场放弃：链路还在就 `halt()` 后直接加载；链路已丢（GEL 报 `target is not connected`）则进重连分支（最多 3 次、退避 900/1800/2700 ms）。本次是第 3 次重连后才 `DSS: reset after reconnect (try 3)` → `DSS: loaded`。只有 3 次全失败才是连接故障。
-- 入口点必须是 `code_start`：不加 `-EntryPoint code_start` 时构建只打印 `LINK : .cproject declares ENTRY_POINT=code_start; NOT applied`，`.map` 里是 `ENTRY POINT SYMBOL: "_c_int00"`，`codestart` 的关狗分支被跳过。判据与原因见 [RAM 与链接](ram-and-linker.md)「入口点」小节。
+- **入口点必须是 `_c_int00`，不要传 `-EntryPoint code_start`**（2026-11-18 修正：本条曾写反，害得另一个对话反复下载失败）。不传时构建只打印 `LINK : .cproject declares ENTRY_POINT=code_start; NOT applied`，`.map` 是 `ENTRY POINT SYMBOL: "_c_int00"`，`.out` 592642 B、`.text` 整块 `0x16a8`，能下载；传了会变成 592810 B、按 `0x800` 分片写、`-1041` + `-150`、并把 CPU 推进不可调试状态。`codestart` 的关狗分支由 `InitSysCtrl()` 的 `DisableDog()` 兜底。判据与原因见 [RAM 与链接](ram-and-linker.md)「入口点」小节。
 - 第一次探针检查可能直接 `NO_PROBE`：本次 15:52 报 `PROBE : NOT FOUND` + exit 3，插好后**同一条命令**报 `XDS100 Class Debug Port` / `Auxiliary Port` / `USB Serial Port (COM11)` + `RESULT: OK`。PnP 需要时间，一次 `NO_PROBE` 不构成硬件结论。
 
 ### 实时模式与"下一次下载"的关系（别把它记成"必须人工关掉"）

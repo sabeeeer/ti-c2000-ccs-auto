@@ -50,6 +50,10 @@ param(
     [string]$Ccxml = '',
     [string]$OutFile = '',
     [string]$MapFile = '',
+    # Refuse by default when the map's ENTRY POINT SYMBOL is not _c_int00: measured twice
+    # in this project that a code_start image fails -1041 on the first block and leaves the
+    # core requiring a power cycle. Set this only after verifying the symbol on this board.
+    [switch]$AllowNonDefaultEntry,
     [string]$CcsRoot = '',
     # Which CPU to open. Empty = choose automatically:
     #   single C28xx core      -> that core (all single-core parts)
@@ -410,8 +414,42 @@ if (-not (Test-Path -LiteralPath $MapFile)) {
 if ($MapFile -and [Math]::Abs(((Get-Item -LiteralPath $MapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $OutFile).LastWriteTimeUtc).TotalSeconds) -gt 120) {
     # Reported, not refused. A timestamp gap means the map MAY describe a different build;
     # the readers report it as source metadata and the data judgements still run. Blocking
-    # here only prevented a download that the board was perfectly able to accept.
+    # here only prevented a download the board was perfectly able to accept.
     Out2 'NOTE    : .map and .out timestamps differ by more than two minutes - the map may describe a different build'
+}
+
+# ---- entry-point gate (HARD) -------------------------------------------------
+# Measured twice in this project (2026-11-15 and again 2026-11-18):
+#   * built with the linker default _c_int00  -> a normal 0x16a8 .text write, loads fine
+#   * built with -EntryPoint code_start       -> the first write becomes Length 0x800
+#     (one RAMLS block), fails with -1041 + FTDI -150, and leaves the core in a state
+#     where a further load reports 'Target reset failed. Error: -1' until retried.
+# The 2026-11-18 failure came from SKILL.md itself telling callers to pass
+# -EntryPoint code_start; the other conversation followed it exactly. That doc line was
+# wrong and has been corrected. A warning was not enough protection while the doc said
+# otherwise, so this gate refuses such an image at the entry, before the board is touched.
+# A project that genuinely needs another entry symbol must say so explicitly.
+if ($MapFile -and -not $AllowNonDefaultEntry) {
+    $mapTxt = ''
+    try { $mapTxt = [IO.File]::ReadAllText($MapFile) } catch { }
+    $em = [regex]::Match($mapTxt, 'ENTRY POINT SYMBOL:\s*"([^"]+)"')
+    if ($em.Success) {
+        $entrySym = $em.Groups[1].Value
+        if ($entrySym -ne '_c_int00') {
+            Out2 'FAILURE: NON_DEFAULT_ENTRY_POINT'
+            Out2 'RESULT: FAIL'
+            Out2 ("REASON: the selected .out links with ENTRY POINT SYMBOL '{0}', not _c_int00" -f $entrySym)
+            Out2 ("        map: {0}" -f $MapFile)
+            Out2 'HINT    : rebuild WITHOUT -EntryPoint (build.ps1 already defaults to _c_int00). Measured twice in this'
+            Out2 '          project: a code_start image writes .text in 0x800 pieces, fails -1041 / FTDI -150 on the first'
+            Out2 '          block, and leaves the core needing a power cycle. Pass -AllowNonDefaultEntry only if you have'
+            Out2 '          confirmed this symbol on this board.'
+            exit 4
+        }
+        Info2 ("ENTRY    : {0} (the only symbol verified to load on this board)" -f $entrySym)
+    } else {
+        Out2 'NOTE    : the map has no ENTRY POINT SYMBOL line - entry point could not be checked'
+    }
 }
 
 $ccsPath = ''
@@ -733,6 +771,7 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
                 '-ProjectPath',$ProjectPath,'-Start','-ConfirmLoad','-OutFile',$OutFile,'-Ccxml',$Ccxml,
                 '-RunMode',$RunMode,'-StartTimeoutSec',[string]$StartTimeoutSec)
             if ($MapFile) { $retryArgs += @('-MapFile',$MapFile) }
+            if ($AllowNonDefaultEntry) { $retryArgs += '-AllowNonDefaultEntry' }
             if ($CcsRoot) { $retryArgs += @('-CcsRoot',$CcsRoot) }
             if ($CorePattern) { $retryArgs += @('-CorePattern',$CorePattern) }
             if ($UserApproved) { $retryArgs += '-UserApproved' }
@@ -760,6 +799,7 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
             if ($Ccxml) { $retryArgs += @('-Ccxml', $Ccxml) }
             if ($OutFile) { $retryArgs += @('-OutFile', $OutFile) }
             if ($MapFile) { $retryArgs += @('-MapFile', $MapFile) }
+            if ($AllowNonDefaultEntry) { $retryArgs += '-AllowNonDefaultEntry' }
             if ($CorePattern) { $retryArgs += @('-CorePattern', $CorePattern) }
             if ($UserApproved) { $retryArgs += '-UserApproved' }
             if ($Quiet) { $retryArgs += '-Quiet' }
