@@ -964,5 +964,19 @@ Info2 ('RUN MODE: {0}' -f $(if ($runSpec.continuous) {
         }))
 Info2 ('LOAD    : #{0} (this is download number {0} for this project, previous {1})' -f $rec.count, $rec.previous)
 Info2 ('LOG     : {0}' -f $logFile)
+# 工程改动留痕（工程 AGENTS.md 硬性规则⑤）：每次成功下载写一条，便于回溯"哪个镜像跑出过什么结果"。
+try {
+    $chgLog = Join-Path $ProjectPath 'BUILD_VERIFICATION.txt'
+    if (-not (Test-Path -LiteralPath $chgLog)) {
+        [IO.File]::WriteAllText($chgLog, ("工程改动留痕（BUILD_VERIFICATION.txt）`r`n`r`n只追加，不覆盖。`r`n--------------------------------------------------------------------------------`r`n"), (New-Object Text.UTF8Encoding($false)))
+    }
+    $oLen = if (Test-Path -LiteralPath $OutFile) { (Get-Item -LiteralPath $OutFile).Length } else { 0 }
+    $chgRec = ('  {0} | load | LOAD #{1} OK, {2} | out {3:N0} B sha {4}' -f `
+            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $rec.count, $runSpec.mode, $oLen, $outSha.Substring(0,12))
+    [IO.File]::AppendAllText($chgLog, $chgRec + "`r`n", (New-Object Text.UTF8Encoding($false)))
+    Info2 'CHGLOG  : appended to BUILD_VERIFICATION.txt'
+} catch {
+    Info2 ('NOTE    : BUILD_VERIFICATION.txt append failed: ' + $_.Exception.Message)
+}
 Out2 'RESULT: OK'
 exit 0

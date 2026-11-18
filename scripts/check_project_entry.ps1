@@ -52,6 +52,32 @@ $skillToken = 'ti-c2000-ccs-auto'
 $violations = New-Object System.Collections.Generic.List[string]
 $notes = New-Object System.Collections.Generic.List[string]
 
+# ---------- 0. 工程改动留痕（BUILD_VERIFICATION.txt）--------------------------
+# 工程 AGENTS.md 的硬性规则⑤要求每次改动追加一条，此前完全依赖 AI 自觉。
+# 2026-11-18 实测：同一工程两个会话，一个写了 5 条、另一个 0 条 —— 靠自觉不可靠。
+# 这里改成机械保证：不存在就当场创建（带表头），存在就报告行数与最后写入时间。
+$chgLog = Join-Path $root 'BUILD_VERIFICATION.txt'
+if (-not (Test-Path -LiteralPath $chgLog)) {
+    $head = @(
+        '工程改动留痕（BUILD_VERIFICATION.txt）',
+        '',
+        '规则（工程 AGENTS.md 硬性规则⑤）：每次改代码 / 配置 / 构建参数 / skill 相关设置，',
+        '追加一条：日期 | 改了什么 | 为什么 | 编译或上板结果。只追加，不覆盖。',
+        '',
+        ('首次创建：{0}，由 check_project_entry.ps1 生成' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+        '--------------------------------------------------------------------------------'
+    ) -join "`r`n"
+    try {
+        [IO.File]::WriteAllText($chgLog, $head + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        $notes.Add('created BUILD_VERIFICATION.txt (project change log) - append one entry per change')
+    } catch {
+        $violations.Add(('cannot create BUILD_VERIFICATION.txt: {0}' -f $_.Exception.Message))
+    }
+} else {
+    $nLines = @([IO.File]::ReadAllLines($chgLog)).Count
+    $notes.Add(('BUILD_VERIFICATION.txt: {0} lines, last write {1}' -f $nLines, (Get-Item -LiteralPath $chgLog).LastWriteTime.ToString('MM-dd HH:mm')))
+}
+
 # ---------- 1. copies of skill scripts inside the project ------------------------
 $copies = @(Get-ChildItem -LiteralPath $root -Recurse -File -Include *.ps1, *.js -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -notmatch '\\\.git\\' } |

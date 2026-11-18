@@ -15,6 +15,30 @@ description: 审查、编译和调试 TI C2000 CCS 工程。先选单步/连续�
 
 CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源。改完先运行 `tools/sync_platform_copies.ps1 -DryRun` 检查 `PRUNE` 清单，再同步到 Codex 等平台副本；不要直接编辑平台副本。
 
+## 三个硬性校验点（调用本 skill 时必须逐条做到）
+
+| # | 时机 | 怎么做 | 不做的后果 |
+|---|---|---|---|
+| **① 入口** | 任何操作前 | `check_project_entry.ps1 -ProjectPath <工程>`，认 `RESULT: OK` | 工程里有 skill 脚本副本 / 入口文档缺失 → 实际跑的是副本而不是 skill |
+| **② 运行** | 每次脚本输出 | 必须有 `SKILL   : ti-c2000-ccs-auto@<version>` | **没有这一行 = 这次操作不是 skill 跑的，结果不可信，停下来重做** |
+| **③ 事后** | 收尾 / 怀疑走偏 | `check_project_entry.ps1 -ProjectPath <工程> -MaxRunAgeMinutes 10`，认 `RESULT: OK` | 无法证明最近一次操作来自本 skill |
+
+**三者分别是事前阻断 / 事中自证 / 事后追查**，任一环独立生效：即使跳过了 ①，②③ 也能把"没走 skill"暴露出来。
+
+**第 ① 条顺带保证 `BUILD_VERIFICATION.txt` 存在**（不存在就当场创建，带表头），
+且 **`build.ps1` / `service.ps1` 成功后会各追加一条**（输出里出现 `chglog :` / `CHGLOG  :`）：
+
+```
+2026-11-18 20:35:01 | build | config CPU1_RAM, compile OK, link OK, 0 warning(s), 25 source(s) | out 592,642 B, entry=code_start
+2026-11-18 20:35:33 | load  | LOAD #139 OK, SingleStep | out 592,642 B sha 625DD203DC0A
+```
+
+**工程改动留痕不再依赖 AI 自觉**——2026-11-18 实测过：同一工程两个会话，一个写了 5 条、另一个 0 条。
+
+> **留痕文件位置**：写在 `-ProjectPath` 所指目录下的 `BUILD_VERIFICATION.txt`。
+> 若工程有父目录（例如 `1-1DMA_Ping-Pong\F28379D_CPU1_Template`），父目录可能另有一份历史记录，
+> **以 `-ProjectPath` 下的为准**；要合并就人工合并，脚本不跨目录写。
+
 ## 模式、入口与互锁
 
 **先分清两个正交的维度 —— "读模式"不是一个东西：**

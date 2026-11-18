@@ -746,6 +746,23 @@ if ($ok) {
         Write-Output ("staged    : {0}" -f $stagedOut)
     }
     Write-Output ("log       : {0}" -f $logFile)
+    # 工程改动留痕（工程 AGENTS.md 硬性规则⑤）。成功才写，失败由调用方决定是否记录，
+    # 避免把"编译失败"刷成噪音。文件不存在时先建（check_project_entry.ps1 也会建）。
+    try {
+        $chgLog = Join-Path $ProjectPath 'BUILD_VERIFICATION.txt'
+        if (-not (Test-Path -LiteralPath $chgLog)) {
+            [IO.File]::WriteAllText($chgLog, ("工程改动留痕（BUILD_VERIFICATION.txt）`r`n`r`n只追加，不覆盖。`r`n--------------------------------------------------------------------------------`r`n"), (New-Object Text.UTF8Encoding($false)))
+        }
+        $oe = Join-Path $OutputDir "$projName.out"
+        $oLen = if (Test-Path -LiteralPath $oe) { (Get-Item -LiteralPath $oe).Length } else { 0 }
+        $entryNote = if ($EntryPoint) { "entry=$EntryPoint" } else { 'entry=default' }
+        $rec = ('  {0} | build | config {1}, compile OK, link OK, {2} warning(s), {3} source(s) | out {4:N0} B, {5}' -f `
+                (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $cfgName, $warningCount, $cfiles.Count, $oLen, $entryNote)
+        [IO.File]::AppendAllText($chgLog, $rec + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        Write-Output ("chglog    : appended to BUILD_VERIFICATION.txt")
+    } catch {
+        Write-Output ('NOTE    : BUILD_VERIFICATION.txt append failed: ' + $_.Exception.Message)
+    }
     Write-Output "RESULT: OK"
     exit 0
 } else {
