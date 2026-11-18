@@ -302,6 +302,19 @@ XDS100；XDS200 没有串号工具；`dbgjtag` 只吃 CCS 生成的 `.dat`）。
 
 读后还要查：采样轮次完整，心跳/可选速率、固件身份、数值有限性与指定范围；连续录波数组另查完成标志、复制前后标志和点数是否齐全。疑点应让当次数据和 `result: FAIL` 判据同时交付，清除旧成功结论；不能把“取到数字”写成“数据可靠”。变量轮询不能还原快速波形。详细阈值见[读数判据](references/data-read-verdict.md)。
 
+**CCS Graph（用户自己开 `Tools → Graph` 看波形）**：参数换算见
+[调试经验索引](references/debugging-experience.md) 里的
+`2026-11-18-ccs-graph-acquisition-buffer` 案例（F28379D + CCS 12.8.1 实测，用户问「graph 参数」时以它为例）。
+一句话规则：
+
+```
+CCS 实际读取字数 = Acquisition Buffer Size × Index Increment   ≤  数组字数
+```
+
+结构体数组 `{Uint16 ia; Uint16 dac;}[1000]`（2000 字）对应 **`Acquisition=1000` + `Index=2`**；
+填 2000 就是 4000 字，越界后 CCS 不报错、只画一张空图（X 轴缩到 1e-5）。
+注意这里的 `Acquisition Buffer Size` 是**采样点数**，与 `read_continuous.ps1 -Rows` 的**字数**语义不同，不要互相套用。
+
 **时间门限**由 `references/firmware-contract.json` 维护：下载尝试之间至少 5000 ms；连续数据请求之间至少 400 ms；重连至少留 400 ms 且须再次验证探针可用。编译成功后加载的必须是**选定的那份** `.out`，比源文件旧就拒绝。`readout/load-count.json` 记录成功加载次数；失败或部分写入的 `loadProgram` 尝试还需看 DSS 日志，不能把该计数当成所有物理写入次数。
 
 连续运行的当前实现每轮会显式 `-Stop` 再 `-Start`，因此**仍会在不同下载轮次间重连**。Stop 后先等 Windows 重新枚举；Start 时按所选 `.ccxml` 的历史记录计算 Stop→DSS 接入间隔，首次连接失败且尚未加载时增加 5 秒并用新 DSS 进程重试一次，成功与失败时间供下次二分估计。PnP 不等于驱动可打开，只有 DSS 连接并验证目标才算接入成功。普通连续读保持同一会话。若 Stop 未干净退出或探针未恢复，循环中止；此恢复算法只有离线测试，当前板和探针的实际秒数待上板测定。
