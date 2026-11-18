@@ -22,7 +22,7 @@ function New-MapFixture([string]$entrySymbol) {
         '******************************************************************************'
         '>> Linked Wed Nov 18 17:57:55 2026'
         ''
-        'OUTPUT FILE NAME:   <C:\Temp\x.out>'
+        'OUTPUT FILE NAME:   <x.out>'
         ('ENTRY POINT SYMBOL: "{0}"  address: 00000000' -f $entrySymbol)
         ''
         'MEMORY CONFIGURATION'
