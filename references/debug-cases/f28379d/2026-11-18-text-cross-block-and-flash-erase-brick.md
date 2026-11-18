@@ -151,7 +151,7 @@ CCS GUI：Run → Reset → CPU Reset → Connect Target      ← GUI 有 DSS �
 或      按住 RESET + 连接（注意：复位状态下写 RAM 会报 -1137）
 ```
 
-DSS 的三个入口（`service` / `run_read` / `read_dma`）在这两种情况下都无能为力，
+DSS 的三个入口（`service` / `run_read` / `read_continuous`）在这两种情况下都无能为力，
 `2026-11-14-disconnect-then-read-is-a-bug.md:36` 已经写过："CCS GUI 有对应设置，DSS 脚本层拿不到"。
 
 **3. 先跑 `check_ram_layout.ps1` 再下载。**

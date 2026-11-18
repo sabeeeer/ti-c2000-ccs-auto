@@ -37,7 +37,7 @@ pwsh -NoProfile -File .\scripts\ti_c2000_service.ps1 -ProjectPath "<工程根目
 高速 DMA 数组用（附着同一会话）：
 
 ```powershell
-pwsh -NoProfile -File .\scripts\ti_c2000_read_dma.ps1 -ProjectPath "<工程根目录>" `
+pwsh -NoProfile -File .\scripts\ti_c2000_read_continuous.ps1 -ProjectPath "<工程根目录>" `
   -ArrayName gAdcAllBuf -Rows 16 -Columns 200 -FrozenBufferReady
 ```
 

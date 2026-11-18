@@ -5,7 +5,7 @@ audit_fw_contract.ps1 -- every script must agree with references\firmware-contra
 Why this exists: the firmware symbols this skill knows by name were hard-coded in twelve
 places and had already drifted when this audit was written (2026-11-15):
 
-  * FrozenValue was 'true' in ti_c2000_live_read.ps1 and '1' in ti_c2000_read_dma.ps1;
+  * FrozenValue was 'true' in ti_c2000_live_read.ps1 and '1' in ti_c2000_read_continuous.ps1;
   * the heartbeat candidate list appeared four times in three different sets/orders.
 
 A contract spread over twelve copies is not a contract. This audit makes the file the only
@@ -121,7 +121,7 @@ function Get-ContractProblems {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
         if (-not $ast.ParamBlock) { continue }
 
-        if ($f.Name -in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+        if ($f.Name -in @('ti_c2000_run_read.ps1','ti_c2000_read_continuous.ps1')) {
             $calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] },$true) |
                 ForEach-Object { $_.GetCommandName() })
             foreach ($required in @('Get-SelectedOutFreshEvidence','Initialize-ReadFailureVerdict','Get-RamProofEvidence')) {
@@ -133,7 +133,7 @@ function Get-ContractProblems {
 
         # Runtime literals were missed by the original audit. A duplicated fallback
         # candidate list can drift even when every parameter default agrees.
-        if ($f.Name -in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+        if ($f.Name -in @('ti_c2000_run_read.ps1','ti_c2000_read_continuous.ps1')) {
             $runtime = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayExpressionAst] -or $n -is [System.Management.Automation.Language.ArrayLiteralAst] }, $true) |
                 Where-Object { $_.Extent.Text -match 'gMsTick' -and $_.Extent.Text -match 'usMainLoop' })
             foreach ($node in $runtime) {

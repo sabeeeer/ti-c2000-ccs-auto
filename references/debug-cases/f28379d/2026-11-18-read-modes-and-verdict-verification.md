@@ -8,7 +8,7 @@
 
 ## 为什么要做这一轮
 
-改了 `run_read` / `read_dma` / `LoadRead` 相关文档与代码后，只跑成功路径是不够的：
+改了 `run_read` / `read_continuous` / `LoadRead` 相关文档与代码后，只跑成功路径是不够的：
 **判据如果永远返回 OK，它就等于没有判据。** 所以每个判据都补了负向用例。
 
 ## 正向用例（4 项）
@@ -17,7 +17,7 @@
 |---|---|---|---|
 | 1 | `ReadOnly` 心跳 + 范围（正确区间）| `-Variables gAmpFb -ValueMin 1000 -ValueMax 2200` | `HEARTBEAT: OK (all candidates increased)` / `RANGE: OK` / `RESULT: OK` |
 | 2 | 速率判据 | `-Variables gMsTick -RateVar gMsTick -ExpectedRatePerSec 1000 -RateTolerancePct 30` | `HEARTBEAT: OK` / `RESULT: OK` |
-| 3 | 冻结小数组 200 点 | `read_dma -FrozenBufferReady -ArrayName BuffA -Rows 200 -Columns 1` | `ROWS 200` / `VALUES 200 (requested 200)` / `RESULT: OK` |
+| 3 | 冻结小数组 200 点 | `read_continuous -FrozenBufferReady -ArrayName BuffA -Rows 200 -Columns 1` | `ROWS 200` / `VALUES 200 (requested 200)` / `RESULT: OK` |
 | 4 | 连续录波 5000 点 | 同上 `-Rows 5000` | `ROWS 5000` / `VALUES 5000` / `RESULT: OK` |
 
 200 点 = 20 ms = 一个工频周期（10 kHz 控制），用作「快速验证」；5000 点用于看波形。
@@ -39,7 +39,7 @@
 
 | 用例 | 命令要点 | 实测 |
 |---|---|---|
-| `LoadRead` + `read_dma` | `-Mode LoadRead -ConfirmLoad -CcsRoot F:\ccs -FrozenBufferReady -Rows 200` | `LOAD #138` → `ROWS 200` / `VALUES 200` / `RESULT: OK` |
+| `LoadRead` + `read_continuous` | `-Mode LoadRead -ConfirmLoad -CcsRoot F:\ccs -FrozenBufferReady -Rows 200` | `LOAD #138` → `ROWS 200` / `VALUES 200` / `RESULT: OK` |
 
 这条同时回归了 `Invoke-RetainedLoadRead` 的参数拼接修复（原先 `'-' + $key, $value`
 被求值成单个字符串，`pwsh -File` 收到参数名 `CcsRoot F` → `SERVICE_PROTOCOL`）。

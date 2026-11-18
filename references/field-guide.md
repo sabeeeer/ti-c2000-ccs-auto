@@ -1,4 +1,4 @@
-﻿# 运行模式：工程修改与上板验证
+# 运行模式：工程修改与上板验证
 
 执行顺序：**可行时读现有固件基线 → 分析 → 必要时修改、构建 → 一次加载、运行并在同一 DSS 会话读取验证**。加载前的复位/停核只属于执行模式；程序运行后的读数不得主动停核或再次加载。DSP28335 的 RAM 工程已观察到另起只读读到 Flash 地址，不能用那次读数验收 RAM `.out`。
 
@@ -10,7 +10,7 @@
 pwsh -NoProfile -File "<skill>\scripts\ti_c2000_run_read.ps1" -ProjectPath "<工程>" -Variables "<变量,寄存器>"
 ```
 
-数组用 `ti_c2000_read_dma.ps1 -FrozenBufferReady`（固件冻结缓冲）。周期数据先让固件录入并冻结完整窗口：50 Hz、1 kHz 的 10 周期是 200 帧；JTAG 传输可超过 200 ms，但目标必须继续运行。记录读数、条件和心跳计数；只看 `isHalted()==false` 不足以证明应用持续执行。
+数组用 `ti_c2000_read_continuous.ps1 -FrozenBufferReady`（固件冻结缓冲）。周期数据先让固件录入并冻结完整窗口：50 Hz、1 kHz 的 10 周期是 200 帧；JTAG 传输可超过 200 ms，但目标必须继续运行。记录读数、条件和心跳计数；只看 `isHalted()==false` 不足以证明应用持续执行。
 
 ## 2. 查例程或现成库
 
@@ -47,12 +47,12 @@ pwsh -NoProfile -File "<skill>\scripts\ti_c2000_run_read.ps1" `
   -HeartbeatExpr "<该固件实际递增的计数器>" -Rounds 3
 ```
 
-已有匹配的 `.out` 可省略 `-Build` 并使用现有镜像。读入口默认附着常驻会话，**不再重新加载**；只有会话不在且带了 `-ConfirmLoad` 时才会自启一次，否则 `FAILURE: LOAD_NOT_CONFIRMED`（exit 4）。所以补读同一个变量的不同轮次不需要重新下载，也不该为补读去重启会话。固件已冻结 RAM 数组时，用 `ti_c2000_read_dma.ps1 -FrozenBufferReady` 在同一会话搬运；该缓冲可由 ISR 或 DMA 填充。28335 的 `gAdcAllBuf[16][400]` 应显式传 `-ArrayName gAdcAllBuf -Rows 16 -Columns 400 -FrozenFlag gAdcBufFull -SeqVar '' -HeartbeatExpr gRunMs`，并核对 `.out`、范围和数组布局。`ti_c2000_debug.ps1 -Build` 只构建，`-LoadOnly` 会下载后暂停；`-Run` 只下载运行、退出即复位，**不能用于读取**。读取统一用 `run_read` / `read_dma` 的常驻会话入口。源码或 `.cmd` 修改后必须真实编译链接（并征得用户同意再下载）。每步成功均须 `RESULT: OK` 和退出码 0；输出里的 `LOAD : #N` 要一并记录。
+已有匹配的 `.out` 可省略 `-Build` 并使用现有镜像。读入口默认附着常驻会话，**不再重新加载**；只有会话不在且带了 `-ConfirmLoad` 时才会自启一次，否则 `FAILURE: LOAD_NOT_CONFIRMED`（exit 4）。所以补读同一个变量的不同轮次不需要重新下载，也不该为补读去重启会话。固件已冻结 RAM 数组时，用 `ti_c2000_read_continuous.ps1 -FrozenBufferReady` 在同一会话搬运；该缓冲可由 ISR 或 DMA 填充。28335 的 `gAdcAllBuf[16][400]` 应显式传 `-ArrayName gAdcAllBuf -Rows 16 -Columns 400 -FrozenFlag gAdcBufFull -SeqVar '' -HeartbeatExpr gRunMs`，并核对 `.out`、范围和数组布局。`ti_c2000_debug.ps1 -Build` 只构建，`-LoadOnly` 会下载后暂停；`-Run` 只下载运行、退出即复位，**不能用于读取**。读取统一用 `run_read` / `read_continuous` 的常驻会话入口。源码或 `.cmd` 修改后必须真实编译链接（并征得用户同意再下载）。每步成功均须 `RESULT: OK` 和退出码 0；输出里的 `LOAD : #N` 要一并记录。
 
 28335 的该缓冲已由源码核对为 ISR 录满后冻结时，单会话命令形状如下；执行前仍须确认当前 `.out` 与板卡、负载状态：
 
 ```powershell
-pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_dma.ps1" `
+pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_continuous.ps1" `
   -ProjectPath "<28335 工程>" -FrozenBufferReady `
   -ArrayName gAdcAllBuf -Rows 16 -Columns 400 `
   -FrozenFlag gAdcBufFull -SeqVar '' -HeartbeatExpr gRunMs `
@@ -63,7 +63,7 @@ pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_dma.ps1" `
 
 ## 4. 运行态复读与判定
 
-同一 DSS 会话中 `runAsynch()` 后读取，至少检查一个实际递增的应用计数器；只看 `isHalted()==false` 或单次变量值不够。对照基线与新数据时保持同一器件、输入、采样率、窗口和换算方法。会话结束可能改变某些板上的运行状态，不能把脚本退出后的状态视为已验证。`ti_c2000_debug.ps1` 只做编译/下载/运行，`-ReadVars` 等读数参数已删除，读数走 `ti_c2000_run_read.ps1` 或 `ti_c2000_read_dma.ps1`。
+同一 DSS 会话中 `runAsynch()` 后读取，至少检查一个实际递增的应用计数器；只看 `isHalted()==false` 或单次变量值不够。对照基线与新数据时保持同一器件、输入、采样率、窗口和换算方法。会话结束可能改变某些板上的运行状态，不能把脚本退出后的状态视为已验证。`ti_c2000_debug.ps1` 只做编译/下载/运行，`-ReadVars` 等读数参数已删除，读数走 `ti_c2000_run_read.ps1` 或 `ti_c2000_read_continuous.ps1`。
 
 ## 失败时查哪里
 

@@ -8,7 +8,7 @@
 |---|---|
 | `ti_c2000_service.ps1 -Start -ConfirmLoad [-Build]` | 用户同意后选择精确 `.out`、连接、验证连接、复位或有效链路上 halt 兜底、加载、运行，DSS 常驻。 |
 | `ti_c2000_run_read.ps1 -Mode ReadOnly` | 读慢变量；不编译、不下载、不连接、不 halt。 |
-| `ti_c2000_read_dma.ps1 -Mode ReadOnly -FrozenBufferReady` | 读固件冻结的**连续录波数组**——这是本 skill 唯一的数组读法，见下文「连续录波」。（点数按用途选：200 点约 20 ms，用于快速验证参数；1000~5000 点用于看波形。）DMA 双缓冲与 bank 选择已于 2026-11-18 移除。 |
+| `ti_c2000_read_continuous.ps1 -Mode ReadOnly -FrozenBufferReady` | 读固件冻结的**连续录波数组**——这是本 skill 唯一的数组读法，见下文「连续录波」。（点数按用途选：200 点约 20 ms，用于快速验证参数；1000~5000 点用于看波形。）DMA 双缓冲与 bank 选择已于 2026-11-18 移除。 |
 | 两个读入口的 `-Mode LoadRead -ConfirmLoad` | 必要时停止旧会话，调用常驻服务加载一次，再经相同 ReadOnly 判据读取；读完保留服务。`-Standalone` 仅是此路径的旧别名。 |
 | `ti_c2000_iterate.ps1 -UserApproved -Expect ...` | 只有用户明确要求连续运行才重复构建/加载/读/判据；最多 20 轮，下载间隔至少 5 秒。 |
 | `ti_c2000_service.ps1 -Stop` | 显式结束会话。DSS 需要释放调试状态，可能暂时使探针重新枚举；不是普通读数步骤。 |
@@ -37,7 +37,7 @@
 # 前提：读前 5 条证据 + 读后 1/2/4 级判据（详见 data-read-verdict.md）
 ti_c2000_run_read.ps1 -Variables gMsTick,gAmpFb,gCtrlLogFrozen -Mode ReadOnly   # 要 HEARTBEAT: OK
 # 取数：数组读还要过第 3 级（完成标志、复制前后不变、点数齐全）
-ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
+ti_c2000_read_continuous.ps1 -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
 ```
 
 不先过校验就直接读数组，数字可能来自「早已停机」「上一轮残留数组」「另一份固件」，
@@ -56,7 +56,7 @@ JTAG 读静态数组」，**点数按用途选**（10 kHz 控制下）：
 | **200**（冻结小数组）| **20 ms = 1 个工频周期** | **快速验证**：系统参数是否收敛、关键运行变量是否在预期范围 |
 | 1000~5000（连续录波）| 100~500 ms = 5~25 个工频周期 | **量周期、相位、频率、THD、观察瞬态** |
 
-**同一个 `ti_c2000_read_dma.ps1 -FrozenBufferReady` 入口，只差 `-ArrayName` 和 `-Rows`。**
+**同一个 `ti_c2000_read_continuous.ps1 -FrozenBufferReady` 入口，只差 `-ArrayName` 和 `-Rows`。**
 小数组的意义是"够快就能多验几次"：200 点只要 20 ms 就采满，参数一改就能立刻验证；
 大数组是为了一次看清波形形状。
 

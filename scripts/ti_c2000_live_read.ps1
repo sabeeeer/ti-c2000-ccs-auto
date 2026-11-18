@@ -99,7 +99,7 @@ $owner = Get-TargetLockInfo -ProjectPath $ProjectPath
 if ($ParentPid -le 0 -or -not $owner -or $owner.pid -ne $ParentPid -or $owner.mode -ne 'ReadOnly' -or
     -not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
     Out2 'USAGE: INTERNAL_ONLY'; Out2 'RESULT: FAIL'
-    Out2 'REASON: use ti_c2000_run_read.ps1 or ti_c2000_read_dma.ps1; their preflight owns the ReadOnly lock'
+    Out2 'REASON: use ti_c2000_run_read.ps1 or ti_c2000_read_continuous.ps1; their preflight owns the ReadOnly lock'
     exit 2
 }
 $names = @($Variables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })

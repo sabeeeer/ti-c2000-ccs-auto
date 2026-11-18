@@ -60,7 +60,7 @@ connect → reset/halt（只为下载）→ loadProgram → runAsynch
 入口：
 
 - 低速：`ti_c2000_run_read.ps1`（不需要 DMA）
-- 高速：`ti_c2000_read_dma.ps1 -FrozenBufferReady`（DMA + ping-pong）
+- 高速：`ti_c2000_read_continuous.ps1 -FrozenBufferReady`（DMA + ping-pong）
 
 旧入口 `ti_c2000_read_runtime.ps1`、`ti_c2000_read_array_runtime.ps1`、`ti_c2000_debug.ps1 -ReadOnly` **已从 skill 删除**（曾短期改为禁用并返回 `READONLY_UNRELIABLE`，2026-11-14 直接删除，不再保留空壳）。`ti_c2000_debug.ps1` 只做编译/下载/运行。
 

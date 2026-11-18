@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $scripts = Join-Path $root 'scripts'
 $bad = New-Object System.Collections.Generic.List[string]
-foreach ($name in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+foreach ($name in @('ti_c2000_run_read.ps1','ti_c2000_read_continuous.ps1')) {
     $text = [IO.File]::ReadAllText((Join-Path $scripts $name))
     if ($text -notmatch 'Invoke-RetainedLoadRead' -or $text -notmatch 'ti_c2000_live_read.ps1') {
         $bad.Add("$name does not route LoadRead and ReadOnly through the retained service")

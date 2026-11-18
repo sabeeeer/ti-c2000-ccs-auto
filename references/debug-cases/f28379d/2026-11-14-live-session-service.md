@@ -2,13 +2,13 @@
 
 - 状态：**已上板验证**（一次加载；低速读跨次不归零）
 - 器件/目标核：LAUNCHXL-F28379D，CPU1；XDS100v2 探针，无功率负载
-- 模块：`ti_c2000_service.ps1`（会话服务）、`ti_c2000_live_read.ps1`（附着读）、`ti_c2000_run_read.ps1` / `ti_c2000_read_dma.ps1`（转发入口）
+- 模块：`ti_c2000_service.ps1`（会话服务）、`ti_c2000_live_read.ps1`（附着读）、`ti_c2000_run_read.ps1` / `ti_c2000_read_continuous.ps1`（转发入口）
 
 读数不再每次 `connect → load → run`，改为会话启动时加载一次、之后所有读都附着到同一个会话。
 
 ## 一、为什么要改
 
-前一版的 `ti_c2000_run_read.ps1` / `ti_c2000_read_dma.ps1` 各自在一个进程里完成"加载 → 运行 → 读 → 断开"。每次调用都重新 `loadProgram`，等于**每次读数都把程序重启一遍**：
+前一版的 `ti_c2000_run_read.ps1` / `ti_c2000_read_continuous.ps1` 各自在一个进程里完成"加载 → 运行 → 读 → 断开"。每次调用都重新 `loadProgram`，等于**每次读数都把程序重启一遍**：
 
 - 同一天连续两次读，`gMsTick` 都从很小重新开始，两次数据描述的其实是两次不同的运行；
 - 用户的原话是"不然你搁那疯狂刷新程序，数据肯定不对"；
@@ -21,7 +21,7 @@
 | 执行模式（唯一） | `scripts/ti_c2000_service.ps1` | `-Start`：`connect → reset → loadProgram → runAsynch` 后**保持会话**，轮询请求；`-Status` / `-Stop` |
 | 会话协议客户端 | `scripts/ti_c2000_live_read.ps1` | 写 `cmd.txt`、读 `res.txt`，落 `readout\data\*.csv` 并调用判读 |
 | 低速读入口 | `scripts/ti_c2000_run_read.ps1` | 默认附着会话；会话不在则自动 `-Start` 一次 |
-| 高速读入口 | `scripts/ti_c2000_read_dma.ps1` | 同上，读一个冻结窗口 |
+| 高速读入口 | `scripts/ti_c2000_read_continuous.ps1` | 同上，读一个冻结窗口 |
 | 排障逃生口 | 两个入口的 `-Standalone` | 单进程 load → run → read，会重载程序 |
 
 状态与协议都在 `<project>\readout\.service\`：`state.json`（pid / out / outSha256 / started）、`ready.txt`、`cmd.txt`、`res.txt`、`server.log`。
@@ -54,7 +54,7 @@
 | `live_read.ps1 -Variables gMsTick,EPwm1Regs.TBPRD -Rounds 3` | `26705 → 27114 → 27540`，`RESULT: OK` |
 | 紧接着再读一次 | `44843 → 45256 → 45656`，**没有归零**，pid 未变 —— 证明没有重新加载 |
 | `run_read.ps1`（默认路径） | 附着同一 pid，`55750 → 56142 → 56537`，`RESULT: OK` |
-| `read_dma.ps1 -FrozenBufferReady` | 当时因缺少 `gBufFull` 提前中止；当前版本会尽量交付数组并在判据中标记冻结证据缺失。历史结果不代表当前输出。 |
+| `read_continuous.ps1 -FrozenBufferReady` | 当时因缺少 `gBufFull` 提前中止；当前版本会尽量交付数组并在判据中标记冻结证据缺失。历史结果不代表当前输出。 |
 | `service.ps1 -Stop` → 再 `run_read` | 自动重启新会话（新 pid），读成功 |
 
 `tests/test_single_session_generation.ps1` 增加两条断言：默认路径必须出现 `ti_c2000_live_read.ps1`、必须保留 `-Standalone`；脚本生成路径改用 `-Standalone` 覆盖。6 个测试全 PASS。

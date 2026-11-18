@@ -1,6 +1,6 @@
 #requires -Version 7.0
 <#
-ti_c2000_read_dma.ps1 -- read a firmware-frozen RAM buffer. Two read modes, one
+ti_c2000_read_continuous.ps1 -- read a firmware-frozen RAM buffer. Two read modes, one
 execution mode (ti_c2000_service.ps1 loads once and keeps running).
 
   -Mode ReadOnly (default) : never downloads. Attaches to the live session after
@@ -167,7 +167,7 @@ $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
 
 # stamp the run with this skill's identity (a read cannot damage anything, so a
 # leftover copy is only reported); see ti_c2000_readmode.ps1 Initialize-SkillRun
-Initialize-SkillRun -ProjectPath $ProjectPath -Script 'ti_c2000_read_dma.ps1' -Mode $spec.mode -Block -Quiet:$Quiet
+Initialize-SkillRun -ProjectPath $ProjectPath -Script 'ti_c2000_read_continuous.ps1' -Mode $spec.mode -Block -Quiet:$Quiet
 
 # a continuous run owns the target while it lasts (see ti_c2000_readmode.ps1)
 Assert-RunModeInterlock -ProjectPath $ProjectPath -ReadMode $spec.mode

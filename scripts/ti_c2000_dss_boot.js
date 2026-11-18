@@ -2,7 +2,7 @@
 // ti_c2000_dss_boot.js -- the connect / reset / load / run sequence, in ONE place.
 //
 // This file is injected into the DSS scripts of ti_c2000_service.ps1,
-// ti_c2000_run_read.ps1 and ti_c2000_read_dma.ps1. It exists because that sequence used
+// ti_c2000_run_read.ps1 and ti_c2000_read_continuous.ps1. It exists because that sequence used
 // to be copy-pasted three times, and a fix applied to one copy never reached the others:
 // on 2026-11-15 the service learned to verify connect() and to stop on Error -1138, while
 // both one-shot readers kept the old, broken sequence.

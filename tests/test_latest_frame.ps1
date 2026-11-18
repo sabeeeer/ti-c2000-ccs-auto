@@ -71,7 +71,7 @@ while ($true) {
     while (-not (Test-Path $ready) -and $waited -lt 8000) { Start-Sleep -Milliseconds 100; $waited += 100 }
     if (-not (Test-Path $ready)) { throw 'mock DSS service did not start' }
     Start-Sleep -Milliseconds 300
-    $args = @('-NoProfile','-File',(Join-Path $scripts 'ti_c2000_read_dma.ps1'),'-ProjectPath',$project,
+    $args = @('-NoProfile','-File',(Join-Path $scripts 'ti_c2000_read_continuous.ps1'),'-ProjectPath',$project,
         '-Mode','ReadOnly','-LatestFrame','-SeqVar','gDmaSeq','-BankVar','gDmaBank',
         '-Bank0Array','buffer0','-Bank1Array','buffer1','-Rows','1','-Columns','3','-LatestFrameTries','3','-CycleSamples','2')
     $result = @(& pwsh @args 2>&1)

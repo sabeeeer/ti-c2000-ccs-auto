@@ -3,7 +3,7 @@
   "about": [
     "The variables this skill expects the FIRMWARE to declare. One file, because these names used",
     "to be hard-coded in twelve places and had already drifted: FrozenValue was 'true' in",
-    "live_read and '1' in read_dma, and the heartbeat candidates differed in set AND order",
+    "live_read and '1' in read_continuous, and the heartbeat candidates differed in set AND order",
     "across four files. tools/audit_fw_contract.ps1 fails the build when any script disagrees",
     "with this file, so the drift cannot come back.",
     "",

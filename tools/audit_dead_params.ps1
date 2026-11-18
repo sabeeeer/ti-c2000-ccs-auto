@@ -5,7 +5,7 @@ audit_dead_params.ps1 -- find parameters declared in param() but never read in t
 Why this exists: a parameter that nothing reads is worse than a missing one. It appears in
 --help and in the documentation, so a caller believes it changes behaviour; the run then
 succeeds while ignoring the request. Measured 2026-11-15: -MapFile existed on run_read and
-read_dma but was never forwarded, so "pass -MapFile to name the map yourself" was advice the
+read_continuous but was never forwarded, so "pass -MapFile to name the map yourself" was advice the
 code could not follow.
 
 Exit 0 when every declared parameter is used somewhere in its own script.

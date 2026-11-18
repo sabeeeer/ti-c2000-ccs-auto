@@ -1,4 +1,4 @@
-﻿# CCS 下载与 DSS 运行态读取
+# CCS 下载与 DSS 运行态读取
 
 ## 所有器件的操作前提：会话边界
 
@@ -6,7 +6,7 @@
 
 本 skill 已不再提供任何“独立只读”入口：`connect → 只读符号 → 取数` 这条路径无法证明它看到的是刚刚下载的 RAM 固件（断开后目标可能复位跑 Flash，例如 F28379D 上 `gMsTick 527→0`、`isHalted=true`；DSP28335 上 PC 落在 Flash）。**不能默认 `disconnect()` 后目标继续运行**：如任务要求程序在脚本退出后继续控制输出，应先在该器件、探针、CCS 组合验证断开行为，或保持同一调试会话；当前自动脚本退出时会断开。用户报告 CCS GUI 存在“断开不复位”设置；在本机 CCS 12.8 DSS 中尝试 `HaltOnDisconnect`、`ResetOnDisconnect`、`AutoResetOnDisconnect` 均返回 `Option not found`，目前没有找到脚本层等效控制。以上是跨器件的保守工作规则，**不是**“DSS 对所有 DSP 必然复位”或“最后必须 halt”的已证实 API 性质。TI 的 [CCS 12.8 实时模式说明](https://software-dl.ti.com/ccs/esd/documents/users_guide_12.8.0/ccs_debug-main.html)明确允许运行时访问；[DSS Target API](https://software-dl.ti.com/ccs/esd/documents/scripting_api/ccs_12.8.0/dss/docs/DS_API/com/ti/debug/engine/scripting/Target.html)分别定义 `disconnect()`、`reset()` 和 `halt()`。现场断开结果按器件逐项归档。
 
-执行模式验证新 RAM 固件时，优先用 `ti_c2000_run_read.ps1` 在同一 DSS 会话内加载、运行、读取；固件已有冻结 DMA 缓冲时用 `ti_c2000_read_dma.ps1`。`ti_c2000_debug.ps1 -Run` 用 `loadti -r -a` 下载并退出会话，**不适合直接作为 DSP28335 新 RAM 固件的读数验收路径**（它不读值，读值只在上面两个单会话入口里发生）。
+执行模式验证新 RAM 固件时，优先用 `ti_c2000_run_read.ps1` 在同一 DSS 会话内加载、运行、读取；固件已有冻结 DMA 缓冲时用 `ti_c2000_read_continuous.ps1`。`ti_c2000_debug.ps1 -Run` 用 `loadti -r -a` 下载并退出会话，**不适合直接作为 DSP28335 新 RAM 固件的读数验收路径**（它不读值，读值只在上面两个单会话入口里发生）。
 
 ## 下载/运行边界
 
@@ -106,7 +106,7 @@ pwsh -NoProfile -File "<skill>\scripts\ti_c2000_run_read.ps1" `
   -Variables "<变量,寄存器>" -Rounds 10 -IntervalMs 500
 
 # 高速：固件先冻结 DMA 缓冲，再在一个会话里批量搬出
-pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_dma.ps1" `
+pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_continuous.ps1" `
   -ProjectPath "<工程>" -Ccxml "<当前目标配置.ccxml>" `
   -FrozenBufferReady -ArrayName "<数组>" -Rows <行> -Columns <列>
 ```
@@ -115,7 +115,7 @@ pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_dma.ps1" `
 
 就绪条件不要用“等一会儿再读”的旧写法（`-WaitFor` 已删除）。要证明初始化到某个阶段，就在固件里埋一个阶段变量并让读数的心跳/启动窗口判据覆盖它；宽松的 `.bss != 0` 可能只是 RAM 残值。目标显示 running 也不是应用心跳证明，须跨轮核对单调计数器递增。
 
-大数组走 `ti_c2000_read_dma.ps1`（固件先冻结缓冲或提供版本号）。裸 `connect → halt → readData → runAsynch` 已造成程序中断和继电器释放；[读取事故案例](debug-cases/dsp28335/2026-11-07-read-halt-bulk-array.md)保留原因与证据边界。`readData` 的页、字地址、宽度和数值范围须与表达式读数交叉验证，不因速度快就默认可信。
+大数组走 `ti_c2000_read_continuous.ps1`（固件先冻结缓冲或提供版本号）。裸 `connect → halt → readData → runAsynch` 已造成程序中断和继电器释放；[读取事故案例](debug-cases/dsp28335/2026-11-07-read-halt-bulk-array.md)保留原因与证据边界。`readData` 的页、字地址、宽度和数值范围须与表达式读数交叉验证，不因速度快就默认可信。
 
 ## 必要的 DSS API 备忘
 

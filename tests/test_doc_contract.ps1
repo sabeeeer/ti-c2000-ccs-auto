@@ -80,7 +80,7 @@ foreach ($d in $docs) {
 
 # ---------- 4. SKILL.md must name every entry point an AI is expected to use --
 $skillMd = [IO.File]::ReadAllText((Join-Path $root 'SKILL.md'))
-foreach ($n in @('ti_c2000_service.ps1', 'ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1',
+foreach ($n in @('ti_c2000_service.ps1', 'ti_c2000_run_read.ps1', 'ti_c2000_read_continuous.ps1',
     'ti_c2000_iterate.ps1', 'ti_c2000_readmode.ps1', 'ti_c2000_loadcount.ps1',
     'ti_c2000_check_read.ps1', 'ti_c2000_debug.ps1', 'ti_c2000_build.ps1',
     'check_project_entry.ps1', 'sync_platform_copies.ps1')) {

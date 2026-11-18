@@ -4,7 +4,7 @@
 #   Execution workflow only: build / load / run with TI C2000 in CCS.
 #   There is deliberately no read mode here. A separately started read
 #   session cannot prove it is looking at the RAM image this script just
-#   loaded; reading belongs to ti_c2000_run_read.ps1 / ti_c2000_read_dma.ps1,
+#   loaded; reading belongs to ti_c2000_run_read.ps1 / ti_c2000_read_continuous.ps1,
 #   which keep one DSS session from load to read.
 #
 #   - auto-detects the CCS installation (registry / C:\ti / %USERPROFILE%\ti)
@@ -53,7 +53,7 @@ Out2 ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
 if ($args.Count -gt 0) {
     Out2 'USAGE: UNKNOWN_ARGUMENT'
     Out2 'RESULT: FAIL'
-    Out2 ('REASON: unrecognized argument(s): ' + ($args -join ' ') + ' - the read-only switches were removed; read with ti_c2000_run_read.ps1 or ti_c2000_read_dma.ps1')
+    Out2 ('REASON: unrecognized argument(s): ' + ($args -join ' ') + ' - the read-only switches were removed; read with ti_c2000_run_read.ps1 or ti_c2000_read_continuous.ps1')
     exit 2
 }
 # Reject incompatible arguments before a background process, build or loader

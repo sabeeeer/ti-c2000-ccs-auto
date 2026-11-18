@@ -39,7 +39,7 @@ foreach ($e in $entries) {
     # exactly one concrete loadProgram call site per generated script: inside the shared file
     if ($t -match 'session\.memory\.loadProgram') { $problems.Add("$e calls session.memory.loadProgram directly - that belongs in dssLoadWithRetry") }
 }
-foreach ($reader in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
+foreach ($reader in @('ti_c2000_run_read.ps1','ti_c2000_read_continuous.ps1')) {
     $t = [IO.File]::ReadAllText((Join-Path $scripts $reader))
     if ($t -notmatch 'Invoke-RetainedLoadRead' -or $t -match 'dssLoadWithRetry|dssShutdown|session\.target\.halt\(') {
         $problems.Add("$reader must load through the retained service and never shut down DSS after reading")
@@ -88,7 +88,7 @@ if (Test-Path -LiteralPath $audit) {
 }
 
 # 5. a parameter nothing reads is a documented promise the code cannot keep. -FrozenValue
-# was declared on live_read, documented, forwarded by read_dma, and never used, so the DMA
+# was declared on live_read, documented, forwarded by read_continuous, and never used, so the DMA
 # freezing criterion only ever checked "the flag did not change" - which an always-0 flag
 # satisfies while the buffer is still being written.
 $deadAudit = Join-Path $root 'tools\audit_dead_params.ps1'

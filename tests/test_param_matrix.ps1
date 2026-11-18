@@ -73,8 +73,8 @@ try {
     Case 'read: readonly no session' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick') 4 'FAILURE: NO_SESSION'
     Case 'read: readonly bypass refused' @('-NoProfile', '-File', $rd, '-ProjectPath', $proj, '-Variables', 'gMsTick', '-NoProbeCheck') 2 'USAGE: READ_PROOF_BYPASS'
 
-    # ---------------- ti_c2000_read_dma.ps1 -------------------------------------
-    $dma = Join-Path $sc 'ti_c2000_read_dma.ps1'
+    # ---------------- ti_c2000_read_continuous.ps1 -------------------------------------
+    $dma = Join-Path $sc 'ti_c2000_read_continuous.ps1'
     Case 'dma: zero rows' @('-NoProfile', '-File', $dma, '-ProjectPath', $proj, '-ArrayName', 'gBuf', '-FrozenBufferReady', '-Rows', '0') 2 'USAGE: BAD_DIMENSIONS'
     Case 'dma: too large' @('-NoProfile', '-File', $dma, '-ProjectPath', $proj, '-ArrayName', 'gBuf', '-FrozenBufferReady', '-Rows', '1000', '-Columns', '1000') 2 'USAGE: ARRAY_TOO_LARGE'
     Case 'dma: inverted range' @('-NoProfile', '-File', $dma, '-ProjectPath', $proj, '-ArrayName', 'gBuf', '-FrozenBufferReady', '-ValueMin', '10', '-ValueMax', '1') 2 'USAGE: BAD_VALUE_RANGE'

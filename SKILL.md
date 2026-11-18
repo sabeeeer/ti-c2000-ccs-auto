@@ -91,7 +91,7 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 
 | 点数 | 入口 | 用途 | 时长（10 kHz 控制）|
 |---|---|---|---|
-| **200** | `ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName <小数组> -Rows 200` | **快速验证**：参数是否收敛、运行变量是否在预期范围 | **20 ms = 1 个工频周期**（改完参数立刻能验）|
+| **200** | `ti_c2000_read_continuous.ps1 -FrozenBufferReady -ArrayName <小数组> -Rows 200` | **快速验证**：参数是否收敛、运行变量是否在预期范围 | **20 ms = 1 个工频周期**（改完参数立刻能验）|
 | **1000~5000** | 同上，`-Rows <点数>` | **取波形**：周期、相位、频率、THD、看瞬态 | 100~500 ms = 5~25 个周期（不超单个 RAMGS 块）|
 
 **机制始终是「ISR 采满 → 置冻结标志 → ISR 停止写入 → JTAG 读静态数组」，只差点数。**
@@ -122,7 +122,7 @@ ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,gAmpFb,gCtrlLogFr
 #       正例：-Variables gAmpFb -ValueMin 1000 -ValueMax 2200 → RANGE: OK
 
 # 第 2 步：取数（只有冻结数组可信）
-ti_c2000_read_dma.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
+ti_c2000_read_continuous.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
 #   数组读要过四级判据的第 3 级：完成标志等于指定值（默认 1）、
 #   复制前后标志及序号不变、返回点数 = Rows×Columns、首元素 evaluate 与 readData 一致
 ```
@@ -138,15 +138,15 @@ ti_c2000_read_dma.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName <数�
 **`LoadRead` ≠ 连续录波。**
 `LoadRead` 只是"本次允许下载一次、然后读"，属于**交易模式**；
 连续录波（含 200 点小数组）是**数据读法**，与它正交：
-`-Mode LoadRead` 下载完可以接着读冻结数组；服务已由别人启动时，也可以只 `read_dma` 不下载。
+`-Mode LoadRead` 下载完可以接着读冻结数组；服务已由别人启动时，也可以只 `read_continuous` 不下载。
 
-**以下表格里 `ReadOnly`/`LoadRead` 指交易模式，`run_read` 指数据可靠性校验（读慢变量 + 出判据），`read_dma` 指连续录波取数。**
+**以下表格里 `ReadOnly`/`LoadRead` 指交易模式，`run_read` 指数据可靠性校验（读慢变量 + 出判据），`read_continuous` 指连续录波取数。**
 
 | 维度 | 入口与行为 |
 |---|---|
 | 单步运行（默认） | `scripts/ti_c2000_service.ps1 -Start -ConfirmLoad [-Build] [-CorePattern <核名匹配式>]`：获准后构建、选定 `.out`、加载一次、运行并保留 DSS 会话。自动选择唯一 C28xx 核；多个 C28xx 核时默认 CPU1 并记录实际核名，选其他核才传 `-CorePattern`。只有列表确实无法确定核时才报参数错误。`-Status` 只报告；`-Stop` 会结束会话，可能使探针重新枚举，只在明确结束/更换镜像时使用。 |
 | 连续运行（用户点名才启用） | `scripts/ti_c2000_iterate.ps1 -UserApproved -Expect ...`：最多 20 轮；每轮构建、加载、运行、读、判据。相邻下载尝试至少隔 5 秒；连接重试和探针恢复应留间隔。运行期间其他读/加载/Stop 由锁拒绝。 |
-| `ReadOnly`（默认读） | `scripts/ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables ...` 读慢变量；`scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName ...` 读**连续录波冻结的数组**——这是唯一把波形取出来的方式。零构建、零加载、零重连、零因读而 `halt`；附着现有服务，在程序运行时读取。连续录波的原理、参数询问、RAM 算法与导出规范见[读模式](references/single-session-read.md)。 |
+| `ReadOnly`（默认读） | `scripts/ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables ...` 读慢变量；`scripts/ti_c2000_read_continuous.ps1 -FrozenBufferReady -ArrayName ...` 读**连续录波冻结的数组**——这是唯一把波形取出来的方式。零构建、零加载、零重连、零因读而 `halt`；附着现有服务，在程序运行时读取。连续录波的原理、参数询问、RAM 算法与导出规范见[读模式](references/single-session-read.md)。 |
 | `LoadRead`（本次获准加载后读） | 同一公开读入口加 `-Mode LoadRead -ConfirmLoad [-Build]`。若旧会话存在，先明确停止；服务加载新镜像并**留在该会话**，再调用正常 `ReadOnly` 判据；读完不 `halt`/断开。`-Standalone` 是同一路径的旧别名。`-MaxLoads/-Expect` 的循环每轮仍受 5 秒门限。`-CcsRoot` 可用（2026-11-18 修复 `Invoke-RetainedLoadRead` 的数组拼接 bug：原先开关与取值被并成一个字符串 → `FAILURE: SERVICE_PROTOCOL`；修后实测 `LOAD #135` + `HEARTBEAT: OK`）。 |
 | Error（离线） | 一出现 `USAGE:` 或 `FAILURE:`，**先查** `scripts/ti_c2000_error.ps1 -Code <错误码>` 或 `-LogPath <日志>`，再读[错误索引](references/error-index.json)。输出 `CATEGORY`：parameter、validation、data_verdict、download_probe。查询不连接、不构建、不复位、不下载；新故障经实测复盘后录入第三类。 |
 
@@ -214,11 +214,11 @@ pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start 
 
 # 3) 只读验活（零下载）
 pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,usMainLoop -Mode ReadOnly
-pwsh -NoProfile -File scripts\ti_c2000_read_dma.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName BuffA -Rows 5000 -Mode ReadOnly
+pwsh -NoProfile -File scripts\ti_c2000_read_continuous.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName BuffA -Rows 5000 -Mode ReadOnly
 ```
 
 实测成功记录：**LOAD #103/#104/#105 连续三次 `RESULT: OK`**，`gFwId=65537`，`gMsTick` 跨轮递增，
-`read_dma BuffA` 5000 点全量返回。四个必须同时满足的指纹：
+`read_continuous BuffA` 5000 点全量返回。四个必须同时满足的指纹：
 
 | 项 | 正确值 | 错了会怎样 |
 |---|---|---|

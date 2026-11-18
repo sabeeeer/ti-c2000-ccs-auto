@@ -1,4 +1,4 @@
-﻿# TI C2000 / CCS 自动化技能
+# TI C2000 / CCS 自动化技能
 
 处理 DSP28335、F28379D 等 C2000 工程。入口是[SKILL.md](SKILL.md)：**两种运行模式（默认单步、可选连续）+ 常驻会话附着读取**共用**器件与 CCS 工程、TI 算法库、调试经验**三类资料。新器件、库和故障按对应类别增补，现有 28335/28379D 资料保留。
 
@@ -6,7 +6,7 @@
 |---|---|---|
 | **单步运行（默认）** | **加载一次**，目标一直跑，会话不退出；下载前必须先问用户，同意后才加 `-ConfirmLoad` | `scripts/ti_c2000_service.ps1 -Start -ConfirmLoad` |
 | **连续运行（显式）** | 反复「构建下载 → 读 → 判据」直到数据对，最多 `-MaxLoads` 次；必须 `-UserApproved` | `scripts/ti_c2000_iterate.ps1` |
-| **读：`ReadOnly`（默认）** | 附着常驻会话，**零下载**；先证明探针在线 + 会话活着 + sha256 一致 + 入口符号 `main` 在 RAM（证明不了即拒绝，`-AllowUnverified` 才放行） | `scripts/ti_c2000_run_read.ps1` / `ti_c2000_read_dma.ps1` |
+| **读：`ReadOnly`（默认）** | 附着常驻会话，**零下载**；先证明探针在线 + 会话活着 + sha256 一致 + 入口符号 `main` 在 RAM（证明不了即拒绝，`-AllowUnverified` 才放行） | `scripts/ti_c2000_run_read.ps1` / `ti_c2000_read_continuous.ps1` |
 | **读：`LoadRead`（显式）** | 本次读从一个新镜像开始：下载一次再读，需 `-ConfirmLoad` | 同上，加 `-Mode LoadRead` |
 | 执行手册 | 运行态读基线、分析、按需修改并构建下载运行、运行态复读验证 | [执行手册](references/field-guide.md) |
 
@@ -30,7 +30,7 @@ pwsh -NoProfile -File "<skill>\scripts\ti_c2000_run_read.ps1" -ProjectPath "<工
   -Mode LoadRead -ConfirmLoad -Variables "gMsTick,usMainLoop"
 
 # 3) 高速 DMA 读：固件已配 ADC+DMA 并冻结缓冲，附着同一个会话
-pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_dma.ps1" -ProjectPath "<工程>" `
+pwsh -NoProfile -File "<skill>\scripts\ti_c2000_read_continuous.ps1" -ProjectPath "<工程>" `
   -ArrayName gAdcAllBuf -Rows 16 -Columns 200 -FrozenFlag gAdcBufFull -FrozenBufferReady
 
 # 4) 连续运行模式：反复构建下载直到数据满足判据（仅在用户明确要求时）

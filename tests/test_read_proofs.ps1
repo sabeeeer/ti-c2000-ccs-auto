@@ -25,7 +25,7 @@ New-Item -ItemType Directory -Force -Path $scripts, $project, $empty, (Join-Path
 [IO.File]::WriteAllText((Join-Path $project 'targetConfigs/x.ccxml'), '<configurations/>', (New-Object Text.UTF8Encoding($false)))
 
 try {
-    foreach ($n in @('ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1', 'ti_c2000_readmode.ps1', 'ti_c2000_probe.ps1', 'ti_c2000_loadcount.ps1')) {
+    foreach ($n in @('ti_c2000_run_read.ps1', 'ti_c2000_read_continuous.ps1', 'ti_c2000_readmode.ps1', 'ti_c2000_probe.ps1', 'ti_c2000_loadcount.ps1')) {
         Copy-Item -LiteralPath (Join-Path $root "scripts/$n") -Destination $scripts
     }
     Copy-Item -LiteralPath (Join-Path $root 'scripts/ti_c2000_fwcontract.ps1') -Destination $scripts
@@ -38,7 +38,7 @@ try {
         '-ProjectPath', $project, '-Variables', 'gMsTick', '-Mode', 'LoadRead', '-ConfirmLoad', '-AllowUnverified')
     Expect 'LoadRead+AllowUnverified' $r 2 'USAGE: MUTUALLY_EXCLUSIVE'
 
-    $r = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_read_dma.ps1'),
+    $r = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_read_continuous.ps1'),
         '-ProjectPath', $project, '-ArrayName', 'gBuf', '-FrozenBufferReady', '-Mode', 'LoadRead', '-ConfirmLoad', '-NoProbeCheck')
     Expect 'LoadRead+NoProbeCheck' $r 2 'USAGE: MUTUALLY_EXCLUSIVE'
 

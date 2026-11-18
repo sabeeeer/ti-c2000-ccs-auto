@@ -113,8 +113,8 @@ pwsh -NoProfile -File tools/audit_build_options.ps1 -ProjectPath <工程>
 
 | # | 问题 | 危害 | 修法 |
 |---|---|---|---|
-| 1 | `ti_c2000_read_dma.ps1` 的 JS 用了 `WARMUP`，模板里从未定义 | **必然失败**：Rhino 抛 `ReferenceError`，一个字节都没读就崩 | 改成字面量 300，并删掉重复的 isHalted 检查 |
-| 2 | `live_read` 的 `-FrozenValue` 声明、文档、且被 `read_dma` 转发，但**从未被读** | DMA 冻结判据只查"拷贝期间不变"；标志恒为 0（还在写）时也通过，读到的可能是撕裂数据 | 加 `Test-FlagEquals`（true/1 归一），要求等于期望值 |
+| 1 | `ti_c2000_read_continuous.ps1` 的 JS 用了 `WARMUP`，模板里从未定义 | **必然失败**：Rhino 抛 `ReferenceError`，一个字节都没读就崩 | 改成字面量 300，并删掉重复的 isHalted 检查 |
+| 2 | `live_read` 的 `-FrozenValue` 声明、文档、且被 `read_continuous` 转发，但**从未被读** | DMA 冻结判据只查"拷贝期间不变"；标志恒为 0（还在写）时也通过，读到的可能是撕裂数据 | 加 `Test-FlagEquals`（true/1 归一），要求等于期望值 |
 | 3 | `readmode.Get-SessionExpressions` 的 cmd/res 交换未原子化 | 与 `live_read.Send-Request` 同一类竞态：清场失败时返回**上一轮的响应** | 清场重试 10 次 + 临时文件 rename |
 | 4 | `dssShutdown` 定义后从未被调用 | 三处各写一份关闭序列（halt/等待/断开/终止），顺序不一致 | 三处统一调用 |
 | 5 | `-MapFile` 未传给 `Get-RunLocation` | 文档说"可以自己指定 map"，实际无效 | 透传 |
@@ -154,8 +154,8 @@ exit=3
 
 | 项 | 为什么要测 |
 |---|---|
-| `read_dma -Mode LoadRead -ConfirmLoad` | `WARMUP` 修复所在的路径；静态审计只能说"没有未定义常量"，能否真的跑起来必须上机 |
-| `read_dma -Mode ReadOnly -FrozenBufferReady` | `-FrozenValue` 现在会比对期望值，需要确认正常冻结时不会被误拒 |
+| `read_continuous -Mode LoadRead -ConfirmLoad` | `WARMUP` 修复所在的路径；静态审计只能说"没有未定义常量"，能否真的跑起来必须上机 |
+| `read_continuous -Mode ReadOnly -FrozenBufferReady` | `-FrozenValue` 现在会比对期望值，需要确认正常冻结时不会被误拒 |
 |---|---|
 | `runAsynch()` 后 300 ms 检查是否足够 | 现有值是经验值；若某个工程初始化 >300 ms，`isHalted()` 可能读到假"在跑" |
 | `halt` 后 `isHalted()` 是否立即为真 | 决定 `-Stop` 的 150 ms 等待是否够 |

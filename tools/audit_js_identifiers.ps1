@@ -4,7 +4,7 @@ audit_js_identifiers.ps1 -- find ALL_CAPS identifiers used in a DSS template but
 defined in it.
 
 Why this exists: a DSS template is JavaScript embedded in a PowerShell here-string. A typo
-or a leftover reference (WARMUP, used by ti_c2000_read_dma.ps1 after the boot sequence moved
+or a leftover reference (WARMUP, used by ti_c2000_read_continuous.ps1 after the boot sequence moved
 to ti_c2000_dss_boot.js) compiles silently in PowerShell and only fails inside Rhino, on the
 board, before a single byte is read. That is the most expensive class of bug in this skill.
 

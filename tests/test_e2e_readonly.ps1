@@ -80,7 +80,7 @@ try {
     $null = Run 'all variables missing -> fail' ($common + @('-File', (Join-Path $sc 'ti_c2000_run_read.ps1'), '-ProjectPath', $ProjectPath, '-Variables', 'gNoSuchVar', '-Mode', 'ReadOnly', '-Rounds', '2', '-IntervalMs', '100')) 1 'FAILURE:'
     $null = Run 'illegal mode -> INVALID_READ_MODE' ($common + @('-File', (Join-Path $sc 'ti_c2000_run_read.ps1'), '-ProjectPath', $ProjectPath, '-Variables', 'gMsTick', '-Mode', 'Foo')) 2 'USAGE: INVALID_READ_MODE'
     $null = Run 'readonly + -ConfirmLoad -> refuse' ($common + @('-File', (Join-Path $sc 'ti_c2000_run_read.ps1'), '-ProjectPath', $ProjectPath, '-Variables', 'gMsTick', '-ConfirmLoad')) 2 'USAGE: MUTUALLY_EXCLUSIVE'
-    $null = Run 'dma without frozen promise' ($common + @('-File', (Join-Path $sc 'ti_c2000_read_dma.ps1'), '-ProjectPath', $ProjectPath, '-ArrayName', 'gBuf')) 2 'USAGE: BUFFER_NOT_CONFIRMED'
+    $null = Run 'dma without frozen promise' ($common + @('-File', (Join-Path $sc 'ti_c2000_read_continuous.ps1'), '-ProjectPath', $ProjectPath, '-ArrayName', 'gBuf')) 2 'USAGE: BUFFER_NOT_CONFIRMED'
     $null = Run 'entry check' ($common + @('-File', (Join-Path $sc 'check_project_entry.ps1'), '-ProjectPath', $ProjectPath)) 0 'RESULT: OK'
     $null = Run 'entry check with a recent run' ($common + @('-File', (Join-Path $sc 'check_project_entry.ps1'), '-ProjectPath', $ProjectPath, '-MaxRunAgeMinutes', '10')) 0 'RESULT: OK'
 

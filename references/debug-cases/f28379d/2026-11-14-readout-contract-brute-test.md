@@ -2,10 +2,10 @@
 
 - 状态：**已回归**（上板 20+ 用例；旧只读入口当日删除）
 - 器件/目标核：LAUNCHXL-F28379D，CPU1；XDS110 探针，无功率负载
-- 模块：`ti_c2000_run_read.ps1`、`ti_c2000_read_dma.ps1`、`ti_c2000_debug.ps1`、`check_read.ps1` 的输出契约
+- 模块：`ti_c2000_run_read.ps1`、`ti_c2000_read_continuous.ps1`、`ti_c2000_debug.ps1`、`check_read.ps1` 的输出契约
 
 板卡：LAUNCHXL-F28379D（XDS110，工程 `F28379D_CPU1_Template`，链接 `2837xD_RAM_lnk_cpu1.cmd`）。
-入口：`scripts/ti_c2000_run_read.ps1`（低速连续读）、`scripts/ti_c2000_read_dma.ps1`（冻结缓冲读）。
+入口：`scripts/ti_c2000_run_read.ps1`（低速连续读）、`scripts/ti_c2000_read_continuous.ps1`（冻结缓冲读）。
 目的：验证"仿真器全程在线、单会话运行态读 RAM"在真实板上不再出现前面的误判，同时把输出契约钉死。
 
 ## 一、测试矩阵（真实运行，全部通过）
@@ -52,6 +52,6 @@
 
 ## 四、仍然存在的限制（不许含糊）
 
-- `ti_c2000_read_dma.ps1` 一次调用只读**一个冻结窗口**。本工程没有 ADC+DMA 固件（`User/` 下没有缓冲数组），因此 DMA 成功路径（真实搬数据、范围判据）**未在本板上验证**，只验证了全部拒绝路径。
+- `ti_c2000_read_continuous.ps1` 一次调用只读**一个冻结窗口**。本工程没有 ADC+DMA 固件（`User/` 下没有缓冲数组），因此 DMA 成功路径（真实搬数据、范围判据）**未在本板上验证**，只验证了全部拒绝路径。
 - `-Rounds × -IntervalMs` 是主机侧名义时长，单轮开销约几十毫秒（心跳读 + 时间戳），实际间隔略大于设定值；不要把 `hostMs` 当精确采样周期。
 - 连接首轮仍可能遇到 `reset failed ... fallback halt`（XDS110 在目标运行态被接管时的常见表现），脚本按"仅 halt + load"继续，属于预期路径，不是失败。

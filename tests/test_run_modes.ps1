@@ -39,7 +39,7 @@ function Write-Marker([int]$holderPid) {
 New-Item -ItemType Directory -Force -Path $scripts, $project, (Join-Path $project 'targetConfigs'), (Join-Path $project 'Debug'), $svcDir | Out-Null
 
 try {
-    foreach ($n in @('ti_c2000_service.ps1', 'ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1',
+    foreach ($n in @('ti_c2000_service.ps1', 'ti_c2000_run_read.ps1', 'ti_c2000_read_continuous.ps1',
                      'ti_c2000_iterate.ps1', 'ti_c2000_loadcount.ps1', 'ti_c2000_readmode.ps1',
                      'ti_c2000_fwcontract.ps1')) {
         Copy-Item -LiteralPath (Join-Path $root "scripts/$n") -Destination $scripts
@@ -57,7 +57,7 @@ try {
 
     $svc = Join-Path $scripts 'ti_c2000_service.ps1'
     $read = Join-Path $scripts 'ti_c2000_run_read.ps1'
-    $dma = Join-Path $scripts 'ti_c2000_read_dma.ps1'
+    $dma = Join-Path $scripts 'ti_c2000_read_continuous.ps1'
     $iter = Join-Path $scripts 'ti_c2000_iterate.ps1'
 
     # ---- 1. download counter accepts every real download, rejects retired names --

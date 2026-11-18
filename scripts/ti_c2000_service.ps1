@@ -6,7 +6,7 @@ Why this exists: every read needs the JTAG session that loaded the RAM image. A
 script that connects -> loads -> reads -> disconnects re-flashes the target on
 every call, so two consecutive reads never describe the same running program.
 Instead the load happens ONCE here, the session is kept open, and each read
-(ti_c2000_run_read.ps1 / ti_c2000_read_dma.ps1) is a request against that live
+(ti_c2000_run_read.ps1 / ti_c2000_read_continuous.ps1) is a request against that live
 session: no reload, no reset, no re-download.
 
   start : connect -> reset -> loadProgram -> runAsynch -> wait for requests
@@ -23,7 +23,7 @@ RUN MODE (two, see ti_c2000_readmode.ps1):
       -Expect and repeats. Inside an iterate loop this script is off limits to
       everyone else (ITERATE_IN_PROGRESS).
 
-Reads are not part of this script. ti_c2000_run_read.ps1 / ti_c2000_read_dma.ps1
+Reads are not part of this script. ti_c2000_run_read.ps1 / ti_c2000_read_continuous.ps1
 attach to the live session (ReadOnly, no download) or download once themselves
 (LoadRead, see ti_c2000_readmode.ps1). The target lock keeps a download and a read
 from overlapping.
@@ -320,7 +320,7 @@ if (-not $ConfirmLoad) {
     Out2 'REASON: nothing was written to the target - this start would compile/download and restart the program'
     Out2 ('HINT    : ask the user "是否编译下载并运行？" first, then re-run the same command with -ConfirmLoad (next download would be #' + ([int]$cnt.count + 1) + ')')
     if ($runSpec.continuous) { Out2 'HINT    : continuous mode also needs -UserApproved; ti_c2000_iterate.ps1 passes both for you' }
-    Out2 'HINT    : reading does not need this - ti_c2000_run_read.ps1 / ti_c2000_read_dma.ps1 attach to a running session (-Mode ReadOnly)'
+    Out2 'HINT    : reading does not need this - ti_c2000_run_read.ps1 / ti_c2000_read_continuous.ps1 attach to a running session (-Mode ReadOnly)'
     exit 4
 }
 
