@@ -17,6 +17,21 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 
 ## 模式、入口与互锁
 
+**先分清两个正交的维度 —— "读模式"不是一个东西：**
+
+| 维度 | 取值 | 决定什么 |
+|---|---|---|
+| **交易模式**（要不要下载）| `ReadOnly` / `LoadRead` | 这个进程会不会碰板子 |
+| **读什么**（数据来源）| 慢变量（`run_read -Variables`）/ **连续录波冻结数组**（`read_dma -FrozenBufferReady`）| 数据从哪来 |
+
+**`LoadRead` ≠ 连续录波。**
+`LoadRead` 只是"本次允许下载一次、然后读"；**连续录波**是"波形怎么取出来"的实现方式，
+它和 `ReadOnly` 组合使用：服务在跑、ISR 已把数组采满并冻结、零下载去读。
+两者可以同时成立（`-Mode LoadRead` 下载完，再用 `read_dma -FrozenBufferReady` 读冻结数组），
+也可以只用后者（服务已由别人启动，我只 `read_dma`）。
+
+**以下表格里 `ReadOnly`/`LoadRead` 指交易模式，`run_read`/`read_dma` 指数据来源。**
+
 | 维度 | 入口与行为 |
 |---|---|
 | 单步运行（默认） | `scripts/ti_c2000_service.ps1 -Start -ConfirmLoad [-Build] [-CorePattern <核名匹配式>]`：获准后构建、选定 `.out`、加载一次、运行并保留 DSS 会话。自动选择唯一 C28xx 核；多个 C28xx 核时默认 CPU1 并记录实际核名，选其他核才传 `-CorePattern`。只有列表确实无法确定核时才报参数错误。`-Status` 只报告；`-Stop` 会结束会话，可能使探针重新枚举，只在明确结束/更换镜像时使用。 |
