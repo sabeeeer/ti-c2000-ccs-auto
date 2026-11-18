@@ -9,6 +9,36 @@ description: 审查、编译和调试 TI C2000 CCS 工程。先选单步/连续�
 
 > **先交数据，再判可信度**：RAM/Flash、目标核、`.map` 与 `gRamProofTick` 是来源信息，不能作为数据判据，也不能因为位置未知或在 Flash 就拒绝下载、扣留已读数据。能访问目标时交付当次 CSV，并在同一次输出中写 `verdict.txt` 的 `OK/FAIL` 与具体原因。目标无法应答、没有常驻会话时没有当次数据可交。运行位置不靠 PC 或固定地址推测；有 `.map` 和[RAM 自证契约](references/ram-proof-firmware.md)时报告证据，否则标 `UNKNOWN`。这一调整仅完成离线验证，尚未上板复核。
 
+## 两条硬约束（优先级高于本文其余所有内容）
+
+### ① 修改本 skill 必须先获得用户授权
+
+**未经用户明确同意，不得改动本 skill 的任何文件**（`SKILL.md`、`references/`、`scripts/`、`tests/`、`tools/`）。
+
+- **回答提问 ≠ 授权修改。** 用户问「会不会…」「是否实现…」「为什么…」时，**只回答，不动手**。
+- 用户提到某个机制"不错"、某种做法"应该有"，也**不等于**让把它做成实现。
+- 要改就先说明：**改哪个文件的哪一段、改成什么、为什么**，等用户明确说「改」再动手。
+- **一次授权只覆盖那一次改动**；下一次改动重新征求，不能顺延成"以后都能改"。
+- 已改完的部分，用户说回滚就回滚，不保留"我觉得对所以留着"。
+
+### ② 不得以任何方式阻碍下载
+
+**本 skill 的任何脚本、判据、门禁都不得成为下载的障碍。** 下载只受一条约束：
+**用户明确同意**（`-ConfirmLoad`）。除此之外不新增任何前置条件。
+
+明确禁止：
+
+- 新增「必须先进某项检查 / 必须有某条记录 / 必须某个文件存在」才允许 `-Start -ConfirmLoad` 的拦截；
+- 把**推断性结论**固化成 `exit 4` 的硬拦截 —— 历史上的 `NON_DEFAULT_ENTRY_POINT` 就是这样把
+  `.cproject` 声明的唯一正确入口挡在门外，代价是整个下午；
+- 以 `ENTRY_CHECK_REQUIRED` / `MUTUALLY_EXCLUSIVE` / `STALE_*` 等名义扩大拒绝面。
+
+**允许拒绝的只有两类**：① 缺 `-ConfirmLoad`（用户没同意下载）；② 探针或目标物理上不可用
+（`NO_PROBE`、`TARGET_NOT_CONNECTED`）。
+**其余情况一律放行**，把疑点写进输出作为 `WARN`/`CHECK` 提示，**不得 `exit` 非零**。
+
+> 这两条是用户 2026-11-18 明确要求的，**不允许以"更好的工程实践"为理由绕过**。
+
 ## 先让 AI 找到正确入口
 
 在新 CCS 工程创建之初，用 `tools/init_project_entry.ps1 -ProjectPath <工程>` 生成相同的 `AGENTS.md`、`CODEBUDDY.md`、`CLAUDE.md`；它遇到已有不同内容会拒绝覆盖，需人工合并。随后用 `tools/init_firmware_contract.ps1 -ProjectPath <工程>` 生成固件侧的判据模块（`ti_c2000_contract.h/.c`：`gFwId`、心跳、RAM 自证、DMA 帧符号，全部带中文注释说明为什么是判据）。该工具**只在显式调用时运行**，不随编译/下载自动改写源码；检测到工程已有同名符号就 `SKIP`，不覆盖手写代码。它只生成声明和 tick 函数，仍需人在 1 ms ISR / 主循环各调一次、并在 `.cmd` 里映射 `ramgs1` 等段名（输出会打印 `NEXT:` 提示）；可用 `-Identity/-Heartbeat/-RamProof/-DmaFrame` 只生成部分模块。开始工程操作前，读本文件和工程 `AGENTS.md`，再运行已安装 skill 的 `scripts/check_project_entry.ps1 -ProjectPath <工程>`。只有退出码 0 且 `RESULT: OK` 才继续；先清理工程里的旧 `ti_c2000_*.ps1/.js` 副本。每次脚本输出必须有 `SKILL   : ti-c2000-ccs-auto@<版本>`；版本由入口、运行脚本、资料和维护工具的内容哈希生成，脚本单独变更也会换号。成功还须退出码 0 与 `RESULT: OK` 同时成立。
