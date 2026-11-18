@@ -53,11 +53,16 @@ param(
     # The project .ccxml is then used as-is when it already pins that serial, otherwise a
     # resolved COPY is generated next to the session and the project file stays portable.
     [string]$ProbeSerial = '',
+    # Debug/diagnostic switch: use the .ccxml exactly as written, without resolving the
+    # attached probe serial at run time. Needed to run a clean A/B experiment (e.g. does
+    # "Only one XDS100" really fail?), because the resolver would otherwise rewrite it.
+    [switch]$NoProbeResolve,
     [string]$OutFile = '',
     [string]$MapFile = '',
-    # Refuse by default when the map's ENTRY POINT SYMBOL is not _c_int00: measured twice
-    # in this project that a code_start image fails -1041 on the first block and leaves the
-    # core requiring a power cycle. Set this only after verifying the symbol on this board.
+    # The gate refuses only when the .out entry symbol CONFLICTS with the .cproject
+    # declaration (linkerID.ENTRY_POINT). It is NOT a check for "_c_int00": that earlier
+    # wording was a misdiagnosis (see ram-and-linker.md 入口点). Set this switch only for a
+    # symbol you have verified on this board, bypassing the conflict check.
     [switch]$AllowNonDefaultEntry,
     [string]$CcsRoot = '',
     # Which CPU to open. Empty = choose automatically:
@@ -440,18 +445,32 @@ if ($MapFile -and -not $AllowNonDefaultEntry) {
     $em = [regex]::Match($mapTxt, 'ENTRY POINT SYMBOL:\s*"([^"]+)"')
     if ($em.Success) {
         $entrySym = $em.Groups[1].Value
-        if ($entrySym -ne '_c_int00') {
+        # `.cproject` 的 linkerID.ENTRY_POINT 是工程自己声明的权威值；与它一致就放行。
+        # 2026-11-18 事故：本工程声明 code_start，一份 code_start 镜像（LOAD #103、#116 用的）
+        # 曾被这里无条件拒绝——把唯一能成功的镜像挡在门外。判据必须是"与声明冲突"，不是"不是 _c_int00"。
+        $declaredEntrySym = ''
+        try {
+            $cpPath = Join-Path $ProjectPath '.cproject'
+            if (Test-Path -LiteralPath $cpPath) {
+                $cpTxt = [IO.File]::ReadAllText($cpPath)
+                $dm = [regex]::Match($cpTxt, 'linkerID\.ENTRY_POINT[^>]*\bvalue="([^"]+)"')
+                if ($dm.Success) { $declaredEntrySym = $dm.Groups[1].Value }
+            }
+        } catch { }
+        if ($entrySym -ne '_c_int00' -and $entrySym -ne $declaredEntrySym) {
             Out2 'FAILURE: NON_DEFAULT_ENTRY_POINT'
             Out2 'RESULT: FAIL'
-            Out2 ("REASON: the selected .out links with ENTRY POINT SYMBOL '{0}', not _c_int00" -f $entrySym)
+            Out2 ("REASON: the .out entry symbol '{0}' conflicts with the .cproject declaration '{1}'" -f $entrySym, $(if ($declaredEntrySym) { $declaredEntrySym } else { 'none' }))
             Out2 ("        map: {0}" -f $MapFile)
-            Out2 'HINT    : rebuild WITHOUT -EntryPoint (build.ps1 already defaults to _c_int00). Measured twice in this'
-            Out2 '          project: a code_start image writes .text in 0x800 pieces, fails -1041 / FTDI -150 on the first'
-            Out2 '          block, and leaves the core needing a power cycle. Pass -AllowNonDefaultEntry only if you have'
-            Out2 '          confirmed this symbol on this board.'
+            Out2 'FIX     : rebuild so the link uses --entry_point=<declared>. build.ps1 does this automatically'
+            Out2 '          (long form only - the short form "-e <sym>" is swallowed by cl2000, which leaves the'
+            Out2 '          .out on _c_int00 while the log claims otherwise; that mismatch is what produced the'
+            Out2 '          0x800-word .text pieces and -1041 / FTDI -150 on 2026-11-18).'
+            Out2 'FIX     : confirm build.ps1 printed "entry point verified in map".'
+            Out2 '          Pass -AllowNonDefaultEntry only for a symbol you have verified on this board.'
             exit 4
         }
-        Info2 ("ENTRY    : {0} (the only symbol verified to load on this board)" -f $entrySym)
+        Info2 ("ENTRY    : {0} (matches the .cproject declaration)" -f $entrySym)
     } else {
         Out2 'NOTE    : the map has no ENTRY POINT SYMBOL line - entry point could not be checked'
     }
@@ -472,8 +491,33 @@ if (-not (Test-Path -LiteralPath $dss)) { Out2 'FAILURE: ENV_NO_DSS'; Out2 'RESU
 # written under readout\.service and handed to DSS; the project file is never modified.
 # This is what makes the same project work with any attached probe.
 $ccxmlOriginal = $Ccxml
-$resolvedCfg = Resolve-ProbeTargetConfig -ProjectPath $ProjectPath -Ccxml $Ccxml -Serial $ProbeSerial `
-    -WorkDir $svcDir -CcsPath $ccsPath -Xds100Tool (Join-Path $ccsPath 'ccs_base\common\uscif\xds100serial.exe')
+# ---------------------------------------------------------------------------
+# 探针确认（串号的唯一用途）。
+#   上机前自动识别"现在插着哪一块"，把它的串号写进工程 .ccxml，让 DSS 精确寻址
+#   一块已知设备，而不是去枚举（枚举在多残留实例的机器上会 -215 semaphore timeout，
+#   同路径 A/B 实测两次复现）。除此之外，编译/下载/读取/判据/报告都不引用串号。
+#   读不到串号时**什么都不改**，也不判失败——那不是错误，只是没有身份信息。
+# ---------------------------------------------------------------------------
+if ($NoProbeResolve) {
+    $attachedInfo = @(Get-AttachedProbeSerials -CcsPath $ccsPath `
+        -Xds100Tool (Join-Path $ccsPath 'ccs_base\common\uscif\xds100serial.exe'))
+    if ($attachedInfo.Count -gt 0) {
+        Info2 ('PROBE   : attached {0}' -f (($attachedInfo | ForEach-Object { $_.Model + '/' + $_.Serial }) -join ', '))
+    }
+    Info2 'PROBE   : confirmation skipped (-NoProbeResolve); ccxml used verbatim'
+    $resolvedCfg = [pscustomobject]@{ Serial = ''; SerialSource = 'disabled'; Changed = $false; Path = $Ccxml; Ok = $true; Note = '' }
+} else {
+    $resolvedCfg = Sync-ProbeSerialToCcxml -ProjectPath $ProjectPath -Ccxml $Ccxml -Serial $ProbeSerial `
+        -CcsPath $ccsPath -Xds100Tool (Join-Path $ccsPath 'ccs_base\common\uscif\xds100serial.exe')
+    if ($resolvedCfg.Serial) {
+        Info2 ('PROBE   : confirmed {0} (source={1}) - identity only, no other check depends on it' -f $resolvedCfg.Serial, $resolvedCfg.SerialSource)
+    }
+    if ($resolvedCfg.Changed) {
+        Info2 ('CCXML   : serial written into the project .ccxml (previous copy kept as .bak)')
+    } elseif ($resolvedCfg.Note) {
+        Info2 ('NOTE    : ' + $resolvedCfg.Note)
+    }
+}
 if ($resolvedCfg.Serial) {
     Info2 ('PROBE   : serial {0} (source={1})' -f $resolvedCfg.Serial, $resolvedCfg.SerialSource)
 }

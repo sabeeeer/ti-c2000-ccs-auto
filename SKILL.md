@@ -22,7 +22,7 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 | 单步运行（默认） | `scripts/ti_c2000_service.ps1 -Start -ConfirmLoad [-Build] [-CorePattern <核名匹配式>]`：获准后构建、选定 `.out`、加载一次、运行并保留 DSS 会话。自动选择唯一 C28xx 核；多个 C28xx 核时默认 CPU1 并记录实际核名，选其他核才传 `-CorePattern`。只有列表确实无法确定核时才报参数错误。`-Status` 只报告；`-Stop` 会结束会话，可能使探针重新枚举，只在明确结束/更换镜像时使用。 |
 | 连续运行（用户点名才启用） | `scripts/ti_c2000_iterate.ps1 -UserApproved -Expect ...`：最多 20 轮；每轮构建、加载、运行、读、判据。相邻下载尝试至少隔 5 秒；连接重试和探针恢复应留间隔。运行期间其他读/加载/Stop 由锁拒绝。 |
 | `ReadOnly`（默认读） | `scripts/ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables ...` 读慢变量；`scripts/ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName ...` 读**连续录波冻结的数组**——这是唯一把波形取出来的方式。零构建、零加载、零重连、零因读而 `halt`；附着现有服务，在程序运行时读取。连续录波的原理、参数询问、RAM 算法与导出规范见[读模式](references/single-session-read.md)。 |
-| `LoadRead`（本次获准加载后读） | 同一公开读入口加 `-Mode LoadRead -ConfirmLoad [-Build]`。若旧会话存在，先明确停止；服务加载新镜像并**留在该会话**，再调用正常 `ReadOnly` 判据；读完不 `halt`/断开。`-Standalone` 是同一路径的旧别名。`-MaxLoads/-Expect` 的循环每轮仍受 5 秒门限。 |
+| `LoadRead`（本次获准加载后读） | 同一公开读入口加 `-Mode LoadRead -ConfirmLoad [-Build]`。若旧会话存在，先明确停止；服务加载新镜像并**留在该会话**，再调用正常 `ReadOnly` 判据；读完不 `halt`/断开。`-Standalone` 是同一路径的旧别名。`-MaxLoads/-Expect` 的循环每轮仍受 5 秒门限。**已知缺陷（2026-11-18 实测）**：传 `-CcsRoot F:\ccs` 会被拼成参数名 `'CcsRoot F'` → `FAILURE: SERVICE_PROTOCOL`（exit 1）；**不传 `-CcsRoot` 时正常**（自动探测 CCS，实测 `LOAD #129` + `HEARTBEAT: OK`）。在修掉之前，LoadRead 不要传 `-CcsRoot`。 |
 | Error（离线） | 一出现 `USAGE:` 或 `FAILURE:`，**先查** `scripts/ti_c2000_error.ps1 -Code <错误码>` 或 `-LogPath <日志>`，再读[错误索引](references/error-index.json)。输出 `CATEGORY`：parameter、validation、data_verdict、download_probe。查询不连接、不构建、不复位、不下载；新故障经实测复盘后录入第三类。 |
 
 下载只能在用户明确同意后传 `-ConfirmLoad`，连续运行还要求用户明确提出反复运行并传 `-UserApproved`。`ReadOnly` 与 `-Build/-ConfirmLoad/-Expect/-MaxLoads>1` 互斥；`-NoProbeCheck/-AllowUnverified/-NoHeartbeat` 的只读绕过已禁用。`RESULT: FAIL`、缺 `RESULT: OK`、非零退出码都不是成功；不得用另一次烧录“凑出”读数。
@@ -32,23 +32,38 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 ## 一次成功下载的固定顺序（2026-11-18 F28379D/CPU1 + XDS100v2 实测）
 
 ```powershell
-pwsh -NoProfile -File scripts\ti_c2000_build.ps1   -ProjectPath <工程>            # 不要传 -EntryPoint
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1   -ProjectPath <工程>            # 不用传 -EntryPoint，默认取 .cproject
 pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -ConfirmLoad
 pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables <变量,寄存器>   # 只读附着，不重烧
 ```
 
-**入口点必须是 `_c_int00`。绝不能传 `-EntryPoint code_start`**（2026-11-18 两次实测，代价是整个下午）：
+**入口点跟随 `.cproject` 的 `linkerID.ENTRY_POINT`，本工程就是 `code_start`。**
+关键不在"选哪个符号"，而在**参数形式**：短形式 `-e <sym>` 实测会被吞掉，必须用长形式
+`--entry_point=<sym>`，并在链接后用 `.map` 复核。三行日志齐全才算生效：
 
-| 构建方式 | `.out` | `.map` 入口 | 首块写入 | 结果 |
-|---|---|---|---|---|
-| 不传（默认） | 592642 B | `_c_int00` | `0x16a8` 整块 | LOAD #103/#104 `RESULT: OK` |
-| `-EntryPoint code_start` | 592810 B | `code_start` | `0x800`（一个 RAMLS 块） | `-1041` + FTDI `-150`，且把 CPU 推进不可调试状态 |
+```text
+LINK    : entry point taken from .cproject = code_start     # 没传参时自动取声明值
+LINK    : entry point requested = code_start (declared in .cproject: code_start)
+LINK    : entry point verified in map = code_start          # 复核，不一致则构建失败
+```
 
-`.cproject` 里的 `ENTRY_POINT=code_start` 是给 **Flash 构建**用的；强加给 RAM 下载会让加载器分片写。
-`service.ps1` 现在下载前检查 `.map` 的 `ENTRY POINT SYMBOL`，非 `_c_int00` 直接
-`FAILURE: NON_DEFAULT_ENTRY_POINT`（exit 4）拒绝、不碰板子；逃生需显式 `-AllowNonDefaultEntry`。
+不一致会直接构建失败（`ENTRY_POINT_NOT_APPLIED requested=... actual=...`），
+所以"打印了但没生效"不可能再溜过去。实测不传任何参数：`ENTRY : code_start` → `LOAD #119 RESULT: OK`。
 
-成功必须三条同时成立，缺一不得写"下载成功"：`.map` 里 `FLASHA~FLASHN` 的 used 全为 0 **且 `ENTRY POINT SYMBOL: "_c_int00"`**；日志出现 `DSS: loaded`（即 `memory.loadProgram` 成功）；`runAsynch` 后应用计数器跨轮递增。入口走 `_c_int00` 会跳过 `codestart` 里的 `WD_DISABLE` 分支，本工程由 `InitSysCtrl()` 内的 `DisableDog()` 兜底（104 次加载无看门狗复位），细节见[RAM 与链接](references/ram-and-linker.md)「入口点」。
+`service.ps1` 的前置判据是**"与 `.cproject` 声明冲突"**，不是"不等于 `_c_int00`"
+（旧判据曾把唯一能成功的镜像挡在门外，已修）。真冲突才报
+`FAILURE: NON_DEFAULT_ENTRY_POINT`（exit 4）；逃生开关 `-AllowNonDefaultEntry`。
+
+> **历史坑（别重犯）**：2026-11-18 有一版把"短形式 `-e` 不生效导致的失败"误判为"`code_start`
+> 这个符号不能用于 RAM 下载"，于是在文档里写下"必须 `_c_int00`、绝不能传 `code_start`"，
+> 并加了"非 `_c_int00` 即拒绝"的门禁。那次误判的产物是 592810 B、`.text` 按 `0x800` 分片；
+> 换成 `--entry_point=code_start` 后镜像正常、`LOAD #116/#119` 连续成功。
+> **教训：先怀疑参数是否真的生效，再怀疑符号选择。**
+
+成功必须三条同时成立，缺一不得写"下载成功"：`.map` 里 `FLASHA~FLASHN` 的 used 全为 0
+**且 `ENTRY POINT SYMBOL` 与 `.cproject` 声明一致**；日志出现 `DSS: loaded`（即
+`memory.loadProgram` 成功）；`runAsynch` 后应用计数器跨轮递增。细节见
+[RAM 与链接](references/ram-and-linker.md)「入口点」。
 
 ### 成功案例（2026-11-18 实测，照抄可复现）
 
@@ -70,7 +85,7 @@ pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -CcsRoot 
 
 # 2) 下载到 RAM 并常驻（用户明确同意后才加 -ConfirmLoad）
 pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -Build -ConfirmLoad
-#    期望：ENTRY : _c_int00 / LOAD : #N / RESULT: OK
+#    期望：ENTRY : code_start（跟随 .cproject）/ LOAD : #N / RESULT: OK
 
 # 3) 只读验活（零下载）
 pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,usMainLoop -Mode ReadOnly
@@ -83,7 +98,7 @@ pwsh -NoProfile -File scripts\ti_c2000_read_dma.ps1 -ProjectPath <工程> -Froze
 | 项 | 正确值 | 错了会怎样 |
 |---|---|---|
 | `.ccxml` 的 `Emulator Selection` | `Value="1"` + 串号 `TI90I42A` | 默认 "Only one XDS100" 会打开**幽灵实例** → `-151`（PnP 看着全 OK） |
-| `.out` 大小 / `.map` 入口 | 592642 B / `_c_int00` | 592810 B / `code_start` → `.text` 按 `0x800` 分片写 → `-1041` + `-150` |
+| `.out` 入口 vs `.cproject` 声明 | **一致**（本工程 `code_start`，`ofd2000` 读 `0x00000000`） | 不一致说明 `--entry_point` 没生效 → 构建期就该被 `ENTRY_POINT_NOT_APPLIED` 拦下。**但入口点本身不是 `-1041` 的成因**：2026-11-18 A/B 实测 `_c_int00` 3/3 `RESULT: OK`、`code_start` 3/3 `RESULT: OK`（LOAD #121~#126） |
 | connect 前 realtime 选项 | **不设**（session 默认 off） | 设 `PoliteRealtimeMode=true` → `-1133` 直接拒绝连接 |
 | `.text` 段布局 | `> RAMCODE` 单块（0x8000~0xA7FF） | `>>` 跨片 → `-1041`（`Length 0x7ff/0x800` 是分片指纹） |
 
@@ -95,10 +110,43 @@ pwsh -NoProfile -File scripts\ti_c2000_read_dma.ps1 -ProjectPath <工程> -Froze
 | 层 | 判据 | 失败含义 | 该改什么 |
 |---|---|---|---|
 | 1 Windows 枚举 | 可用设备数 / 幽灵数（`Unknown` 或 `Present=False`） | 0 个可用 → `NO_PROBE` | **只有这一层代表"真的没插"**，此时才让人查插线/供电 |
-| 2 FTDI 驱动 | `xds100serial -l` 能否列出探针 | 打不开 | 先看第 4 层；**有活跃 DSS 会话时本层 SKIP**（会话占着 FTDI 句柄，属正常，不是故障） |
-| 3 实物串号 | `xds100serial` 输出的串号（PnP 的 InstanceId 末尾多一位，`...TI90I42AB` → `TI90I42A`） | 读不到 | 会话占用属正常；否则看第 2 层 |
-| 4 ccxml 选择 | `Emulator Selection` 是否按串号、且该串号在实物列表里 | 默认 `Only one` + 有幽灵 → `PROBE_SELECTION_AMBIGUOUS`；串号不符 → `PROBE_SERIAL_MISMATCH` | **只改 ccxml 一行**（`-- Enter the serial number`）。**不拔线、不改 BOOT** |
-| 5 结论 | 上面四层 | — | 软件层全过就明确写"不要动硬件"，不写含糊的硬件建议 |
+| 2 句柄占用 / 串号可读性 | 残留 `dss`/`java` 进程；`xds100serial -l` 能否列出探针 | **不是判据**（见下） | 清理残留进程后重试；有活跃会话时属正常 |
+| 3 实物串号 | `xds100serial` 输出的串号（PnP 的 InstanceId 末尾多一位，`...TI90I42AB` → `TI90I42A`） | 读不到 | 只做身份记录，不据此判故障 |
+| 4 ccxml 选择 | `Emulator Selection` 是否按串号、且该串号在实物列表里 | 多块**实物**在场且无法确定 → `PROBE_SELECTION_AMBIGUOUS`；串号不符 → 自动生成副本适配 | **只改 ccxml / probe-serial.txt 一行**。**不拔线、不改 BOOT** |
+| 4b DSS 试连（`-Deep`） | DSS 能否 `connect → isConnected → disconnect` | 打不开 → `PROBE_DSS_CONNECT_FAILED` | 先查第 4 层，再换口/线 |
+| 5 结论 | 上面各层 | — | 软件层全过就明确写"不要动硬件"，不写含糊的硬件建议 |
+
+> **两条实测结论（2026-11-18，同一块板、同一分钟，别再用推测替代）**
+>
+> 1. `xds100serial -l` 报 "No XDS100 emulators were found" **不能证明探针坏**：DSS 会话正常运行
+>    （`LOAD #108`）时它正是这么报的，`-Stop` 后 3 秒立刻读到 `0403/a6d0 XDS100v1/v2 TI90I42A`；
+>    同一颗 FTDI 芯片的串口通道（`COM11 @460800`）全程能打开、能写入。该工具只反映
+>    "FTDI 句柄此刻是否被 DSS 占着"。
+> 2. **失败的是"自动选择探针"这条路径，不是"幽灵被打开"。** A/B 对照（间隔统一 10 s，唯一变量
+>    是 ccxml 选择）：`Emulator Selection = Only one` → `-215` 信号量超时、连不上；
+>    改成按串号 `TI90I42A` → `LOAD #113` OK。幽灵实例 `Present=False` 物理不存在、DSS 根本打不开，
+>    所以正确表述是"自动枚举在残留实例的机器上会超时"，而不是"选中了幽灵"。
+>
+> 因此：**先让"自动选择"本身可用——清掉幽灵实例**（`tools\clean_ghost_probes.ps1 -Confirm`，需管理员；
+> 只删 `Status≠OK` 的历史记录，在用的探针不会被碰）；仍失败再查残留 `dss`/`java` 客户端；**不要**因此让人
+> 拔线、换线或改 BOOT。
+>
+> **硬性设计原则：串号只用于「探针确认」，其他功能一律不依赖它。**
+>
+> 上机前 skill 自动识别当前实物探针（XDS100 → `xds100serial -l`；XDS110 → `xdsdfu -e`；
+> 其他型号 → PnP / DSS 试连），把得到的串号**最小改写**进工程 `.ccxml`
+> （只动 `-- Enter the serial number` 的 Value，driver / device / ICEPick_C / Subpath
+> 一个都不碰；写前做 XML 合法性 + driver 节点数 + 串号存在性三重校验，失败就不写；
+> 写入前自动留 `.bak`），让 DSS 精确寻址一块已知设备，**而不是去枚举**
+> ——枚举在有多组残留实例的机器上会 `-215` 信号量超时（同路径 A/B 两次复现）。
+>
+> **编译 / 下载 / 读取 / 判据 / 报告都不读串号。** 读不到串号时什么都不改，也不判失败。
+> 需要人工干预时可用 `-ProbeSerial`、`$env:TI_C2000_PROBE_SERIAL` 或
+> `targetConfigs\probe-serial.txt` 覆盖自动发现（都是可选，不是前提）。
+>
+> 实测（2026-11-18）：ccxml 里删掉串号块 → 直接 `-Start -Build -ConfirmLoad`
+> → `PROBE : confirmed TI90I42A (source=discovered)` + `serial written into the project .ccxml`
+> → `LOAD #117 RESULT: OK`，写回后 4 个 driver / device / router / Subpath 全部完好。
 
 **型号无关**：`-ProbeCheckOnly -Deep` 会额外让 DSS 自己开一次探针（connect → isConnected → disconnect，
 **不加载程序**），这是唯一对 XDS100/XDS110/XDS200/XDS560v2/板载探针都成立的判据（xds100serial 只认识
@@ -146,5 +194,23 @@ XDS100；XDS200 没有串号工具；`dbgjtag` 只吃 CCS 生成的 `.dat`）。
 同一任务可查多类，但只把新事实归入其主类：eCAP 配置与官方模板在第一类，eCAP 实测故障在第三类。不能把 DSP28335 或某个 XDS 的现场现象推广到所有芯片/探针。第二类的 SolarLib、DCL、DMC 文档和第一类的 28379D 功能不得因精简入口而删除。
 
 ## 维护与离线复核
+
+> ⚠️ **改了 skill 文件 ≠ 立即生效。已开启的会话不会重读 SKILL.md / references。**
+> 2026-11-18 实测：修好本文档里 `-EntryPoint code_start` 那条错误指令后，另一个**早已开启**的
+> 会话仍按旧指令构建，持续把 `code_start` 镜像写回 `Debug\`，门禁反复报
+> `NON_DEFAULT_ENTRY_POINT`，看起来像"修了没用"。
+> **改完 skill 必须让相关会话重开**（或明确把新规则告知该会话），否则两个会话会按两套规则
+> 互相覆盖同一份产物。判断是否踩到这一条：`.out` 的时间戳晚于你最后一次编译，且入口点不是
+> 你期望的那个。
+
+> **诊断探针问题时的两个实验开关**（没有它们做不出干净对照）：
+> - `-NoProbeResolve`（`service.ps1`）：禁用"探针确认"，`.ccxml` 原样使用。
+>   否则 resolver 会自动把 `Only one` 改回按串号，**A/B 实验直接失效**（第一次就踩了这个坑）。
+> - `tools/clean_ghost_probes.ps1 [-Confirm]`：列出/删除 `Status≠OK` 的历史探针记录
+>   （默认只列；需管理员；`Status=OK` 的在用探针绝不会被碰）。用于让 `Only one` 自己在
+>   多残留实例的机器上可用。
+>
+> 做对照实验的硬要求：**同一路径、统一间隔、只改一个因子、至少重复一次**。
+> 这次的教训是"改 ccxml 后成功"其实只是"改文件花的时间让 FTDI 句柄释放了"。
 
 固件符号和时间门限先改 `references/firmware-contract.json`，再运行 `tools/audit_fw_contract.ps1`。出错先用 Error 模式；新增错误先写 `references/error-index.json` 的处理步骤及类别，再运行 `tools/audit_error_index.ps1` 和 `tools/audit_error_prefix.ps1`，实测案例另归第三类。新增器件进第一类，新增 TI 库进第二类。改后运行离线 `tests/test_*.ps1`（不运行需真机的 `test_e2e_readonly.ps1`）、`tools/audit_js_identifiers.ps1`、`tools/audit_dead_params.ps1`、`tools/audit_fw_contract.ps1`、`scripts/check_debug_catalog.ps1` 和 Codex `quick_validate.py`，检查输出与退出码。**测试脚本自身必须在成功路径末尾显式 `exit 0`**：否则 `LASTEXITCODE` 会残留最后一次子进程调用的失败码（实测 `test_run_modes.ps1` 因最后一步是故意拒绝而输出 `RESULT: OK`/exit 3，`test_compiler_selection.ps1` 因最后一步是故意失败的编译而输出 `RESULT: OK`/exit 1），显示通过却是失败退出码。上板结论必须另标“实测”，不能拿离线测试代替。

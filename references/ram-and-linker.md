@@ -126,43 +126,56 @@ SECTIONS
    ```
    若有 `#pragma DATA_SECTION(buf,"DMARAML6")` 之类，说明那个块被 DMA 借用，不能挪（或要同步改宏）。
 
-### 入口点：RAM 下载必须是 `_c_int00`，**不要**传 `-e code_start`（2026-11-18 两次实测）
+### 入口点：跟随 `.cproject` 声明，必须用长形式 `--entry_point=`
 
-> ⚠️ **本节曾在 2026-11-18 被写反过一次**，直接导致另一个对话反复下载失败。
-> 当时的结论是"必须传 `-EntryPoint code_start`"，那条是错的。下面是实测结果。
+> ⚠️ 这一节被写错过**两次**，都是同一个根因（参数没真正生效），务必按下面的机制理解：
+> ① 2026-11-15 结论"加了 `-e` 就全失败 → 以后别传入口"；
+> ② 2026-11-18 结论"必须 `_c_int00`、不能用 `code_start`"。
+> 两条都是错的。真相是 ③。
 
-`.cproject` 里写着 `ENTRY_POINT=code_start` **不等于** RAM 下载要用它。用本 skill 的构建脚本时，**不传** `-EntryPoint` 的输出是：
+**真相**：短形式 `-e <symbol>` 追加在 `-z ... --reread_libs` 之后会被 **cl2000 吞掉**。
+日志打印 `overridden to code_start`，但 `.out` 的实际入口仍是 `_c_int00`（如 `0x942d`，落在 `.text` 内）。
+于是 `loadProgram` 写完 `BEGIN` 就把 PC 指向**尚未写入**的 `.text`，CPU 跑飞占总线，
+首块写 `0x8000` 就报 `Error -1041` + FTDI `-150`——看起来像"`code_start` 不能用于 RAM 下载"，
+实际是"入口参数没生效，镜像半截就起跑"。
+
+换成**长形式**并加 **map 复核**之后，同一工程 `LOAD #116` / `#119` 连续成功：
 
 ```text
-LINK    : .cproject declares ENTRY_POINT=code_start; NOT applied (use -EntryPoint code_start to force it)
-ENTRY POINT SYMBOL: "_c_int00" address: 0000942d
+LINK    : entry point taken from .cproject = code_start          # 没传参时自动取声明值
+LINK    : entry point requested = code_start (declared in .cproject: code_start)
+LINK    : entry point verified in map = code_start               # 复核；不一致则构建失败
+ENTRY   : code_start
+LOAD    : #119
+RESULT: OK
 ```
 
-**这就是能下载的形态**（`.out` 592642 B，`.text` 整块 `0x16a8`，LOAD #103/#104 实测通过）。
+**规则（三条缺一不可）**：
 
-一旦显式传 `-EntryPoint code_start`：
+1. **入口符号跟随 `.cproject` 的 `linkerID.ENTRY_POINT`**（本工程 = `code_start`）。
+   不传 `-EntryPoint` 时 `build.ps1` 自动取该声明值，所以正常情况下**不需要人工传参**。
+2. **必须用 `--entry_point=<sym>` 长形式**；短形式 `-e <sym>` 实测被吞，禁止回退。
+3. **链接后必须用 `.map` 复核** `ENTRY POINT SYMBOL`；不一致直接构建失败
+   （`ENTRY_POINT_NOT_APPLIED requested=... actual=...`），让"打印了但没生效"当场暴露。
 
-```text
-ENTRY POINT SYMBOL: "code_start" address: 00000000
-```
-
-`.out` 变成 592810 B，加载器把 `.text` 按 `0x800`（一个 RAMLS 块）分片写，**第一片就 `-1041` + FTDI `-150`**，
-并把 CPU 推进不可调试状态（随后连正确镜像也会 `Target reset failed. Error: -1`，重试一次才恢复）。
-
-**为什么当初会写反**：`F2837xD_CodeStartBranch.asm` 的 `codestart` 里带 `WD_DISABLE` 分支
-（`LB wd_disable` → 写 `WDCR` → `LB _c_int00`），入口直接是 `_c_int00` 会**跳过关狗**。
-这个担忧本身成立，但它不是"必须传 code_start"的理由——本工程由 `InitSysCtrl()` 里的
-`DisableDog()` 兜底，104 次加载没有一次看门狗复位。**下载可行性优先于入口形式。**
-
-**判据（下载 RAM 镜像时必须看）**：`.map` 出现 `ENTRY POINT SYMBOL: "_c_int00"`。
-若看到 `"code_start"`，**重新编译且不传 `-EntryPoint`**，不要试图直接下载（`service.ps1` 会以
-`FAILURE: NON_DEFAULT_ENTRY_POINT` exit 4 拒绝）。
+`service.ps1` 的前置判据是"是否与 `.cproject` 声明**冲突**"，不是"是否等于 `_c_int00`"。
+真冲突才报 `FAILURE: NON_DEFAULT_ENTRY_POINT`（exit 4），逃生开关 `-AllowNonDefaultEntry`。
+（旧判据曾无条件拒绝非 `_c_int00`，把唯一能成功的镜像挡在门外。）
 
 ```powershell
-pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -Stage      # 就这样，别加 -EntryPoint
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -Stage      # 不用加 -EntryPoint
+```
 ```
 
-`code_start` 属于 **Flash 启动**的构建形态（另一套链接脚本 + `-D_FLASH`），不能拿来下 RAM。
+`code_start` 只是 `BEGIN` 段里的入口符号，**与 Flash / RAM 链接脚本无关**。同一份 RAM `.cmd` 下，入口取 `_c_int00`（`0x942d`，落在 `.text` 内）或 `code_start`（`0x0`，落在 `BEGIN`）都能正常下载：
+
+| 入口 | `ofd2000` 读到的值 | 2026-11-18 A/B 实测 |
+|---|---|---|
+| `_c_int00` | `0x0000942d` | #121 / #122 / #123 全 `RESULT: OK` |
+| `code_start` | `0x00000000` | #124 / #125 / #126 全 `RESULT: OK` |
+
+> 曾错误断言「`code_start` 属于 Flash 启动形态、不能下 RAM」——那是把 11-15 的误诊当成了事实。
+> `.text` 分片还是整块由 `.cmd` 的 `>>` / `>` 决定，**与入口点无关**。
 
 ---
 
