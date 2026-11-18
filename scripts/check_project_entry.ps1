@@ -52,6 +52,32 @@ $skillToken = 'ti-c2000-ccs-auto'
 $violations = New-Object System.Collections.Generic.List[string]
 $notes = New-Object System.Collections.Generic.List[string]
 
+# ---------- 0. 工程改动留痕（BUILD_VERIFICATION.txt）--------------------------
+# 工程 AGENTS.md 的硬性规则⑤要求每次改动追加一条，此前完全依赖 AI 自觉。
+# 2026-11-18 实测：同一工程两个会话，一个写了 5 条、另一个 0 条 —— 靠自觉不可靠。
+# 这里改成机械保证：不存在就当场创建（带表头），存在就报告行数与最后写入时间。
+$chgLog = Join-Path $root 'BUILD_VERIFICATION.txt'
+if (-not (Test-Path -LiteralPath $chgLog)) {
+    $head = @(
+        '工程改动留痕（BUILD_VERIFICATION.txt）',
+        '',
+        '规则（工程 AGENTS.md 硬性规则⑤）：每次改代码 / 配置 / 构建参数 / skill 相关设置，',
+        '追加一条：日期 | 改了什么 | 为什么 | 编译或上板结果。只追加，不覆盖。',
+        '',
+        ('首次创建：{0}，由 check_project_entry.ps1 生成' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+        '--------------------------------------------------------------------------------'
+    ) -join "`r`n"
+    try {
+        [IO.File]::WriteAllText($chgLog, $head + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        $notes.Add('created BUILD_VERIFICATION.txt (project change log) - append one entry per change')
+    } catch {
+        $violations.Add(('cannot create BUILD_VERIFICATION.txt: {0}' -f $_.Exception.Message))
+    }
+} else {
+    $nLines = @([IO.File]::ReadAllLines($chgLog)).Count
+    $notes.Add(('BUILD_VERIFICATION.txt: {0} lines, last write {1}' -f $nLines, (Get-Item -LiteralPath $chgLog).LastWriteTime.ToString('MM-dd HH:mm')))
+}
+
 # ---------- 1. copies of skill scripts inside the project ------------------------
 $copies = @(Get-ChildItem -LiteralPath $root -Recurse -File -Include *.ps1, *.js -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -notmatch '\\\.git\\' } |
@@ -74,7 +100,23 @@ $entryNames = @('AGENTS.md', 'CODEBUDDY.md', 'CLAUDE.md')
 $rootEntries = @($entryNames | ForEach-Object { Join-Path $root $_ })
 $missingRoot = @($rootEntries | Where-Object { -not (Test-Path -LiteralPath $_) })
 if ($missingRoot.Count -gt 0) {
-    $violations.Add(('project root is missing AI entry file(s): ' + (($missingRoot | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') + '; run tools/init_project_entry.ps1 or merge existing instructions'))
+    # 自动触发（2026-11-18 用户要求）：调用 skill 就该产生可验证的事件，
+    # 而不是等某个 AI 记得去跑 tools\init_project_entry.ps1。
+    # 该工具只在缺失时写入，已有内容一律 SKIP 或 REFUSE，不会覆盖手写规则。
+    $skillRootForInit = Split-Path $PSScriptRoot -Parent
+    $initTool = Join-Path $skillRootForInit 'tools\init_project_entry.ps1'
+    if (Test-Path -LiteralPath $initTool) {
+        $initOut = @(& $initTool -ProjectPath $root 2>&1)
+        foreach ($line in $initOut) {
+            if ([string]$line -match 'CREATED|SKIP|REFUSE|EXISTS') { $notes.Add('init: ' + ([string]$line).Trim()) }
+        }
+        $missingRoot = @($rootEntries | Where-Object { -not (Test-Path -LiteralPath $_) })
+    }
+    if ($missingRoot.Count -gt 0) {
+        $violations.Add(('project root is missing AI entry file(s): ' + (($missingRoot | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') + '; run tools/init_project_entry.ps1 or merge existing instructions'))
+    } else {
+        $notes.Add('auto-created the missing AI entry file(s) via init_project_entry.ps1')
+    }
 } else {
     $entryTexts = @($rootEntries | ForEach-Object { [IO.File]::ReadAllText($_) })
     if (@($entryTexts | Sort-Object -Unique).Count -ne 1) {

@@ -8,7 +8,7 @@
 |---|---|
 | `ti_c2000_service.ps1 -Start -ConfirmLoad [-Build]` | 用户同意后选择精确 `.out`、连接、验证连接、复位或有效链路上 halt 兜底、加载、运行，DSS 常驻。 |
 | `ti_c2000_run_read.ps1 -Mode ReadOnly` | 读慢变量；不编译、不下载、不连接、不 halt。 |
-| `ti_c2000_read_dma.ps1 -Mode ReadOnly -FrozenBufferReady` | 读固件冻结的**连续录波数组**——这是本 skill 唯一的数组读法，见下文「连续录波」。DMA 双缓冲与 bank 选择已于 2026-11-18 移除。 |
+| `ti_c2000_read_dma.ps1 -Mode ReadOnly -FrozenBufferReady` | 读固件冻结的**连续录波数组**——这是本 skill 唯一的数组读法，见下文「连续录波」。（点数按用途选：200 点约 20 ms，用于快速验证参数；1000~5000 点用于看波形。）DMA 双缓冲与 bank 选择已于 2026-11-18 移除。 |
 | 两个读入口的 `-Mode LoadRead -ConfirmLoad` | 必要时停止旧会话，调用常驻服务加载一次，再经相同 ReadOnly 判据读取；读完保留服务。`-Standalone` 仅是此路径的旧别名。 |
 | `ti_c2000_iterate.ps1 -UserApproved -Expect ...` | 只有用户明确要求连续运行才重复构建/加载/读/判据；最多 20 轮，下载间隔至少 5 秒。 |
 | `ti_c2000_service.ps1 -Stop` | 显式结束会话。DSS 需要释放调试状态，可能暂时使探针重新枚举；不是普通读数步骤。 |
@@ -31,7 +31,36 @@
 
 ## 连续录波：唯一的数据读取方式
 
-**要把波形取出来，只有这一条路。** DMA 双缓冲、ping-pong、bank 选择那一套已于 2026-11-18 从本 skill 移除——它要求 JTAG 在 DMA 持续覆写内存的同时去读，实测结果是：
+**读数组之前必须先过数据可靠性校验 —— 这是前提，也是判据来源。**
+
+```powershell
+# 前提：读前 5 条证据 + 读后 1/2/4 级判据（详见 data-read-verdict.md）
+ti_c2000_run_read.ps1 -Variables gMsTick,gAmpFb,gCtrlLogFrozen -Mode ReadOnly   # 要 HEARTBEAT: OK
+# 取数：数组读还要过第 3 级（完成标志、复制前后不变、点数齐全）
+ti_c2000_read_dma.ps1 -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
+```
+
+不先过校验就直接读数组，数字可能来自「早已停机」「上一轮残留数组」「另一份固件」，
+而**这三种情况下数字都看起来正常**。判据分两层，缺任一项都要判 `result: FAIL`：
+
+| 层 | 关键项 | 出处 |
+|---|---|---|
+| **读前** | `ALIVE` 心跳推进、`gFwId` 与加载记录一致、`.out` 不比源码旧且 SHA256 匹配、探针/会话/目标应答、加载次数 | `data-read-verdict.md`「读前：先告知来源与状态」 |
+| **读后** | 1 身份仍一致；2 跨轮心跳推进（给了 `-RateVar` 则查速率容差）；3 冻结标志/复制前后不变/点数齐全；4 数值可解析且有限、范围逐点检查 | `data-read-verdict.md`「读后：四级判据」 |
+
+**要把波形取出来，只有这一条路。** 机制始终是「ISR 采满 → 置冻结标志 → ISR 停止写入 →
+JTAG 读静态数组」，**点数按用途选**（10 kHz 控制下）：
+
+| 点数 | 时长（10 kHz 控制）| 用途 |
+|---|---|---|
+| **200**（冻结小数组）| **20 ms = 1 个工频周期** | **快速验证**：系统参数是否收敛、关键运行变量是否在预期范围 |
+| 1000~5000（连续录波）| 100~500 ms = 5~25 个工频周期 | **量周期、相位、频率、THD、观察瞬态** |
+
+**同一个 `ti_c2000_read_dma.ps1 -FrozenBufferReady` 入口，只差 `-ArrayName` 和 `-Rows`。**
+小数组的意义是"够快就能多验几次"：200 点只要 20 ms 就采满，参数一改就能立刻验证；
+大数组是为了一次看清波形形状。
+
+DMA 双缓冲、ping-pong、bank 选择那一套已于 2026-11-18 从本 skill 移除——它要求 JTAG 在 DMA 持续覆写内存的同时去读，实测结果是：
 
 ```
 6 槽环形快照：读 512 字全部返回 0x200000，随后 target is not connected

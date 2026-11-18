@@ -306,13 +306,27 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
         Out2 ('PROBE   : [1/5] Windows 枚举 : {0} 个可用设备 / {1} 个幽灵(Unknown 或 Present=False)' -f $usableCount, $ghostCount)
         if ($usableCount -eq 0 -and -not $inv.SerialOk) { Stop-NoProbe }
 
-        # --- L2 FTDI 驱动能否打开：PnP 枚举 ≠ 驱动访问 ---
-        if ($inv.SerialOk) {
-            Out2 'PROBE   : [2/5] FTDI 驱动    : OK（xds100serial 能打开探针）'
-        } elseif ($sessionAlive) {
-            Out2 'PROBE   : [2/5] FTDI 驱动    : SKIP（活跃 DSS 会话占着探针，属正常）'
+        # --- L2 句柄占用 / 串号可读性 -------------------------------------------
+        # 2026-11-18 控制实验（同一块板、同一分钟）：
+        #   A) DSS 会话运行中（LOAD #108 正常跑）-> xds100serial -l 报
+        #      "No XDS100 emulators were found"
+        #   B) 停会话 3 秒后 -> 立刻读到 0403/a6d0 XDS100v1/v2 TI90I42A
+        # 结论：该工具的成败只反映"FTDI 句柄有没有被占用"，**不能**用来判定探针好坏。
+        # 所以这里不再输出 FAIL，只报告事实；真正的可用性判据是 [4b] 的 DSS 试连。
+        $staleProcs = @(Get-Process -Name dss,java -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        if ($staleProcs.Count -gt 0) {
+            Out2 ('PROBE   : [2/5] 残留 DSS/Java : {0} 个（pid {1}）—— 这些进程可能仍占着 FTDI 句柄' -f $staleProcs.Count, ($staleProcs -join ','))
         } else {
-            Out2 'PROBE   : [2/5] FTDI 驱动    : FAIL（xds100serial 打不开任何 XDS100）'
+            Out2 'PROBE   : [2/5] 残留 DSS/Java : 无'
+        }
+        if ($inv.SerialOk) {
+            Out2 'PROBE   : [2/5] 串号可读性    : OK（xds100serial 已打开探针）'
+        } elseif ($sessionAlive) {
+            Out2 'PROBE   : [2/5] 串号可读性    : SKIP（活跃会话占着句柄，属正常，不是故障）'
+        } elseif ($staleProcs.Count -gt 0) {
+            Out2 'PROBE   : [2/5] 串号可读性    : 被残留进程占用（先清理它们，不要动硬件）'
+        } else {
+            Out2 'PROBE   : [2/5] 串号可读性    : 读不到（这本身不足以判定探针坏，见 [4b]）'
         }
 
         # --- L3 实物串号：唯一可信身份 ---
@@ -353,18 +367,24 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
         if ($attachedSerials.Count -eq 1) { $autoSerial = $attachedSerials[0] }
         elseif ($attachedSerials.Count -gt 1 -and $pinnedFlag -and ($attachedSerials -contains $cfgSerial)) { $autoSerial = $cfgSerial }
 
+        # 只报告事实。串号不是 skill 的依赖项：ccxml 原样交给 DSS，除非调用方显式给了
+        # -ProbeSerial / TI_C2000_PROBE_SERIAL / targetConfigs\probe-serial.txt。
         if ($pinnedFlag -and $autoSerial -eq $cfgSerial) {
             Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}（与实物一致）' -f $cfgSerial)
         } elseif ($pinnedFlag -and $autoSerial) {
             Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}，实物是 {1}' -f $cfgSerial, $autoSerial)
-            Out2 ('PROBE   :                     -> 运行时自动生成临时副本按 {0} 连接；工程文件不改' -f $autoSerial)
+            Out2 'PROBE   :                     -> 默认仍按 ccxml 原样使用；要改用实物串号请显式传 -ProbeSerial'
         } elseif ($pinnedFlag) {
-            Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}（实物串号此刻读不到，按原样使用）' -f $cfgSerial)
+            Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}（实物串号此刻读不到）' -f $cfgSerial)
         } elseif ($autoSerial) {
-            Out2  'PROBE   : [4/5] ccxml 选择   : 默认 "Only one XDS100"（多探针时不安全）'
-            Out2 ('PROBE   :                     -> 运行时自动按实物串号 {0} 生成临时副本' -f $autoSerial)
+            Out2 'PROBE   : [4/5] ccxml 选择   : 默认 "Only one XDS100"（没有 pin 串号）'
         } else {
             Out2 'PROBE   : [4/5] ccxml 选择   : 默认 "Only one XDS100"（实物串号不可读）'
+        }
+        # 不依赖串号的根治建议：清掉幽灵，让"自动选择"本身可用。
+        if ($ghostCount -gt 0 -and -not $pinnedFlag) {
+            Out2 ('PROBE   : [4/5] 建议         : {0} 个幽灵实例；若遇到 -215/连不上，用管理员运行' -f $ghostCount)
+            Out2 'PROBE   :                    tools\clean_ghost_probes.ps1 -Confirm（清掉它们，而不是填串号）'
         }
 
         # --- 4b) 可选：让 DSS 自己打开一次（型号无关的最终判据）--------------------
@@ -389,15 +409,21 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
             }
         }
 
-        # --- L5 判定：只有"无法自动适配"才 FAIL ---
+        # --- L5 判定：只保留两条站得住的失败条件 --------------------------------
+        # 已删除的两个旧判据（2026-11-18 控制实验反证）：
+        #   a) "xds100serial 读不到 → PROBE_DRIVER_UNUSABLE"
+        #      反证：会话运行中(LOAD #108)它就报找不到，停会话 3 秒后立刻找到。
+        #      该工具的成败与能否下载无关，拿它判探针坏会误伤。
+        #   b) "有幽灵 + 默认 Only one → PROBE_SELECTION_AMBIGUOUS"
+        #      反证：幽灵是 Present=False（物理不存在），DSS 打开的是在场设备，
+        #      打不开一个不存在的设备这件事本身不成立，因此不构成歧义。
+        # 留下的判据必须是"要么有硬证据、要么能自动恢复"。
         $fail = ''
         if ($deepFail) {
             $fail = $deepFail
         } elseif ($attachedSerials.Count -gt 1 -and -not $autoSerial) {
-            # 多块探针 + ccxml 没指定其中任何一块：猜不出来，必须人来指定。
+            # 真的有多块实物探针同时在场，且 ccxml 没指定其中任何一块：确实猜不出来。
             $fail = 'PROBE_SELECTION_AMBIGUOUS'
-        } elseif (-not $inv.SerialOk -and -not $sessionAlive) {
-            $fail = 'PROBE_DRIVER_UNUSABLE'
         }
 
         switch ($fail) {
@@ -412,37 +438,15 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
                 Out2 'NOTE    : 不要改 BOOT 引脚——BOOT 只决定目标从哪里启动，与探针能否打开无关'
                 exit 3
             }
-            'PROBE_SERIAL_MISMATCH' {
-                Out2 'PROBE   : [5/5] 结论         : 软件问题（ccxml 串号写错）—— 不要动硬件'
-                Out2 'FAILURE: PROBE_SERIAL_MISMATCH'
-                Out2 'RESULT: FAIL'
-                Out2 ('REASON: .ccxml 指定串号 {0}，实物是 {1}' -f $cfgSerial, $serialBlob)
-                Out2 'FIX     : 只改 ccxml 的 "-- Enter the serial number" 为实物串号（other-devices-and-probes.md §3.1）'
-                Out2 'FIX     : 不用拔线、不用改 BOOT、不用换探针；改完重跑本检查'
-                exit 3
-            }
             'PROBE_SELECTION_AMBIGUOUS' {
-                Out2 'PROBE   : [5/5] 结论         : 软件问题（ccxml 没按串号选，会打开幽灵实例）—— 不要动硬件'
+                Out2 'PROBE   : [5/5] 结论         : 有 {0} 块实物探针在场，无法确定用哪一块 —— 不要动硬件' -f $attachedSerials.Count
                 Out2 'FAILURE: PROBE_SELECTION_AMBIGUOUS'
                 Out2 'RESULT: FAIL'
-                Out2 ('REASON: ccxml 用默认 "Only one XDS100"，但枚举到 {0} 个可用设备 + {1} 个幽灵' -f $usableCount, $ghostCount)
-                Out2 '        DSS 会挑中不可用的那个 -> Error -151（设备管理器看起来一切正常）'
-                if ($inv.SerialOk) {
-                    Out2 ('FIX     : 在 ccxml 里加按串号选择（Emulator Selection Value="1"），串号填 {0}' -f ($serialBlob -replace '.*?XDS100\S*\s+(\S+)\s+.*', '$1'))
-                } else {
-                    Out2 'FIX     : 先确认实物串号（xds100serial -l），再在 ccxml 里按该串号选择'
-                }
+                Out2 ('REASON: 检测到 {0} 块实物探针（{1}），ccxml 没有指定其中任何一块' -f $attachedSerials.Count, ($attachedSerials -join ', '))
+                Out2 'FIX     : 三选一显式指定 —— -ProbeSerial <串号> / $env:TI_C2000_PROBE_SERIAL /'
+                Out2 '          targetConfigs\probe-serial.txt（每行一个串号）'
+                Out2 'FIX     : 不要拔线、不要改 BOOT；这只是"选哪一块"，不是探针故障'
                 Out2 'FIX     : 不要拔线、不要改 BOOT；改完重跑本检查'
-                exit 3
-            }
-            'PROBE_DRIVER_UNUSABLE' {
-                Out2 'PROBE   : [5/5] 结论         : 软件层已排除（无幽灵、串号无冲突）—— 才轮到硬件'
-                Out2 'FAILURE: PROBE_DRIVER_UNUSABLE'
-                Out2 'RESULT: FAIL'
-                Out2 ('REASON: Windows 枚举到 {0} 个设备，但 xds100serial 打不开任何一个，且没有活跃会话占用' -f $usableCount)
-                Out2 'FIX     : 1) 重新插拔探针 USB，再跑本检查（这一步才是硬件动作）'
-                Out2 'FIX     : 2) 仍失败再换 USB 口/线；3) 最后才怀疑探针或目标板供电'
-                Out2 'NOTE    : 不要改 BOOT 引脚——BOOT 只影响目标启动，与探针能否打开无关'
                 exit 3
             }
             default {
@@ -451,9 +455,9 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
                 } elseif ($pinnedFlag -and $autoSerial -eq $cfgSerial) {
                     Out2 ('PROBE   : [5/5] 结论         : 软件层全部通过（ccxml 串号 {0} 与实物一致）—— 不要动硬件' -f $cfgSerial)
                 } elseif ($autoSerial) {
-                    Out2 ('PROBE   : [5/5] 结论         : 软件层通过；运行时按实物串号 {0} 自动适配（工程文件不改）—— 不要动硬件' -f $autoSerial)
+                    Out2 ('PROBE   : [5/5] 结论         : 软件层通过；-Start 时会把实物串号 {0} 写进 ccxml —— 不要动硬件' -f $autoSerial)
                 } else {
-                    Out2 'PROBE   : [5/5] 结论         : 软件层通过（串号此刻不可读，按原 ccxml 使用）—— 不要动硬件'
+                    Out2 'PROBE   : [5/5] 结论         : 软件层通过（串号此刻不可读；-Start 时读不到就原样用 ccxml）—— 不要动硬件'
                 }
             }
         }

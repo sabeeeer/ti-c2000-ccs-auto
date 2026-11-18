@@ -155,19 +155,22 @@ or the budget runs out. Its result is only as strong as -ProbeCheck: the current
 later with connect and isConnected. Do not call a PnP result "openable".
 #>
 # =============================================================================
-# Probe identity resolution -- keeps the project .ccxml FREE of a hard-coded serial.
+# Probe identity resolution -- used by the -Deep check only (read-only).
 #
-# Why: writing "TI90I42A" into the project's .ccxml ties the project to one physical
-# probe. Any other probe then fails with PROBE_SERIAL_MISMATCH, and the usual reaction
-# is to edit the project file again (or blame the hardware). Instead the project file
-# may stay portable ("Only one XDS100", or another probe's serial) and this function
-# resolves it at run time against the probe that is actually attached:
+# NOT the main path any more. The main path is Sync-ProbeSerialToCcxml (below), which
+# writes the attached probe's serial INTO the project .ccxml so DSS addresses one known
+# device instead of enumerating (enumeration times out with -215 on machines that carry
+# several historical probe records).
+#
+# This function is kept for the -Deep probe check, where we want a throwaway copy and
+# must not touch the project file. It never fails because of a serial mismatch: the
+# serial is only ever used to pick which probe to address, never as a pass/fail criterion.
 #
 #   serial source priority:
 #     1. -Serial <value>                       explicit, always wins
 #     2. $env:TI_C2000_PROBE_SERIAL            per-machine / CI override
 #     3. <project>\targetConfigs\probe-serial.txt   one serial per line, '#' comments
-#     4. xds100serial -l output                the only trustworthy physical identity
+#     4. xds100serial -l / xdsdfu -e output    physical identity
 #     5. the serial already in .ccxml          last resort (unverified)
 #
 #   decision:
@@ -241,6 +244,136 @@ function Get-ConfiguredProbeSerial {
     }
     $s = [regex]::Match($CcxmlText, 'Value="([^"]*)"\s+id="-- Enter the serial number"')
     if ($s.Success) { $r.Serial = $s.Groups[1].Value }
+    return $r
+}
+
+# =============================================================================
+# Sync-ProbeSerialToCcxml -- "探针确认"动作，串号的唯一用途。
+#
+# 设计分工（用户 2026-11-18 定）：
+#   串号**不是**配置前提，也不是任何判据的输入。它只做一件事：
+#     上机前确认"现在插着的是哪一块"，并把这个事实写进工程 .ccxml，
+#     让 DSS 精确寻址一块已知设备，而不是去枚举（枚举在多残留实例的机器上会
+#     -215 semaphore timeout —— 同路径 A/B 实测两次复现）。
+#   除此之外，编译 / 下载 / 读取 / 判据 / 报告都不再引用串号。
+#
+# 串号来源优先级（全部无需人工输入）：
+#   1. -Serial            显式指定（CI / 多探针场景）
+#   2. $env:TI_C2000_PROBE_SERIAL
+#   3. <project>\targetConfigs\probe-serial.txt
+#   4. 自动发现：XDS100 -> xds100serial -l，XDS110 -> xdsdfu -e
+#   5. 读不到 -> 什么都不改，原 .ccxml 原样使用（绝不因此判失败）
+#
+# 写回是**最小改写**：只动 "-- Enter the serial number" 的 Value（或插入串号块），
+# driver / device / ICEPick_C router / Subpath / configuration id 一个字节都不碰；
+# 写前 [xml] 解析 + driver 节点数比对 + 串号存在性校验，任一不过就放弃写入。
+# 写入前自动生成 .bak。
+# =============================================================================
+function Sync-ProbeSerialToCcxml {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [Parameter(Mandatory)][string]$Ccxml,
+        [string]$Serial = '',
+        [string]$CcsPath = '',
+        [string]$Xds100Tool = '',
+        [switch]$DryRun
+    )
+    $r = [pscustomobject]@{
+        Serial = ''; SerialSource = 'none'; Changed = $false; Path = $Ccxml
+        Ok = $true; Note = ''
+    }
+    if (-not (Test-Path -LiteralPath $Ccxml)) { $r.Ok = $false; $r.Note = 'ccxml not found'; return $r }
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($Ccxml) } catch { $r.Ok = $false; $r.Note = 'ccxml unreadable'; return $r }
+    $cfg = Get-ConfiguredProbeSerial -CcxmlText $text
+
+    # ---- 1) 确认现在插着哪一块 ----
+    $use = ''; $src = 'none'
+    if ($Serial) { $use = $Serial.Trim(); $src = 'param' }
+    if (-not $use -and $env:TI_C2000_PROBE_SERIAL) { $use = $env:TI_C2000_PROBE_SERIAL.Trim(); $src = 'env' }
+    if (-not $use) {
+        $f = Join-Path $ProjectPath 'targetConfigs\probe-serial.txt'
+        if (Test-Path -LiteralPath $f) {
+            $lines = @(Get-Content -LiteralPath $f | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+            if ($lines.Count -gt 0) { $use = $lines[0]; $src = 'file' }
+        }
+    }
+    if (-not $use) {
+        $attached = @(Get-AttachedProbeSerials -CcsPath $CcsPath -Xds100Tool $Xds100Tool)
+        if ($attached.Count -eq 1) { $use = $attached[0].Serial; $src = 'discovered' }
+        elseif ($attached.Count -gt 1) {
+            $hit = @($attached | Where-Object { $_.Serial -eq $cfg.Serial })
+            if ($hit.Count -eq 1) { $use = $hit[0].Serial; $src = 'discovered' }
+            else {
+                $r.Note = ('{0} probes attached ({1}) - cannot pick one silently; ccxml left as-is' -f
+                    $attached.Count, (($attached | ForEach-Object { $_.Serial }) -join ', '))
+                return $r
+            }
+        }
+    }
+    if (-not $use) {
+        $r.Serial = $cfg.Serial
+        $r.SerialSource = 'unavailable'
+        $r.Note = 'attached probe could not be read right now; ccxml used unchanged (not a failure)'
+        return $r
+    }
+    $r.Serial = $use
+    $r.SerialSource = $src
+
+    # ---- 2) 已经一致：不写文件 ----
+    if ($cfg.Pinned -and $cfg.Serial -eq $use) {
+        $r.Note = 'ccxml already names the attached probe - no change'
+        return $r
+    }
+
+    # ---- 3) 最小改写 ----
+    $newText = $text
+    if ($text -match 'id="-- Enter the serial number"') {
+        $newText = [regex]::Replace($newText, '(<property[^>]*id="-- Enter the serial number"[^>]*/>)', {
+            param($m) [regex]::Replace($m.Value, 'Value="[^"]*"', ('Value="{0}"' -f $use))
+        })
+        if ($newText -notmatch 'id="Emulator Selection"[\s\S]{0,400}?Value="1"') {
+            $newText = [regex]::Replace($newText, '(<property\b[^>]*id="Emulator Selection"[^>]*>)', {
+                param($m) [regex]::Replace($m.Value, '\bValue="[^"]*"', 'Value="1"')
+            })
+        }
+    } else {
+        $nl = "`r`n"
+        $block = '            <property Type="choicelist" Value="1" id="Emulator Selection">' + $nl +
+                 '                <choice Name="Select by serial number" value="0">' + $nl +
+                 ('                    <property Type="stringfield" Value="{0}" id="-- Enter the serial number"/>' -f $use) + $nl +
+                 '                </choice>' + $nl +
+                 '            </property>' + $nl
+        $idx = $newText.IndexOf('<platform')
+        if ($idx -lt 0) { $r.Ok = $false; $r.Note = 'no <platform> node; refusing to modify'; return $r }
+        $lineStart = $newText.LastIndexOf("`n", [Math]::Max(0, $idx - 1))
+        if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart += 1 }
+        $newText = $newText.Substring(0, $lineStart) + $block + $newText.Substring($lineStart)
+    }
+
+    # ---- 4) 写前自校验：合法 XML / 串号在 / driver 数不变 / device 还在 ----
+    try { [void][xml]$newText } catch { $r.Ok = $false; $r.Note = 'generated ccxml is not valid XML; not written'; return $r }
+    if ($newText -notmatch [regex]::Escape($use)) { $r.Ok = $false; $r.Note = 'serial missing after edit; not written'; return $r }
+    if (([regex]::Matches($text, 'xmlpath="drivers"')).Count -ne ([regex]::Matches($newText, 'xmlpath="drivers"')).Count) {
+        $r.Ok = $false; $r.Note = 'driver node count would change; not written'; return $r
+    }
+    if (($text -match 'partnum=') -and ($newText -notmatch 'partnum=')) {
+        $r.Ok = $false; $r.Note = '<device> node would be lost; not written'; return $r
+    }
+
+    if ($DryRun) {
+        $r.Changed = $true
+        $r.Note = ('would set serial to {0} (dry run)' -f $use)
+        return $r
+    }
+    try {
+        Copy-Item -LiteralPath $Ccxml -Destination ($Ccxml + '.bak') -Force
+        [IO.File]::WriteAllText($Ccxml, $newText)
+    } catch {
+        $r.Ok = $false; $r.Note = 'write failed: ' + $_.Exception.Message; return $r
+    }
+    $r.Changed = $true
+    $r.Note = ('ccxml serial set to {0} (probe identity only; nothing else depends on it)' -f $use)
     return $r
 }
 
