@@ -100,7 +100,23 @@ $entryNames = @('AGENTS.md', 'CODEBUDDY.md', 'CLAUDE.md')
 $rootEntries = @($entryNames | ForEach-Object { Join-Path $root $_ })
 $missingRoot = @($rootEntries | Where-Object { -not (Test-Path -LiteralPath $_) })
 if ($missingRoot.Count -gt 0) {
-    $violations.Add(('project root is missing AI entry file(s): ' + (($missingRoot | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') + '; run tools/init_project_entry.ps1 or merge existing instructions'))
+    # 自动触发（2026-11-18 用户要求）：调用 skill 就该产生可验证的事件，
+    # 而不是等某个 AI 记得去跑 tools\init_project_entry.ps1。
+    # 该工具只在缺失时写入，已有内容一律 SKIP 或 REFUSE，不会覆盖手写规则。
+    $skillRootForInit = Split-Path $PSScriptRoot -Parent
+    $initTool = Join-Path $skillRootForInit 'tools\init_project_entry.ps1'
+    if (Test-Path -LiteralPath $initTool) {
+        $initOut = @(& $initTool -ProjectPath $root 2>&1)
+        foreach ($line in $initOut) {
+            if ([string]$line -match 'CREATED|SKIP|REFUSE|EXISTS') { $notes.Add('init: ' + ([string]$line).Trim()) }
+        }
+        $missingRoot = @($rootEntries | Where-Object { -not (Test-Path -LiteralPath $_) })
+    }
+    if ($missingRoot.Count -gt 0) {
+        $violations.Add(('project root is missing AI entry file(s): ' + (($missingRoot | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') + '; run tools/init_project_entry.ps1 or merge existing instructions'))
+    } else {
+        $notes.Add('auto-created the missing AI entry file(s) via init_project_entry.ps1')
+    }
 } else {
     $entryTexts = @($rootEntries | ForEach-Object { [IO.File]::ReadAllText($_) })
     if (@($entryTexts | Sort-Object -Unique).Count -ne 1) {

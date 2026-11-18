@@ -25,8 +25,17 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 
 **三者分别是事前阻断 / 事中自证 / 事后追查**，任一环独立生效：即使跳过了 ①，②③ 也能把"没走 skill"暴露出来。
 
-**第 ① 条顺带保证 `BUILD_VERIFICATION.txt` 存在**（不存在就当场创建，带表头），
-且 **`build.ps1` / `service.ps1` 成功后会各追加一条**（输出里出现 `chglog :` / `CHGLOG  :`）：
+**第 ① 条不是"检查报告"，而是"自动触发"**——它在一次调用里就补齐所有缺的东西：
+
+| 缺失项 | 自动动作 | 输出里能看到 |
+|---|---|---|
+| `BUILD_VERIFICATION.txt` | 创建（带表头，只追加不覆盖）| `CHECK : created BUILD_VERIFICATION.txt` |
+| `AGENTS.md` / `CODEBUDDY.md` / `CLAUDE.md` | 调 `tools\init_project_entry.ps1` 生成三份**内容一致**的入口文档 | `CHECK : init: CREATED : ...\AGENTS.md` |
+| 三份已存在但内容不同 | **不自动覆盖**（可能有人手写了规则）→ 报 VIOLATION 让人合并 | `VIOLATION: ... differ` |
+
+> `init_project_entry.ps1` 要求目录里有 `.cproject`；没有就 `USAGE: NO_PROJECT`（不是工程，不生成入口文档）。
+
+**且 `build.ps1` / `service.ps1` 成功后会各追加一条**（输出里出现 `chglog :` / `CHGLOG  :`）：
 
 ```
 2026-11-18 20:35:01 | build | config CPU1_RAM, compile OK, link OK, 0 warning(s), 25 source(s) | out 592,642 B, entry=code_start
