@@ -48,6 +48,11 @@ param(
     [switch]$Stop,
     [switch]$Status,
     [string]$Ccxml = '',
+    # Physical probe serial to pin at run time. Empty = resolve automatically:
+    # $env:TI_C2000_PROBE_SERIAL -> targetConfigs\probe-serial.txt -> xds100serial -l.
+    # The project .ccxml is then used as-is when it already pins that serial, otherwise a
+    # resolved COPY is generated next to the session and the project file stays portable.
+    [string]$ProbeSerial = '',
     [string]$OutFile = '',
     [string]$MapFile = '',
     # Refuse by default when the map's ENTRY POINT SYMBOL is not _c_int00: measured twice
@@ -459,6 +464,27 @@ if (-not $ccsPath) { Out2 'FAILURE: ENV_NO_CCS'; Out2 'RESULT: FAIL'; Out2 'REAS
 $dss = Join-Path $ccsPath 'ccs_base\scripting\bin\dss.bat'
 if (-not (Test-Path -LiteralPath $dss)) { Out2 'FAILURE: ENV_NO_DSS'; Out2 'RESULT: FAIL'; Out2 "REASON: dss.bat not found under '$ccsPath'"; exit 1 }
 
+# ---- resolve the probe serial at run time ------------------------------------
+# The project .ccxml is NOT required to name a serial (it would tie the project to one
+# physical probe). Priority: -ProbeSerial -> $env:TI_C2000_PROBE_SERIAL ->
+# targetConfigs\probe-serial.txt -> xds100serial -l (physical identity) -> .ccxml as-is.
+# When the resolved serial differs from what the project file pins, a resolved COPY is
+# written under readout\.service and handed to DSS; the project file is never modified.
+# This is what makes the same project work with any attached probe.
+$ccxmlOriginal = $Ccxml
+$resolvedCfg = Resolve-ProbeTargetConfig -ProjectPath $ProjectPath -Ccxml $Ccxml -Serial $ProbeSerial `
+    -WorkDir $svcDir -CcsPath $ccsPath -Xds100Tool (Join-Path $ccsPath 'ccs_base\common\uscif\xds100serial.exe')
+if ($resolvedCfg.Serial) {
+    Info2 ('PROBE   : serial {0} (source={1})' -f $resolvedCfg.Serial, $resolvedCfg.SerialSource)
+}
+if ($resolvedCfg.Path -ne $ccxmlOriginal) {
+    $Ccxml = $resolvedCfg.Path
+    Info2 ('CCXML   : resolved copy -> {0}' -f $Ccxml)
+    Info2 'CCXML   : project file untouched (portable; see targetConfigs\probe-serial.txt)'
+} elseif ($resolvedCfg.Note) {
+    Info2 ('NOTE    : ' + $resolvedCfg.Note)
+}
+
 New-Item -ItemType Directory -Path $svcDir -Force | Out-Null
 # from here on the target is being taken: hold the lock so no read can attach while
 # the image is being written (checked after the cheap build/probe work on purpose)
@@ -704,7 +730,8 @@ else { Write-Output 'FAILURE: DSS_BOOT_MISSING'; Write-Output 'RESULT: FAIL'; Wr
 
 Info2 "PROJECT : $ProjectPath"
 Info2 "CCS     : $ccsPath"
-Info2 "CCXML   : $Ccxml"
+Info2 "CCXML   : $ccxmlOriginal"
+if ($Ccxml -ne $ccxmlOriginal) { Info2 "CCXML   : using resolved copy $Ccxml" }
 Info2 "OUT     : $OutFile"
 Info2 "SESSION : $svcDir"
 Info2 'STEP    : connect -> reset -> load once -> run forever'
@@ -715,7 +742,7 @@ Info2 'STEP    : connect -> reset -> load once -> run forever'
 $cmdLine = '/d /s /c ""' + $dss + '" "' + $jsPath + '" > "' + $logFile + '" 2>&1"'
 # Enumeration is only the first layer. Let build and setup time count toward the
 # learned Stop-to-DSS interval; the later connect result updates this record.
-Wait-ProbeDriverGap -ProjectPath $ProjectPath -Ccxml $Ccxml -Quiet:$Quiet
+Wait-ProbeDriverGap -ProjectPath $ProjectPath -Ccxml $ccxmlOriginal -Quiet:$Quiet
 Wait-MinLoadGap -ProjectPath $ProjectPath
 $psi = $null
 try { $psi = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -PassThru -WindowStyle Hidden -ErrorAction Stop }
@@ -763,7 +790,7 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
         # No reset or load has happened yet. A PnP hit may precede driver access, so
         # add 5 s to the observed failed Stop-to-connect interval and retry once in a
         # fresh process. Subsequent Stop/Start cycles begin at the good/bad midpoint.
-        Mark-ProbeDriverFailure -ProjectPath $ProjectPath -Ccxml $Ccxml
+        Mark-ProbeDriverFailure -ProjectPath $ProjectPath -Ccxml $ccxmlOriginal
         if (-not $env:TI_C2000_CONNECT_RETRY) {
             Out2 'NOTE    : DSS connect failed before load; increasing the recovery interval for this probe configuration and retrying once'
             $env:TI_C2000_CONNECT_RETRY = '1'
@@ -829,7 +856,7 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
 }
 
 # READY is written only after DSS connected, verified the target, loaded and ran.
-Mark-ProbeDriverSuccess -ProjectPath $ProjectPath -Ccxml $Ccxml
+Mark-ProbeDriverSuccess -ProjectPath $ProjectPath -Ccxml $ccxmlOriginal
 
 $resolvedCore = if (Test-Path -LiteralPath $coreFile) { ([string](Get-Content -LiteralPath $coreFile -Raw)).Trim() } else { '' }
 if (-not $resolvedCore) {
@@ -849,7 +876,10 @@ $state = [ordered]@{
     outSha256 = $outSha
     map       = $MapFile
     mapSha256 = $mapSha
-    ccxml     = (Get-Item -LiteralPath $Ccxml).FullName
+    ccxml     = (Get-Item -LiteralPath $ccxmlOriginal).FullName
+    # The project file stays the recorded identity; the resolved copy (if any) is extra state.
+    ccxmlResolved = $(if ($Ccxml -ne $ccxmlOriginal) { (Get-Item -LiteralPath $Ccxml).FullName } else { '' })
+    probeSerial   = [string]$resolvedCfg.Serial
     core      = $resolvedCore
     corePattern = $CorePattern
     status    = 'RUNNING'

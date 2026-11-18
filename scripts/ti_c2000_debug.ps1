@@ -28,6 +28,12 @@ param(
     [switch]$LoadOnly,
     [switch]$ConfirmLoad,
     [switch]$ProbeCheckOnly,
+    # With -ProbeCheckOnly: also let DSS open the probe (connect -> isConnected -> disconnect,
+    # never loads). This is the only openability check that holds for EVERY probe type
+    # (XDS100/110/200/560v2/on-board), because it uses the same code path a download does.
+    [switch]$Deep,
+    # Physical probe serial; empty = resolve from env / probe-serial.txt / xds100serial.
+    [string]$ProbeSerial = '',
     [switch]$NoProbeCheck,
     [int]$TimeoutSec     = 180,
     [switch]$Quiet,
@@ -167,31 +173,91 @@ if ($roots.Count -eq 0) { Out2 "FAILURE: ENV_NO_CCS"; Out2 "RESULT: FAIL"; Out2 
 $ccs = $roots[0]
 Info2 "CCS     : $($ccs.Path)  (v$($ccs.Version))"
 
-function Get-ConnectedProbes {
+# Probe library: serial resolution (model independent) + the DSS openability test.
+. (Join-Path $PSScriptRoot 'ti_c2000_probe.ps1')
+
+# -----------------------------------------------------------------------------
+# Probe inventory: three independent facts, never merged into one boolean.
+#   L1 PnP enumeration      - is anything plugged in at all
+#   L2 FTDI driver can open - xds100serial -l; PnP enumeration is NOT driver access
+#   L3 physical serial      - the only trustworthy identity (PnP DeviceID has one
+#                             extra trailing char: ...TI90I42AB -> TI90I42A)
+# 2026-11-18: L1 passed (COM11 + Debug + Aux all OK) while L2 failed ("No XDS100
+# emulators were found") and DSS opened a ghost instance -> Error -151. A check that
+# only looked at L1 reported OK for a full afternoon of failed downloads.
+# -----------------------------------------------------------------------------
+$script:ProbeInventory = $null
+function Get-ProbeInventory {
+    if ($script:ProbeInventory) { return $script:ProbeInventory }
     $probePatterns = 'XDS|Texas Instruments.*(Debug|Emulat|Probe)|Debug Probe|Spectrum Digital|Blackhawk|SEGGER|J-Link|ICDI'
-    $found = @()
+    # 幽灵实例（Present=False / Status=Unknown）**只有 Get-PnpDevice 看得到**；
+    # Get-CimInstance Win32_PnPEntity 只返回当前存在的设备，所以用它永远数不出幽灵
+    # （2026-11-18 实测：CIM 返回 3 条，Get-PnpDevice 返回 12 条 = 3 OK + 9 Unknown）。
+    # 而"有幽灵 + ccxml 默认 Only one"正是 -151 的成因，必须能数出来。
+    $all = @()
+    $usedPnp = $false
     try {
-        $found = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop 2>$null |
-                   Where-Object { $_.Name -match $probePatterns -and
-                       ($null -eq $_.ConfigManagerErrorCode -or $_.ConfigManagerErrorCode -eq 0) -and
-                       (-not $_.PSObject.Properties['Present'] -or $_.Present) })
-    } catch { $found = @() }
-    if ($found.Count -eq 0) {
-        $xdsTool = Join-Path $ccs.Path 'ccs_base\common\uscif\xds100serial.exe'
-        if (Test-Path -LiteralPath $xdsTool) {
-            $xdsRows = @(& $xdsTool -l 2>$null | Where-Object { $_ -match '^[0-9a-fA-F]{4}/[0-9a-fA-F]{4}\s+XDS100' })
-            foreach ($row in $xdsRows) { $found += [pscustomobject]@{ Name = $row.Trim() } }
-        }
+        $all = @(Get-PnpDevice -ErrorAction Stop 2>$null | Where-Object { $_.FriendlyName -match $probePatterns })
+        $usedPnp = $true
+    } catch {
+        $all = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop 2>$null | Where-Object { $_.Name -match $probePatterns })
+    }
+
+    $isReal = {
+        param($d)
+        if ($d.PSObject.Properties['Status']) { return ($d.Status -eq 'OK') }
+        return (($null -eq $d.ConfigManagerErrorCode -or $d.ConfigManagerErrorCode -eq 0) -and
+                (-not $d.PSObject.Properties['Present'] -or $d.Present))
+    }
+    $usable = @($all | Where-Object { & $isReal $_ })
+    $ghosts = @($all | Where-Object { -not (& $isReal $_) })
+
+    $serialOk = $false
+    $serialLines = @()
+    $xdsTool = Join-Path $ccs.Path 'ccs_base\common\uscif\xds100serial.exe'
+    if (Test-Path -LiteralPath $xdsTool) {
+        $rows = @(& $xdsTool -l 2>$null | Where-Object { $_ -match '^[0-9a-fA-F]{4}/[0-9a-fA-F]{4}\s+XDS100' })
+        if ($rows.Count -gt 0) { $serialOk = $true; $serialLines = @($rows | ForEach-Object { $_.Trim() }) }
+    }
+
+    $script:ProbeInventory = [pscustomobject]@{
+        All         = @($all)
+        Usable      = @($usable)
+        Ghosts      = @($ghosts)
+        SerialOk    = $serialOk
+        SerialLines = @($serialLines)
+        SerialTool    = (Test-Path -LiteralPath $xdsTool)
+    }
+    return $script:ProbeInventory
+}
+
+# Backwards-compatible thin wrapper: callers that only need "is something there".
+function Get-ConnectedProbes {
+    $inv = Get-ProbeInventory
+    $found = @($inv.Usable)
+    if ($found.Count -eq 0 -and $inv.SerialOk) {
+        $found = @($inv.SerialLines | ForEach-Object { [pscustomobject]@{ Name = $_ } })
     }
     return @($found)
 }
 
+function Test-LiveServiceSession([string]$proj) {
+    $stateFile = Join-Path $proj 'readout\.service\state.json'
+    if (-not (Test-Path -LiteralPath $stateFile)) { return $false }
+    try {
+        $st = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+        if ($st.pid -and (Get-Process -Id ([int]$st.pid) -ErrorAction SilentlyContinue)) { return $true }
+    } catch { }
+    return $false
+}
+
 function Stop-NoProbe {
-    Out2 "PROBE   : NOT FOUND"
+    Out2 "PROBE   : [1/5] Windows 枚举 : 0 个可用设备"
     Out2 "FAILURE: NO_PROBE"
     Out2 "RESULT: FAIL"
     Out2 "REASON: no JTAG probe enumerated by Windows (checked: XDS*, Spectrum Digital, Blackhawk, SEGGER, Debug Probe)"
-    Out2 "HINT    : connect the probe and target board, then ask the operator before retrying"
+    Out2 "HINT    : this is the ONE case where the hardware really is absent - connect the probe"
+    Out2 "          and the board, then ask the operator before retrying"
     exit 3
 }
 
@@ -223,6 +289,174 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
         $preProbes = @(Get-ConnectedProbes)
         if ($preProbes.Count -eq 0) { Stop-NoProbe }
         foreach ($item in $preProbes) { Info2 ("PROBE   : {0}" -f $item.Name) }
+
+        # ===== 分层探针自检（5 层判据）=========================================
+        # 判定顺序固定为「软件层 -> 硬件层」：只有软件层全部排除后才允许建议动硬件。
+        # 2026-11-18 的教训：只查 L1(PnP) 就报 OK，而真因在 L4(ccxml 选了幽灵实例)，
+        # 结果把一整个下午浪费在"拔线/改 BOOT"上。
+        $inv = Get-ProbeInventory
+        $sessionAlive = Test-LiveServiceSession -proj $ProjectPath
+        $usableCount = @($inv.Usable).Count
+        $ghostCount  = @($inv.Ghosts).Count
+
+        Out2 ''
+        Out2 'PROBE   : === 探针自检（5 层判据）==='
+
+        # --- L1 Windows 枚举：只回答"插没插" ---
+        Out2 ('PROBE   : [1/5] Windows 枚举 : {0} 个可用设备 / {1} 个幽灵(Unknown 或 Present=False)' -f $usableCount, $ghostCount)
+        if ($usableCount -eq 0 -and -not $inv.SerialOk) { Stop-NoProbe }
+
+        # --- L2 FTDI 驱动能否打开：PnP 枚举 ≠ 驱动访问 ---
+        if ($inv.SerialOk) {
+            Out2 'PROBE   : [2/5] FTDI 驱动    : OK（xds100serial 能打开探针）'
+        } elseif ($sessionAlive) {
+            Out2 'PROBE   : [2/5] FTDI 驱动    : SKIP（活跃 DSS 会话占着探针，属正常）'
+        } else {
+            Out2 'PROBE   : [2/5] FTDI 驱动    : FAIL（xds100serial 打不开任何 XDS100）'
+        }
+
+        # --- L3 实物串号：唯一可信身份 ---
+        if ($inv.SerialOk) {
+            foreach ($line in $inv.SerialLines) { Out2 ('PROBE   : [3/5] 实物串号     : ' + $line) }
+        } elseif ($sessionAlive) {
+            Out2 'PROBE   : [3/5] 实物串号     : 未知（会话占用；-Stop 后可读）'
+        } else {
+            Out2 'PROBE   : [3/5] 实物串号     : 读不到'
+        }
+
+        # --- L4 ccxml 选择：按串号还是默认 Only one ---
+        $preText = ''
+        try { $preText = [System.IO.File]::ReadAllText($preCcxml) } catch { }
+        $selValue = ''
+        $cfgSerial = ''
+        if ($preText) {
+            # CCS 的写入顺序不固定（<property Type="choicelist" Value="1" id="Emulator Selection">），
+            # 先取标签再取 Value，避免属性顺序变化导致解析失败（踩过）。
+            $mSelTag = [regex]::Match($preText, '<property\b[^>]*id="Emulator Selection"[^>]*>')
+            if ($mSelTag.Success) {
+                $mSelVal = [regex]::Match($mSelTag.Value, '\bValue="([^"]*)"')
+                if ($mSelVal.Success) { $selValue = $mSelVal.Groups[1].Value }
+            }
+            $mSer = [regex]::Match($preText, 'Value="([^"]*)"\s+id="-- Enter the serial number"')
+            if ($mSer.Success) { $cfgSerial = $mSer.Groups[1].Value }
+        }
+        $pinnedFlag = ($selValue -eq '1' -and $cfgSerial)
+        $serialBlob = (@($inv.SerialLines) -join ' ')
+        # 从 xds100serial 行里取出串号（形如 "0403/a6d0  XDS100v1/v2  TI90I42A  ..."）
+        $attachedSerials = @()
+        foreach ($line in @($inv.SerialLines)) {
+            $mS = [regex]::Match([string]$line, '^\s*[0-9a-fA-F]{4}/[0-9a-fA-F]{4}\s+(\S+)\s+(\S+)\s+')
+            if ($mS.Success) { $attachedSerials += $mS.Groups[2].Value }
+        }
+        # 运行时能自动确定的串号：只有一块 -> 就它；多块但 ccxml 已指定其中一块 -> 用它。
+        $autoSerial = ''
+        if ($attachedSerials.Count -eq 1) { $autoSerial = $attachedSerials[0] }
+        elseif ($attachedSerials.Count -gt 1 -and $pinnedFlag -and ($attachedSerials -contains $cfgSerial)) { $autoSerial = $cfgSerial }
+
+        if ($pinnedFlag -and $autoSerial -eq $cfgSerial) {
+            Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}（与实物一致）' -f $cfgSerial)
+        } elseif ($pinnedFlag -and $autoSerial) {
+            Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}，实物是 {1}' -f $cfgSerial, $autoSerial)
+            Out2 ('PROBE   :                     -> 运行时自动生成临时副本按 {0} 连接；工程文件不改' -f $autoSerial)
+        } elseif ($pinnedFlag) {
+            Out2 ('PROBE   : [4/5] ccxml 选择   : 按串号 {0}（实物串号此刻读不到，按原样使用）' -f $cfgSerial)
+        } elseif ($autoSerial) {
+            Out2  'PROBE   : [4/5] ccxml 选择   : 默认 "Only one XDS100"（多探针时不安全）'
+            Out2 ('PROBE   :                     -> 运行时自动按实物串号 {0} 生成临时副本' -f $autoSerial)
+        } else {
+            Out2 'PROBE   : [4/5] ccxml 选择   : 默认 "Only one XDS100"（实物串号不可读）'
+        }
+
+        # --- 4b) 可选：让 DSS 自己打开一次（型号无关的最终判据）--------------------
+        # xds100serial 只认识 XDS100；XDS110/XDS200/XDS560v2 没有对应的串号工具，
+        # dbgjtag 又要 CCS 生成的 .dat 而不是 .ccxml。唯一对所有型号都成立的是
+        # "DSS 能不能打开它"——这正是下载用的同一条代码路径。-Deep 才跑（几秒）。
+        $deepFail = ''
+        if ($Deep) {
+            $xdsToolDeep = Join-Path $ccs.Path 'ccs_base\common\uscif\xds100serial.exe'
+            $resolvedDeep = Resolve-ProbeTargetConfig -ProjectPath $ProjectPath -Ccxml $preCcxml -Serial $ProbeSerial `
+                -WorkDir (Join-Path $ProjectPath 'readout\.service') -CcsPath $ccs.Path -Xds100Tool $xdsToolDeep
+            $dssBat = Join-Path $ccs.Path 'ccs_base\scripting\bin\dss.bat'
+            $probeTest = Test-ProbeOpenableByDss -Ccxml $resolvedDeep.Path -DssBat $dssBat -ProjectPath $ProjectPath -CorePattern $CorePattern
+            if ($probeTest.Skipped) {
+                Out2 ('PROBE   : [4b]  DSS 试连   : SKIP（{0}）' -f $probeTest.Detail)
+            } elseif ($probeTest.Ok) {
+                Out2 ('PROBE   : [4b]  DSS 试连   : OK（{0}）' -f $probeTest.Detail)
+            } else {
+                Out2 ('PROBE   : [4b]  DSS 试连   : FAIL（{0}）' -f $probeTest.Detail)
+                if ($probeTest.Log) { Out2 ('PROBE   :                    log: {0}' -f $probeTest.Log) }
+                $deepFail = 'PROBE_DSS_CONNECT_FAILED'
+            }
+        }
+
+        # --- L5 判定：只有"无法自动适配"才 FAIL ---
+        $fail = ''
+        if ($deepFail) {
+            $fail = $deepFail
+        } elseif ($attachedSerials.Count -gt 1 -and -not $autoSerial) {
+            # 多块探针 + ccxml 没指定其中任何一块：猜不出来，必须人来指定。
+            $fail = 'PROBE_SELECTION_AMBIGUOUS'
+        } elseif (-not $inv.SerialOk -and -not $sessionAlive) {
+            $fail = 'PROBE_DRIVER_UNUSABLE'
+        }
+
+        switch ($fail) {
+            'PROBE_DSS_CONNECT_FAILED' {
+                Out2 'PROBE   : [5/5] 结论         : DSS 自己都打不开探针（这就是下载用的同一条路径）'
+                Out2 'FAILURE: PROBE_DSS_CONNECT_FAILED'
+                Out2 'RESULT: FAIL'
+                Out2 'REASON: DSS connect 未通过（型号无关的最终判据，见 probe-openable.log）'
+                Out2 'FIX     : 1) 先看上面 [4/5]：ccxml 是否指向实物串号（配置错比硬件坏常见得多）'
+                Out2 'FIX     : 2) 换一个 USB 口 / 换线，重跑 -ProbeCheckOnly -Deep'
+                Out2 'FIX     : 3) 两者都排除后才怀疑探针本体或目标板供电'
+                Out2 'NOTE    : 不要改 BOOT 引脚——BOOT 只决定目标从哪里启动，与探针能否打开无关'
+                exit 3
+            }
+            'PROBE_SERIAL_MISMATCH' {
+                Out2 'PROBE   : [5/5] 结论         : 软件问题（ccxml 串号写错）—— 不要动硬件'
+                Out2 'FAILURE: PROBE_SERIAL_MISMATCH'
+                Out2 'RESULT: FAIL'
+                Out2 ('REASON: .ccxml 指定串号 {0}，实物是 {1}' -f $cfgSerial, $serialBlob)
+                Out2 'FIX     : 只改 ccxml 的 "-- Enter the serial number" 为实物串号（other-devices-and-probes.md §3.1）'
+                Out2 'FIX     : 不用拔线、不用改 BOOT、不用换探针；改完重跑本检查'
+                exit 3
+            }
+            'PROBE_SELECTION_AMBIGUOUS' {
+                Out2 'PROBE   : [5/5] 结论         : 软件问题（ccxml 没按串号选，会打开幽灵实例）—— 不要动硬件'
+                Out2 'FAILURE: PROBE_SELECTION_AMBIGUOUS'
+                Out2 'RESULT: FAIL'
+                Out2 ('REASON: ccxml 用默认 "Only one XDS100"，但枚举到 {0} 个可用设备 + {1} 个幽灵' -f $usableCount, $ghostCount)
+                Out2 '        DSS 会挑中不可用的那个 -> Error -151（设备管理器看起来一切正常）'
+                if ($inv.SerialOk) {
+                    Out2 ('FIX     : 在 ccxml 里加按串号选择（Emulator Selection Value="1"），串号填 {0}' -f ($serialBlob -replace '.*?XDS100\S*\s+(\S+)\s+.*', '$1'))
+                } else {
+                    Out2 'FIX     : 先确认实物串号（xds100serial -l），再在 ccxml 里按该串号选择'
+                }
+                Out2 'FIX     : 不要拔线、不要改 BOOT；改完重跑本检查'
+                exit 3
+            }
+            'PROBE_DRIVER_UNUSABLE' {
+                Out2 'PROBE   : [5/5] 结论         : 软件层已排除（无幽灵、串号无冲突）—— 才轮到硬件'
+                Out2 'FAILURE: PROBE_DRIVER_UNUSABLE'
+                Out2 'RESULT: FAIL'
+                Out2 ('REASON: Windows 枚举到 {0} 个设备，但 xds100serial 打不开任何一个，且没有活跃会话占用' -f $usableCount)
+                Out2 'FIX     : 1) 重新插拔探针 USB，再跑本检查（这一步才是硬件动作）'
+                Out2 'FIX     : 2) 仍失败再换 USB 口/线；3) 最后才怀疑探针或目标板供电'
+                Out2 'NOTE    : 不要改 BOOT 引脚——BOOT 只影响目标启动，与探针能否打开无关'
+                exit 3
+            }
+            default {
+                if ($sessionAlive -and -not $inv.SerialOk) {
+                    Out2 ('PROBE   : [5/5] 结论         : 会话占用中，链路由该会话负责；串号核对跳过（{0}）—— 不要动硬件' -f $cfgSerial)
+                } elseif ($pinnedFlag -and $autoSerial -eq $cfgSerial) {
+                    Out2 ('PROBE   : [5/5] 结论         : 软件层全部通过（ccxml 串号 {0} 与实物一致）—— 不要动硬件' -f $cfgSerial)
+                } elseif ($autoSerial) {
+                    Out2 ('PROBE   : [5/5] 结论         : 软件层通过；运行时按实物串号 {0} 自动适配（工程文件不改）—— 不要动硬件' -f $autoSerial)
+                } else {
+                    Out2 'PROBE   : [5/5] 结论         : 软件层通过（串号此刻不可读，按原 ccxml 使用）—— 不要动硬件'
+                }
+            }
+        }
     }
     if ($ProbeCheckOnly) {
         Out2 "RESULT: OK"

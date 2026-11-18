@@ -154,6 +154,317 @@ or the budget runs out. Its result is only as strong as -ProbeCheck: the current
 -ProbeCheckOnly callback checks Windows enumeration, while DSS verifies target access
 later with connect and isConnected. Do not call a PnP result "openable".
 #>
+# =============================================================================
+# Probe identity resolution -- keeps the project .ccxml FREE of a hard-coded serial.
+#
+# Why: writing "TI90I42A" into the project's .ccxml ties the project to one physical
+# probe. Any other probe then fails with PROBE_SERIAL_MISMATCH, and the usual reaction
+# is to edit the project file again (or blame the hardware). Instead the project file
+# may stay portable ("Only one XDS100", or another probe's serial) and this function
+# resolves it at run time against the probe that is actually attached:
+#
+#   serial source priority:
+#     1. -Serial <value>                       explicit, always wins
+#     2. $env:TI_C2000_PROBE_SERIAL            per-machine / CI override
+#     3. <project>\targetConfigs\probe-serial.txt   one serial per line, '#' comments
+#     4. xds100serial -l output                the only trustworthy physical identity
+#     5. the serial already in .ccxml          last resort (unverified)
+#
+#   decision:
+#     ccxml already pins the same serial   -> use the project file untouched
+#     ccxml pins a different serial        -> temp copy with the serial replaced
+#     ccxml uses "Only one XDS100"         -> temp copy that pins the discovered serial
+#                                             (ghost instances make "Only one" unsafe)
+#     serial cannot be read                -> use the project file, mark SerialUnknown
+#
+# The temp copy is a MINIMAL edit of the original text (no rebuild, so the <device>
+# node, ICEPick_C router, Subpath and every driver survive), is [xml]-parsed and
+# re-checked before it is written, and lands next to the session for inspection.
+# =============================================================================
+# Serial discovery across probe models. Every vendor exposes a different utility, so this
+# never assumes one. Sources, in the order they are tried:
+#   XDS100 (FTDI)  -> <CCS>\ccs_base\common\uscif\xds100serial.exe -l
+#                      "0403/a6d0  XDS100v1/v2  TI90I42A  Texas Instruments Inc.XDS100 Ver 2.0"
+#   XDS110 (CDC)   -> <CCS>\ccs_base\common\uscif\xds110\xdsdfu.exe -e
+#                      per TI's XDS110 page (emu_xds110.html): 'xdsdfu -e' enumerates and
+#                      prints Serial Num; 8-char printable ASCII, no commas. Firmware/DFU
+#                      states are visible here too (VID 0x1cbe / PID 0x00ff = ROM DFU).
+#   XDS200         -> no serial utility in the emupack; falls through to PnP / DSS.
+#   anything else  -> PnP InstanceId, and ultimately the model-independent DSS test.
+# Parsing is deliberately loose (any 'Serial Num|Number|S/N' shape, 4..32 chars) because
+# the exact wording differs between emupack versions.
+function Get-AttachedProbeSerials {
+    param([string]$CcsPath = '', [string]$Xds100Tool = '')
+    $rows = @()
+
+    # --- XDS100 family (FTDI) ---
+    if ($Xds100Tool -and (Test-Path -LiteralPath $Xds100Tool)) {
+        try {
+            foreach ($line in @(& $Xds100Tool -l 2>$null)) {
+                $m = [regex]::Match([string]$line, '^\s*[0-9a-fA-F]{4}/[0-9a-fA-F]{4}\s+(\S+)\s+(\S+)\s+')
+                if ($m.Success) {
+                    $rows += [pscustomobject]@{ Model = $m.Groups[1].Value; Serial = $m.Groups[2].Value; Raw = ([string]$line).Trim() }
+                }
+            }
+        } catch { }
+    }
+
+    # --- XDS110 family (CDC) ---
+    if ($CcsPath) {
+        $dfu = Join-Path $CcsPath 'ccs_base\common\uscif\xds110\xdsdfu.exe'
+        if (Test-Path -LiteralPath $dfu) {
+            try {
+                foreach ($line in @(& $dfu -e 2>$null | ForEach-Object { [string]$_ })) {
+                    $m = [regex]::Match($line, '(?i)(?:serial\s*(?:num(?:ber)?)?|s/n)\s*[:=]?\s*([A-Za-z0-9_-]{4,32})')
+                    if (-not $m.Success) { continue }
+                    $sn = $m.Groups[1].Value
+                    # 00000000 is the ROM-DFU placeholder, not a real probe identity.
+                    if ($sn -eq '00000000') { continue }
+                    if (@($rows | Where-Object { $_.Serial -eq $sn }).Count -gt 0) { continue }
+                    $rows += [pscustomobject]@{ Model = 'XDS110'; Serial = $sn; Raw = $line.Trim() }
+                }
+            } catch { }
+        }
+    }
+    return @($rows)
+}
+
+function Get-ConfiguredProbeSerial {
+    param([string]$CcxmlText)
+    $r = [pscustomobject]@{ Pinned = $false; Serial = ''; Tag = '' }
+    if (-not $CcxmlText) { return $r }
+    $tag = [regex]::Match($CcxmlText, '<property\b[^>]*id="Emulator Selection"[^>]*>')
+    if ($tag.Success) {
+        $r.Tag = $tag.Value
+        $v = [regex]::Match($tag.Value, '\bValue="([^"]*)"')
+        if ($v.Success -and $v.Groups[1].Value -eq '1') { $r.Pinned = $true }
+    }
+    $s = [regex]::Match($CcxmlText, 'Value="([^"]*)"\s+id="-- Enter the serial number"')
+    if ($s.Success) { $r.Serial = $s.Groups[1].Value }
+    return $r
+}
+
+function Resolve-ProbeTargetConfig {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [Parameter(Mandatory)][string]$Ccxml,
+        [string]$Serial = '',
+        [string]$WorkDir = '',
+        [string]$Xds100Tool = '',
+        [string]$CcsPath = ''
+    )
+    $result = [pscustomobject]@{
+        Path         = $Ccxml
+        Source       = 'project'
+        Serial       = ''
+        SerialSource = 'none'
+        Note         = ''
+        Changed      = $false
+    }
+    if (-not (Test-Path -LiteralPath $Ccxml)) { return $result }
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($Ccxml) } catch { return $result }
+    $cfg = Get-ConfiguredProbeSerial -CcxmlText $text
+
+    # ---- 1) which serial do we believe? ----
+    $useSerial = ''
+    $src = 'none'
+    if ($Serial) { $useSerial = $Serial.Trim(); $src = 'param' }
+    if (-not $useSerial -and $env:TI_C2000_PROBE_SERIAL) { $useSerial = $env:TI_C2000_PROBE_SERIAL.Trim(); $src = 'env' }
+    if (-not $useSerial) {
+        $f = Join-Path $ProjectPath 'targetConfigs\probe-serial.txt'
+        if (Test-Path -LiteralPath $f) {
+            $lines = @(Get-Content -LiteralPath $f | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+            if ($lines.Count -gt 0) { $useSerial = $lines[0]; $src = 'file' }
+        }
+    }
+    if (-not $useSerial) {
+        $attached = @(Get-AttachedProbeSerials -Xds100Tool $Xds100Tool -CcsPath $CcsPath)
+        if ($attached.Count -eq 1) { $useSerial = $attached[0].Serial; $src = 'discovered' }
+        elseif ($attached.Count -gt 1) {
+            # Several probes attached and nothing said which one: prefer the one the
+            # project already pins, otherwise refuse to guess.
+            $match = @($attached | Where-Object { $_.Serial -eq $cfg.Serial })
+            if ($match.Count -eq 1) { $useSerial = $match[0].Serial; $src = 'discovered' }
+            else { $result.Note = ('{0} probes attached ({1}) and none selected - pass -Serial or set TI_C2000_PROBE_SERIAL' -f $attached.Count, (($attached | ForEach-Object { $_.Serial }) -join ', ')); return $result }
+        }
+    }
+    if (-not $useSerial) {
+        # Nothing readable (session holds the FDII handle, or no probe). Keep the project file.
+        $result.Serial = $cfg.Serial
+        $result.SerialSource = 'ccxml'
+        $result.Note = 'attached probe serial not readable now; project .ccxml used as-is'
+        return $result
+    }
+    $result.Serial = $useSerial
+    $result.SerialSource = $src
+
+    # ---- 2) is the project file already correct? ----
+    if ($cfg.Pinned -and $cfg.Serial -eq $useSerial) {
+        $result.Note = ('project .ccxml already pins {0}' -f $useSerial)
+        return $result
+    }
+
+    # ---- 3) minimal edit: pin the discovered serial without touching any other node ----
+    $newText = $text
+    if ($text -match 'id="-- Enter the serial number"') {
+        $newText = [regex]::Replace($newText, '(<property[^>]*id="-- Enter the serial number"[^>]*/>)', {
+            param($m) [regex]::Replace($m.Value, 'Value="[^"]*"', ('Value="{0}"' -f $useSerial))
+        })
+        if ($newText -notmatch 'id="Emulator Selection"[\s\S]{0,400}?Value="1"') {
+            $newText = [regex]::Replace($newText, '(<property\b[^>]*id="Emulator Selection"[^>]*>)', {
+                param($m) [regex]::Replace($m.Value, '\bValue="[^"]*"', 'Value="1"')
+            })
+        }
+    } else {
+        $nl = "`r`n"
+        $block = '            <property Type="choicelist" Value="1" id="Emulator Selection">' + $nl +
+                 '                <choice Name="Select by serial number" value="0">' + $nl +
+                 ('                    <property Type="stringfield" Value="{0}" id="-- Enter the serial number"/>' -f $useSerial) + $nl +
+                 '                </choice>' + $nl +
+                 '            </property>' + $nl
+        $idx = $newText.IndexOf('<platform')
+        if ($idx -lt 0) { $result.Note = 'ccxml has no <platform>; cannot insert the serial block'; return $result }
+        $lineStart = $newText.LastIndexOf("`n", [Math]::Max(0, $idx - 1))
+        if ($lineStart -lt 0) { $lineStart = 0 } else { $lineStart += 1 }
+        $newText = $newText.Substring(0, $lineStart) + $block + $newText.Substring($lineStart)
+    }
+
+    # ---- 4) self-check BEFORE writing: serial correct, node counts unchanged, valid XML ----
+    try { [void][xml]$newText } catch { $result.Note = 'generated ccxml is not valid XML; keeping the project file'; return $result }
+    if ($newText -notmatch [regex]::Escape($useSerial)) { $result.Note = 'generated ccxml does not contain the serial; keeping the project file'; return $result }
+    $drvOld = ([regex]::Matches($text, 'xmlpath="drivers"')).Count
+    $drvNew = ([regex]::Matches($newText, 'xmlpath="drivers"')).Count
+    if ($drvOld -ne $drvNew) { $result.Note = ('driver node count would change ({0}->{1}); keeping the project file' -f $drvOld, $drvNew); return $result }
+    if (($text -match 'partnum=') -and ($newText -notmatch 'partnum=')) { $result.Note = '<device> node would be lost; keeping the project file'; return $result }
+
+    if (-not $WorkDir) { $WorkDir = Join-Path $ProjectPath 'readout\.service' }
+    if (-not (Test-Path -LiteralPath $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null }
+    $outPath = Join-Path $WorkDir ('resolved-' + ($useSerial -replace '[^A-Za-z0-9_-]', '_') + '.ccxml')
+    [IO.File]::WriteAllText($outPath, $newText)
+
+    $result.Path = $outPath
+    $result.Source = 'temp'
+    $result.Changed = $true
+    $result.Note = ('project .ccxml left untouched; resolved copy pins {0} (from {1})' -f $useSerial, $src)
+    return $result
+}
+
+# =============================================================================
+# Probe-agnostic openability test: ask DSS itself, with a connect-but-never-load
+# session. This is the only check that is true for EVERY probe type (XDS100 FTDI,
+# XDS110 CDC, XDS200, XDS560v2, on-board XDS110 on LaunchPad, ...), because it uses
+# exactly the same code path a real download uses.
+#
+# Why not a tool-specific serial utility:
+#   * xds100serial.exe  only knows XDS100 (no xds110serial/xds200serial exists)
+#   * dbgjtag.exe       is generic but needs a CCS-generated board data file (.dat),
+#                       not the project .ccxml, so it cannot be used offline here
+#   * PnP enumeration   says nothing about whether the driver can open the device
+# DSS is the common denominator. Cost: a few seconds, so it is opt-in (-Deep).
+# =============================================================================
+function Test-ProbeOpenableByDss {
+    param(
+        [Parameter(Mandatory)][string]$Ccxml,
+        [Parameter(Mandatory)][string]$DssBat,
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [string]$WorkDir = '',
+        [int]$TimeoutSec = 60,
+        [string]$CorePattern = ''
+    )
+    $r = [pscustomobject]@{ Ok = $false; Skipped = $false; Detail = ''; Log = '' }
+    if (-not (Test-Path -LiteralPath $Ccxml)) { $r.Detail = 'ccxml not found'; return $r }
+    if (-not (Test-Path -LiteralPath $DssBat)) { $r.Detail = 'dss.bat not found'; return $r }
+
+    # A live session owns the probe: opening a second DSS target would fight it.
+    $stateFile = Join-Path $ProjectPath 'readout\.service\state.json'
+    if (Test-Path -LiteralPath $stateFile) {
+        try {
+            $st = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+            if ($st.pid -and (Get-Process -Id ([int]$st.pid) -ErrorAction SilentlyContinue)) {
+                $r.Ok = $true; $r.Skipped = $true; $r.Detail = 'a live DSS session already holds the probe'
+                return $r
+            }
+        } catch { }
+    }
+
+    if (-not $WorkDir) { $WorkDir = Join-Path $ProjectPath 'readout\.service' }
+    if (-not (Test-Path -LiteralPath $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null }
+    $js = Join-Path $WorkDir 'probe-openable.js'
+    $log = Join-Path $WorkDir 'probe-openable.log'
+    $ccxmlJs = (Get-Item -LiteralPath $Ccxml).FullName.Replace('\', '/')
+
+    $jsText = @'
+// Probe-agnostic openability probe: connect, verify, disconnect. Never loads, never halts a running app.
+importPackage(Packages.com.ti.debug.engine.scripting);
+importPackage(Packages.com.ti.ccstudio.scripting.environment);
+var env = ScriptingEnvironment.instance();
+try { env.setScriptTimeout(0); } catch (e) { }
+var server = env.getServer("DebugServer.1");
+server.setConfig("__CCXML__");
+var cpus = server.getListOfCPUs();
+var target = "";
+var pattern = "__CORE__";
+for (var i = 0; i < cpus.length; i++) {
+    var n = "" + cpus[i];
+    if (pattern) { if (new RegExp(pattern).test(n)) { target = n; break; } }
+    else if (n.indexOf("C28xx") >= 0) { target = n; break; }
+}
+if (!target) {
+    var all = [];
+    for (var k = 0; k < cpus.length; k++) { all.push("" + cpus[k]); }
+    print("PROBE_OPENABLE 0 NO_TARGET_CORE [" + all.join(" | ") + "]");
+} else {
+    var s = null;
+    try {
+        s = server.openSession(target);
+        s.target.connect();
+        var up = false;
+        try { up = s.target.isConnected(true); } catch (e1) { up = false; }
+        if (up) {
+            try { s.target.isHalted(); } catch (e2) { up = false; }
+        }
+        if (up) { print("PROBE_OPENABLE 1 " + s.getCPUName()); }
+        else { print("PROBE_OPENABLE 0 CONNECT_NOT_VERIFIED"); }
+        try { s.target.disconnect(); } catch (e3) { }
+    } catch (e) {
+        print("PROBE_OPENABLE 0 " + e);
+    }
+    try { if (s) { s.terminate(); } } catch (e4) { }
+}
+'@
+    $jsText = $jsText.Replace('__CCXML__', $ccxmlJs).Replace('__CORE__', $CorePattern)
+    [IO.File]::WriteAllText($js, $jsText)
+    if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue }
+
+    $cmdLine = '/d /s /c ""' + $DssBat + '" "' + $js + '" > "' + $log + '" 2>&1"'
+    $p = $null
+    try {
+        $p = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -PassThru -WindowStyle Hidden -ErrorAction Stop
+    } catch { $r.Detail = 'could not start DSS: ' + $_.Exception.Message; return $r }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    if (-not $p.HasExited) {
+        try { & cmd.exe /d /c "taskkill /PID $($p.Id) /T /F" 2>&1 | Out-Null } catch { }
+        $r.Detail = ('DSS did not finish within {0} s' -f $TimeoutSec)
+        if (Test-Path -LiteralPath $log) { $r.Log = $log }
+        return $r
+    }
+
+    $text = ''
+    if (Test-Path -LiteralPath $log) { try { $text = [IO.File]::ReadAllText($log) } catch { } }
+    $r.Log = $log
+    $m = [regex]::Match($text, 'PROBE_OPENABLE\s+([01])\s*(.*)')
+    if ($m.Success) {
+        $r.Ok = ($m.Groups[1].Value -eq '1')
+        $r.Detail = $m.Groups[2].Value.Trim()
+    } else {
+        $r.Detail = 'DSS produced no PROBE_OPENABLE line (see log)'
+    }
+    return $r
+}
+
 function Wait-ProbeUsable {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,

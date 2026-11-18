@@ -50,6 +50,70 @@ pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Varia
 
 成功必须三条同时成立，缺一不得写"下载成功"：`.map` 里 `FLASHA~FLASHN` 的 used 全为 0 **且 `ENTRY POINT SYMBOL: "_c_int00"`**；日志出现 `DSS: loaded`（即 `memory.loadProgram` 成功）；`runAsynch` 后应用计数器跨轮递增。入口走 `_c_int00` 会跳过 `codestart` 里的 `WD_DISABLE` 分支，本工程由 `InitSysCtrl()` 内的 `DisableDog()` 兜底（104 次加载无看门狗复位），细节见[RAM 与链接](references/ram-and-linker.md)「入口点」。
 
+### 成功案例（2026-11-18 实测，照抄可复现）
+
+环境：F28379D/CPU1（LAUNCHXL-F28379D）+ **XDS100v2，实物串号 `TI90I42A`** + CCS 12.8.1（F:\ccs）+ 编译器 15.12.1.LTS。
+
+```powershell
+# 0) 探针自检（5 层判据；软件层优先，失败会明确说"改 ccxml"，不会让你动硬件）
+pwsh -NoProfile -File scripts\ti_c2000_debug.ps1 -ProjectPath <工程> -ProbeCheckOnly
+#    期望 5 行齐全：
+#      [1/5] Windows 枚举 : 3 个可用设备 / 9 个幽灵(Unknown 或 Present=False)
+#      [2/5] FTDI 驱动    : OK（xds100serial 能打开探针）
+#      [3/5] 实物串号     : 0403/a6d0  XDS100v1/v2  TI90I42A  Texas Instruments Inc.XDS100 Ver 2.0
+#      [4/5] ccxml 选择   : 按串号 TI90I42A
+#      [5/5] 结论         : 软件层全部通过（ccxml 串号与实物一致）—— 不要动硬件
+
+# 1) 编译（不要带 -EntryPoint）
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -CcsRoot F:\ccs
+#    期望：compile OK / link OK / 0 warnings；Debug 里 .out 大小与入口点见下表
+
+# 2) 下载到 RAM 并常驻（用户明确同意后才加 -ConfirmLoad）
+pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -Build -ConfirmLoad
+#    期望：ENTRY : _c_int00 / LOAD : #N / RESULT: OK
+
+# 3) 只读验活（零下载）
+pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,usMainLoop -Mode ReadOnly
+pwsh -NoProfile -File scripts\ti_c2000_read_dma.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName BuffA -Rows 5000 -Mode ReadOnly
+```
+
+实测成功记录：**LOAD #103/#104/#105 连续三次 `RESULT: OK`**，`gFwId=65537`，`gMsTick` 跨轮递增，
+`read_dma BuffA` 5000 点全量返回。四个必须同时满足的指纹：
+
+| 项 | 正确值 | 错了会怎样 |
+|---|---|---|
+| `.ccxml` 的 `Emulator Selection` | `Value="1"` + 串号 `TI90I42A` | 默认 "Only one XDS100" 会打开**幽灵实例** → `-151`（PnP 看着全 OK） |
+| `.out` 大小 / `.map` 入口 | 592642 B / `_c_int00` | 592810 B / `code_start` → `.text` 按 `0x800` 分片写 → `-1041` + `-150` |
+| connect 前 realtime 选项 | **不设**（session 默认 off） | 设 `PoliteRealtimeMode=true` → `-1133` 直接拒绝连接 |
+| `.text` 段布局 | `> RAMCODE` 单块（0x8000~0xA7FF） | `>>` 跨片 → `-1041`（`Length 0x7ff/0x800` 是分片指纹） |
+
+排查顺序固定为：**探针串号 → 入口点 → realtime → 段布局 → 才怀疑硬件**。
+`reset failed. Error: -1` / `target is not connected` 先原样重试一次，仍失败再断电。
+
+### 探针自检的 5 层判据，以及"什么时候才允许动硬件"
+
+| 层 | 判据 | 失败含义 | 该改什么 |
+|---|---|---|---|
+| 1 Windows 枚举 | 可用设备数 / 幽灵数（`Unknown` 或 `Present=False`） | 0 个可用 → `NO_PROBE` | **只有这一层代表"真的没插"**，此时才让人查插线/供电 |
+| 2 FTDI 驱动 | `xds100serial -l` 能否列出探针 | 打不开 | 先看第 4 层；**有活跃 DSS 会话时本层 SKIP**（会话占着 FTDI 句柄，属正常，不是故障） |
+| 3 实物串号 | `xds100serial` 输出的串号（PnP 的 InstanceId 末尾多一位，`...TI90I42AB` → `TI90I42A`） | 读不到 | 会话占用属正常；否则看第 2 层 |
+| 4 ccxml 选择 | `Emulator Selection` 是否按串号、且该串号在实物列表里 | 默认 `Only one` + 有幽灵 → `PROBE_SELECTION_AMBIGUOUS`；串号不符 → `PROBE_SERIAL_MISMATCH` | **只改 ccxml 一行**（`-- Enter the serial number`）。**不拔线、不改 BOOT** |
+| 5 结论 | 上面四层 | — | 软件层全过就明确写"不要动硬件"，不写含糊的硬件建议 |
+
+**型号无关**：`-ProbeCheckOnly -Deep` 会额外让 DSS 自己开一次探针（connect → isConnected → disconnect，
+**不加载程序**），这是唯一对 XDS100/XDS110/XDS200/XDS560v2/板载探针都成立的判据（xds100serial 只认识
+XDS100；XDS200 没有串号工具；`dbgjtag` 只吃 CCS 生成的 `.dat`）。各型号的枚举名、串号工具、复用方式
+（`-ProbeSerial` / `TI_C2000_PROBE_SERIAL` / `targetConfigs\probe-serial.txt` / 自动发现）见
+[探针型号与识别](references/probe-models-and-detection.md)。
+
+**硬规则（2026-11-18 惨痛教训）：**
+
+- **`BOOT` 引脚只决定目标从哪里启动，与探针能否被 DSS 打开无关。** 任何探针层报错都不该拿 BOOT 当对策。
+- **拔插 USB 只在两种情况下提出**：① 第 1 层 0 个可用；② 第 2 层失败 **且** 第 4 层已正确按串号选、无幽灵、无会话占用。
+- **幽灵实例只有 `Get-PnpDevice` 数得出来**，`Get-CimInstance Win32_PnPEntity` 只返回当前存在的设备（实测 3 条 vs 12 条），所以别用后者判断"是否有多块探针"。
+
+详细版（含全部原始输出与 `.bak` 恢复步骤）见工程根的 `DOWNLOAD-SUCCESS.md`。
+
 失败先看 `<工程>\readout\.service\server.log`，不要先怀疑硬件：
 
 - `Error -1133` 之后紧跟 `DSS: PoliteRealtimeMode off, retrying connect for -1133` 是**自动降级并重连**的过程，不是失败；实时选项只属于当次会话，下一次下载会重新以 realtime on 开始、再自己降级，**不需要人工去关**；`loadti` 从不设它，所以 `loadti` 也报 `-1133` 时原因就不在实时模式；
