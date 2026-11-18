@@ -48,10 +48,10 @@ Out2 ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
 
 if (-not (Test-Path -LiteralPath $CsvPath)) {
     Out2 'FAILURE: NO_CSV'; Out2 'RESULT: FAIL'
-    Out2 "REASON: '$CsvPath' not found"; exit 2
+    Out2 "REASON: '$CsvPath' not found"; exit 4
 }
 if ($ExpectedRows -lt 0 -or ($null -ne $ValueMin -and $null -ne $ValueMax -and $ValueMin -gt $ValueMax)) {
-    Out2 'FAILURE: INVALID_VERDICT_REQUEST'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: INVALID_VERDICT_REQUEST'; Out2 'RESULT: FAIL'
     Out2 'REASON: ExpectedRows must be nonnegative and ValueMin must not exceed ValueMax'; exit 2
 }
 
@@ -59,7 +59,7 @@ try {
     $rows = @(Import-Csv -LiteralPath $CsvPath)
 } catch {
     Out2 'FAILURE: CSV_PARSE_ERROR'; Out2 'RESULT: FAIL'
-    Out2 ('REASON: ' + $_.Exception.Message); exit 2
+    Out2 ('REASON: ' + $_.Exception.Message); exit 4
 }
 if ($rows.Count -lt 1) {
     Out2 'FAILURE: TOO_FEW_ROWS'; Out2 'RESULT: FAIL'

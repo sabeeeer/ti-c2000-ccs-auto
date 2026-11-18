@@ -50,25 +50,48 @@ function dssBoardRefusedDebug(msg) {
         || (s.indexOf("Device refused to allow debug mode") >= 0);
 }
 
-// 5 attempts, growing wait: -150 means the previous DSP process may still be releasing the
-// USB handle, which needs a longer settle than a normal retry.
-function dssConnectVerified(session, log, maxTry) {
-    var n = maxTry || 5;
-    for (var i = 1; i <= n; i++) {
-        try {
-            session.target.connect();
-            if (dssLinkIsUp(session)) { log("DSS: connected"); return true; }
-            log("CONNECT_RETRY " + i + ": connect returned but the target does not answer");
-            try { session.target.disconnect(); } catch (eX) { }
-        } catch (e) {
-            log("CONNECT_RETRY " + i + ": " + e);
-            if (dssBoardRefusedDebug(e)) {
-                log("DSS: debug mode refused during connect - not retrying");
-                return false;
-            }
+// One connect per DSS process. Retrying it five times in the same process made a
+// not-yet-openable adapter look like a target fault and could cascade -1041 -> -150.
+// The service owns the bounded fresh-process retry and learns Stop-to-connect time.
+function dssConnectVerified(session, log) {
+    try {
+        session.target.connect();
+        if (dssLinkIsUp(session)) { log("DSS: connected"); return true; }
+        log("DSS: connect returned but the target does not answer");
+    } catch (e) {
+        var msg = "" + e;
+        log("DSS: connect failed: " + msg);
+        // Error -1133 "Device blocked debug access because it is currently executing
+        // non-debuggable code". TI's own wording offers two ways out: wait for the device
+        // to reach debuggable code, or "disable realtime mode, and then attempt to connect".
+        // The service sets PoliteRealtimeMode(true) for running-target reads, which is
+        // exactly what -1133 refuses. loadti.bat never sets those options, which is why
+        // loadti could connect on 2026-11-18 while the service could not (same board,
+        // same .ccxml, same minute). Retry once with the realtime options off.
+        // The Java exception carries only "emulation failure occurred"; the real code
+        // (-1133) goes to DSS stdout, exactly like the -1138/GEL case documented above.
+        // So match both shapes, and also retry on any connect failure with realtime off:
+        // the retry is cheap and a wrong guess costs one extra connect attempt.
+        if (msg.indexOf("-1133") >= 0
+            || msg.indexOf("non-debuggable code") >= 0
+            || msg.indexOf("emulation failure") >= 0) {
+            try { session.target.disconnect(); } catch (eD) { }
+            dssSleepMs(500);
+            try {
+                session.options.setBoolean("PoliteRealtimeMode", false);
+                log("DSS: PoliteRealtimeMode off, retrying connect for -1133");
+            } catch (eO) { log("DSS: PoliteRealtimeMode not settable here: " + eO); }
+            try { session.options.setBoolean("AllowInterruptsWhenHalted", false); } catch (eP) { }
+            try {
+                session.target.connect();
+                if (dssLinkIsUp(session)) {
+                    log("DSS: connected (realtime off)");
+                    return true;
+                }
+            } catch (e2) { log("DSS: retry after realtime off failed: " + e2); }
         }
-        dssSleepMs(1000 + 500 * i);
     }
+    try { session.target.disconnect(); } catch (eX) { }
     return false;
 }
 
@@ -77,13 +100,16 @@ function dssResetVerified(session, log) {
     try { session.target.reset(); log("DSS: reset"); return true; }
     catch (e1) {
         log("DSS: reset failed (" + e1 + ")");
-        // Always try halt first. A refused reset is normally recoverable, and halt is what
-        // the loader needs anyway - this is the path that loaded successfully sixteen times
-        // on 2026-11-15 while an over-strict -1138 check later turned it into a hard stop.
-        // Only when the link itself is dead does this fall through to reconnecting.
+        // A reset exception is NOT a verdict: -6310 (PRSC read), -150 / GEL noise and
+        // "Target reset failed. Error: -1" often come from the emulator/GEL layer while
+        // the core is still fully reachable, and loadProgram itself halts and loads fine
+        // afterwards (measured 2026-11-18). The only question is whether we can still
+        // TOUCH the target - dssLinkIsUp() calls isConnected(true) + isHalted(). If yes,
+        // continue to load; halt here is best-effort and must not gate the decision.
         if (dssLinkIsUp(session)) {
-            try { session.target.halt(); log("DSS: halted (reset refused, link alive) - continuing"); return true; }
-            catch (e2) { log("DSS: halt also failed: " + e2); }
+            try { session.target.halt(); log("DSS: halted (reset noisy, link alive) - continuing to load"); }
+            catch (e2) { log("DSS: halt best-effort failed (" + e2 + ") but link answers - continuing to load"); }
+            return true;
         }
         log("DSS: link lost after connect, reconnecting");
         try { session.target.disconnect(); } catch (e0) { }

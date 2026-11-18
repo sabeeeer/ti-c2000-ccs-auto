@@ -61,7 +61,7 @@ param(
     [switch]$Quiet,
     # ReadOnly: attach and read, never download. LoadRead: download once, then read.
     # no [ValidateSet]: an illegal value must reach Resolve-ReadModeSpec, otherwise the
-    # documented FAILURE: INVALID_READ_MODE (exit 2) can never be produced
+    # documented USAGE: INVALID_READ_MODE (exit 2) can never be produced
     [string]$Mode = 'ReadOnly',
     # pass only after the user said yes to "compile/download and run?"
     [switch]$ConfirmLoad,
@@ -90,17 +90,17 @@ function Complete-Run { Out2 'RESULT: OK'; exit 0 }
 if ($Standalone) { $Mode = 'LoadRead' }
 $spec = Resolve-ReadModeSpec -Mode $Mode -ConfirmLoad:$ConfirmLoad -Build:$Build -Expect $Expect -MaxLoads $MaxLoads -NoProbeCheck:$NoProbeCheck -AllowUnverified:$AllowUnverified
 try { if ($CorePattern) { [void][regex]::new($CorePattern) } }
-catch { Out2 'FAILURE: INVALID_CORE_PATTERN'; Out2 'RESULT: FAIL'; exit 2 }
+catch { Out2 'USAGE: INVALID_CORE_PATTERN'; Out2 'RESULT: FAIL'; exit 2 }
 if ($spec.mode -eq 'ReadOnly' -and ($NoProbeCheck -or $AllowUnverified -or $NoHeartbeat)) {
-    Out2 'FAILURE: READ_PROOF_BYPASS'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: READ_PROOF_BYPASS'; Out2 'RESULT: FAIL'
     Out2 'REASON: ReadOnly requires probe, firmware and heartbeat proofs; bypass switches are disabled'
     exit 2
 }
 
 $names = @($Variables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if ($names.Count -eq 0) { Out2 'FAILURE: NEED_VARIABLES'; Out2 'RESULT: FAIL'; Out2 'REASON: -Variables requires at least one expression'; exit 2 }
+if ($names.Count -eq 0) { Out2 'USAGE: NEED_VARIABLES'; Out2 'RESULT: FAIL'; Out2 'REASON: -Variables requires at least one expression'; exit 2 }
 if (@($names | Sort-Object -Unique).Count -ne $names.Count) {
-    Out2 'FAILURE: DUPLICATE_VARIABLES'; Out2 'RESULT: FAIL'; Out2 'REASON: each variable may appear only once'; exit 2
+    Out2 'USAGE: DUPLICATE_VARIABLES'; Out2 'RESULT: FAIL'; Out2 'REASON: each variable may appear only once'; exit 2
 }
 if ($NoHeartbeat) { $HeartbeatExpr = '' }
 $pathPattern = '[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]*)\])*'
@@ -108,11 +108,11 @@ $heartbeats = @($HeartbeatExpr -split ',' | ForEach-Object { $_.Trim() } | Where
 if (@($names | Where-Object { $_ -notmatch "^$pathPattern$" }).Count -gt 0 -or
     @($heartbeats | Where-Object { $_ -notmatch "^$pathPattern$" }).Count -gt 0 -or
     $Rounds -lt 2 -or $IntervalMs -lt 0 -or $WarmupMs -lt 0) {
-    Out2 'FAILURE: INVALID_READ_REQUEST'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: INVALID_READ_REQUEST'; Out2 'RESULT: FAIL'
     Out2 'REASON: use simple read paths, at least two rounds and nonnegative timing values'; exit 2
 }
 
-if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) { Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2 }
+if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) { Out2 'USAGE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2 }
 $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
 
 # a read never writes the target, so a leftover copy of a skill script is reported but
@@ -131,7 +131,7 @@ if (Test-Path -LiteralPath $projectFile) {
     try {
         [xml]$projectXml = Get-Content -LiteralPath $projectFile -Raw
         if ($projectXml.projectDescription.name) { $projName = [string]$projectXml.projectDescription.name }
-    } catch { Out2 'FAILURE: INVALID_PROJECT_NAME'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $_.Exception.Message); exit 2 }
+    } catch { Out2 'USAGE: INVALID_PROJECT_NAME'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $_.Exception.Message); exit 2 }
 }
 $projName = [IO.Path]::GetFileName($projName)
 $projName = [regex]::Replace($projName, '[^A-Za-z0-9._-]+', '_').Trim('.', '_')
@@ -140,12 +140,12 @@ if (-not $Ccxml) {
     $c = @(Get-ChildItem -Path (Join-Path $ProjectPath 'targetConfigs') -Filter '*.ccxml' -ErrorAction SilentlyContinue | Sort-Object Name) | Select-Object -First 1
     if ($c) { $Ccxml = $c.FullName }
 }
-if (-not $Ccxml -or -not (Test-Path -LiteralPath $Ccxml)) { Out2 'FAILURE: NO_CCXML'; Out2 'RESULT: FAIL'; Out2 'REASON: no .ccxml found; pass -Ccxml <file>'; exit 2 }
+if (-not $Ccxml -or -not (Test-Path -LiteralPath $Ccxml)) { Out2 'USAGE: NO_CCXML'; Out2 'RESULT: FAIL'; Out2 'REASON: no .ccxml found; pass -Ccxml <file>'; exit 2 }
 if (-not $OutFile) { $OutFile = Join-Path $ProjectPath "Debug\$projName.out" }
 
 $skillRoot = Split-Path $PSScriptRoot -Parent
 $debugScript = Join-Path $skillRoot 'scripts\ti_c2000_debug.ps1'
-if (-not (Test-Path -LiteralPath $debugScript)) { Out2 'FAILURE: ENV_NO_DEBUG_SCRIPT'; Out2 'RESULT: FAIL'; Out2 'REASON: ti_c2000_debug.ps1 is missing from this skill installation'; exit 2 }
+if (-not (Test-Path -LiteralPath $debugScript)) { Out2 'FAILURE: ENV_NO_DEBUG_SCRIPT'; Out2 'RESULT: FAIL'; Out2 'REASON: ti_c2000_debug.ps1 is missing from this skill installation'; exit 1 }
 $pwshExe = Join-Path $PSHOME 'pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
 
@@ -170,7 +170,7 @@ if ($spec.mode -eq 'LoadRead') {
 # ---------- ReadOnly: attach to the one live session, never load -----------------
 # Loading on every call means every call restarts the program, so two reads never
 # describe the same run. The service loads once and keeps running; this reader only
-# asks it for values, after proving it is still our image running from RAM.
+# asks it for values after checking the retained target; RAM/Flash is source metadata.
 if ($spec.mode -eq 'ReadOnly') {
     $s = Get-LiveSessionInfo -ProjectPath $ProjectPath
     if (-not $s.alive) {
@@ -181,37 +181,35 @@ if ($spec.mode -eq 'ReadOnly') {
         Out2 ('          (that would be download #' + ([int]$cnt.count + 1) + ' for this project)')
         exit 4
     }
-    if (-not $s.state.core -or ($CorePattern -and [string]$s.state.core -notmatch $CorePattern)) {
+    if ($CorePattern -and [string]$s.state.core -notmatch $CorePattern) {
         Out2 'FAILURE: CORE_UNVERIFIED'; Out2 'RESULT: FAIL'
         Out2 ('REASON: retained session core {0} does not match the requested core pattern {1}' -f $s.state.core,$CorePattern); exit 4
     }
+    if (-not $s.state.core) { Out2 'SOURCE  : target core was not recorded by the retained session; continuing to read and report data' }
     # a session whose JTAG link died still has a live pid and a matching sha256, so
     # "process alive" is not enough - the probe has to be enumerated first
     Assert-ProbeOnline -ProjectPath $ProjectPath -DebugScript $debugScript -CcsRoot $CcsRoot -Skip:$NoProbeCheck -Quiet:$Quiet
 
-    if (-not (Test-Path -LiteralPath $OutFile)) {
-        Out2 'FAILURE: NO_OUT_FILE'; Out2 'RESULT: FAIL'; Out2 ('REASON: missing ' + $OutFile); exit 2
-    }
-    $curSha = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
-    if ($curSha -ne [string]$s.state.outSha256) {
-        Out2 'FAILURE: STALE_SERVICE'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: the session loaded a different image (session {0}, disk {1})' -f $s.state.outSha256, $curSha)
-        Out2 'HINT    : the .out was rebuilt after the load; reading it now would mix two builds'
-        Out2 'HINT    : -Stop the session and start it again (-Start -ConfirmLoad) to load the new image'
-        exit 2
-    }
+    $outExists = Test-Path -LiteralPath $OutFile
+    $curSha = if ($outExists) { (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash } else { '' }
+    $staleServiceIssue = if (-not $outExists) {
+        'selected disk .out is missing; the retained session may still be readable but its image cannot be checked against disk'
+    } elseif ($curSha -ne [string]$s.state.outSha256) {
+        'disk .out SHA differs from the image recorded at load; data source identity is unverified'
+    } else { '' }
     $lk = Enter-TargetLock -ProjectPath $ProjectPath -Mode 'ReadOnly'
-    if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 5 }
+    if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 4 }
     try {
         Initialize-ReadFailureVerdict -ProjectPath $ProjectPath
         Info2 ('JUDGE   : session alive (pid {0}, loaded {1}, LOAD #{2})' -f $s.state.pid, $s.state.started, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }))
-        Info2 ('JUDGE   : image matches this build (sha256 {0})' -f $curSha.Substring(0, 16))
+        Info2 ('IMAGE   : disk SHA256 {0}; load-record match {1}' -f $(if ($curSha) { $curSha.Substring(0,16) } else { 'MISSING' }),$(if ($staleServiceIssue) { 'NO' } else { 'YES' }))
         # ---- PREFLIGHT: report the state of the target BEFORE reading anything --------
         # Reading first and reporting afterwards is the pattern that produced the original
         # bug (ADC values from an old project, discovered only when they made no sense).
         # Every fact below is gathered first; a hard failure stops here, with no CSV and no
         # verdict written, so nothing can be mistaken for a reading.
         $blocking = New-Object System.Collections.Generic.List[string]
+        if ($staleServiceIssue) { $blocking.Add($staleServiceIssue) }
         $cnt = Get-LoadCount -ProjectPath $ProjectPath
         $fresh = Get-SelectedOutFreshEvidence -ProjectPath $ProjectPath -OutFile $OutFile
         if (-not $fresh.ok) { $blocking.Add(('selected image is stale: {0} ({1})' -f $fresh.reason,$fresh.file)) }
@@ -245,10 +243,10 @@ if ($spec.mode -eq 'ReadOnly') {
         $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates $aliveCands
 
         Out2 'PREFLIGHT: 读之前必须确认的事'
-        Out2 '  PROBE    : online and usable; retained DSS session responded'
+        Out2 '  PROBE    : enumerated; retained DSS session responded (driver access is checked by DSS)'
         Out2 ('  CORE     : {0}' -f $s.state.core)
         Out2 ('  LOCATION : {0} ({1})' -f $loc.kind,$loc.text)
-        Out2 ('  BUILD    : {0}   sha256 {1}' -f $OutFile, $curSha.Substring(0, 16))
+        Out2 ('  BUILD    : {0}   sha256 {1}' -f $OutFile, $(if ($curSha) { $curSha.Substring(0,16) } else { 'MISSING' }))
         Out2 ('  FRESH    : {0}{1}' -f $(if ($fresh.ok) { 'project inputs are no newer than .out' } else { 'STALE' }), $(if ($fresh.file) { ' (' + $fresh.file + ')' } else { '' }))
         Out2 ('  LOADS    : #{0} total for this project; this session is load #{1} (started {2})' -f $cnt.count, $(if ($s.state.loadIndex) { $s.state.loadIndex } else { '?' }), $s.state.started)
         if ($fwNow) {
@@ -263,34 +261,12 @@ if ($spec.mode -eq 'ReadOnly') {
         Out2 ('  ALIVE    : {0}' -f $(if ($alive.ok) { '{0} {1} -> {2}, {3}' -f $alive.name, $alive.first, $alive.last, $alive.reason } else { 'NOT RUNNING - ' + $alive.reason }))
         if (-not $alive.ok) { $blocking.Add('the program is not advancing, so any values read now describe a stopped or missing program') }
 
-        if (-not $loc.ok) {
-            $blocking.Add(('RAM execution proof failed: {0} ({1})' -f $loc.code,$loc.text))
-        }
+        if (-not $loc.ok) { Out2 ('  SOURCE   : UNKNOWN ({0}); location is informational' -f $loc.code) }
 
-        if ($blocking.Count -gt 0) {
-            # a refusal must not leave the previous run's data or its "result: OK" behind
-            $dDir = Join-Path $ProjectPath 'readout\data'
-            $cDir = Join-Path $ProjectPath 'readout\check'
-            foreach ($n in @('data.csv', 'array.csv', 'variables.csv')) {
-                $p = Join-Path $dDir $n
-                if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
-            }
-            if (Test-Path -LiteralPath $cDir) {
-                $v = @('result: FAIL', 'failure: PREFLIGHT_FAILED',
-                    ('mode: ' + $spec.mode),
-                    ('out: ' + $OutFile), ('out_sha256: ' + $curSha),
-                    ('location: ' + $loc.kind + ' ' + $loc.text),
-                    ('image: ' + $(if ($fwNow) { $FwIdVar + '=' + $fwNow } else { 'not declared' })),
-                    ('reason: ' + ($blocking -join '; ')),
-                    ('at: ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
-                [IO.File]::WriteAllLines((Join-Path $cDir 'verdict.txt'), $v, (New-Object Text.UTF8Encoding($true)))
-            }
-            Out2 'FAILURE: PREFLIGHT_FAILED'; Out2 'RESULT: FAIL'
-            foreach ($b in $blocking) { Out2 ('REASON: ' + $b) }
-            Out2 'HINT    : nothing was read; the previous data.csv and verdict.txt were cleared so no stale result survives'
-            exit 4
-        }
-        Out2 'PREFLIGHT: all conditions hold - reading'
+        # Source and identity doubts are data verdicts. Return the requested samples and
+        # attach these doubts to verdict.txt; only an inaccessible target stops the read.
+        foreach ($b in $blocking) { Out2 ('CHECK   : ' + $b) }
+        Out2 ('PREFLIGHT: {0}; reading' -f $(if ($blocking.Count) { 'source/identity needs review' } else { 'all conditions hold' }))
         Info2 ''
         Info2 ('JUDGE   : firmware identity will be re-checked while sampling: {0} must equal {1}' -f $FwIdVar, $fwExpect)
         if ($RateVar -and $ExpectedRatePerSec -gt 0) {
@@ -303,12 +279,13 @@ if ($spec.mode -eq 'ReadOnly') {
         $largs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'ti_c2000_live_read.ps1'),
             '-ProjectPath', $ProjectPath, '-Variables', ($names -join ','),
             '-Rounds', [string]$Rounds, '-IntervalMs', [string]$IntervalMs, '-HeartbeatExpr', $HeartbeatExpr,
-            '-ParentPid', [string]$PID)
+            '-ParentPid', [string]$PID, '-PreflightIssues', ($blocking -join ' | '))
         # range verdict (data-read-verdict.md 判据 4) belongs at read time: without it the
         # caller would have to read, then run check_read by hand on the CSV
         if ($null -ne $ValueMin) { $largs += @('-ValueMin',([double]$ValueMin).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
         if ($null -ne $ValueMax) { $largs += @('-ValueMax',([double]$ValueMax).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
-        $largs += @('-ExpectFwId', [string]$fwExpect, '-FwIdVar', $FwIdVar)
+        if ($fwExpect) { $largs += @('-ExpectFwId', [string]$fwExpect) }
+        $largs += @('-FwIdVar', $FwIdVar)
         if ($RateVar) { $largs += @('-RateVar', $RateVar) }
         if ($ExpectedRatePerSec -gt 0) { $largs += @('-ExpectedRatePerSec', [string]$ExpectedRatePerSec, '-RateTolerancePct', [string]$RateTolerancePct) }
         if ($NoHeartbeat) { $largs += '-NoHeartbeat' }

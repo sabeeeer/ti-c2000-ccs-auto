@@ -116,10 +116,11 @@ if ($Source -eq 'github') {
 }
 if (-not $root) {
     Write-Output "SOURCE: none"
-    Write-Output "FATAL: no C2000Ware source. Options:"
+    Write-Output 'FAILURE: SDK_SOURCE_MISSING'
+    Write-Output "REASON: no C2000Ware source. Options:"
     Write-Output "  -SdkRoot <dir>            point to a local C2000Ware / snapshot"
     Write-Output "  (default auto)            install C2000Ware, or clone https://github.com/$GithubRepo"
-    exit 2
+    exit 1
 }
 Write-Output ("SOURCE: " + $root)
 
@@ -129,7 +130,7 @@ function Rel([string]$p) { return $p.Replace($root + '\', '') }
 if ($GetFile) {
     $f = Join-Path $root $GetFile
     if (Test-Path -LiteralPath $f) { Write-Output ("===== FILE: " + $GetFile + " ====="); Get-Content -LiteralPath $f -TotalCount 200 }
-    else { Write-Output ("not found: " + $GetFile) ; exit 1 }
+    else { Write-Output ('FAILURE: SDK_FILE_NOT_FOUND'); Write-Output ("REASON: not found: " + $GetFile) ; exit 1 }
     exit 0
 }
 
@@ -156,7 +157,7 @@ if ($List -eq 'libs') {
     exit 0
 }
 
-if (-not $Keyword) { Write-Output "usage: -Keyword <word> [-Kind all|example|library|api] | -List devices|libs | -GetFile <path> [-Source auto|local|github]"; exit 1 }
+if (-not $Keyword) { Write-Output 'USAGE: QUERY_REQUIRED'; Write-Output "REASON: -Keyword <word> [-Kind all|example|library|api] | -List devices|libs | -GetFile <path> [-Source auto|local|github]"; exit 2 }
 $kw = $Keyword
 
 # ---------- 例程 ----------

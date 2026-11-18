@@ -25,7 +25,7 @@
 |---|---|---|
 | 下载 | **零下载** | 下载一次（`-MaxLoads N` 可循环到 `-Expect` 满足） |
 | 前置证明 | 会话存活 + `sha256(out)==state.outSha256` + `&main`/`&c_int00` < 0x080000 | 需 `-ConfirmLoad`；`-Standalone` 是它的别名 |
-| 失败 | `NO_SESSION`/`STALE_SERVICE`/`NOT_RAM_IMAGE`，绝不偷偷下载凑数 | `LOAD_NOT_CONFIRMED` exit 4 |
+| 失败（当时实现） | 会话不存在、镜像或位置无法证明会拒读；现行规则改为交付可读取的数据并附 FAIL 判据，位置只报告来源。历史现象不作为现行入口承诺。 | 未获下载确认时仍拒绝下载 |
 
 ## 互锁（全部在任何 DSS 动作之前判定）
 

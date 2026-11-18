@@ -15,7 +15,7 @@ foreach ($name in @('ti_c2000_run_read.ps1','ti_c2000_read_dma.ps1')) {
     }
 }
 $live = [IO.File]::ReadAllText((Join-Path $scripts 'ti_c2000_live_read.ps1'))
-foreach ($required in @("Join-Path `$ProjectPath 'readout\data'",'FW_ID_UNREADABLE','HEARTBEAT_FAIL','BUF_CHANGED','verdict.txt','INTERNAL_ONLY')) {
+foreach ($required in @("Join-Path `$ProjectPath 'readout\data'",'FW_ID_UNREADABLE','HEARTBEAT_FAIL','DATA_UNRELIABLE','verdict.txt','INTERNAL_ONLY')) {
     if ($live -notmatch [regex]::Escape($required)) { $bad.Add("live_read missing $required") }
 }
 foreach ($required in @("'-RangeVars', 'value'", "'-ExpectedRows'", 'ramAliveAfter', 'appAliveAfter')) {

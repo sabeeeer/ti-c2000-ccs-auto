@@ -51,18 +51,21 @@ param(
     [string]$OutFile = '',
     [string]$MapFile = '',
     [string]$CcsRoot = '',
-    # Which CPU to open. Not empty by default: getListOfCPUs() on an F28379D returns
-    # several entries (C28xx_CPU1, C28xx_CPU2, CLA1, CLA2 ...), so an empty pattern matches
-    # all of them and every -Start dies with AMBIGUOUS_CORE (measured 2026-11-16).
-    # CPU1 is what a single-core project runs on; override for a CPU2 or CLA target.
-    [string]$CorePattern = '.*C28xx_CPU1$',
+    # Which CPU to open. Empty = choose automatically:
+    #   single C28xx core      -> that core (all single-core parts)
+    #   several C28xx cores    -> C28xx_CPU1, with a note saying so (F28379D is dual-core)
+    #   nothing identifiable   -> USAGE: AMBIGUOUS_CORE, list the names and stop
+    # A hard-coded 'CPU1' default would silently open the wrong core on a CPU2 project,
+    # and no default at all made every dual-core -Start fail. Automatic selection with an
+    # explicit note is the only form that works on both.
+    [string]$CorePattern = '',
     [switch]$Build,
     # set this only after the user answered yes to "compile/download and run?"
     [switch]$ConfirmLoad,
     # SingleStep = load once and stay (default). Iterate = continuous, driven by
     # ti_c2000_iterate.ps1 -UserApproved, which passes -RunMode Iterate every round.
     # no [ValidateSet]: an illegal value must reach Resolve-RunModeSpec, which reports
-    # FAILURE: INVALID_RUN_MODE (exit 2). A binding-time rejection exits 1 with an English
+    # USAGE: INVALID_RUN_MODE (exit 2). A binding-time rejection exits 1 with an English
     # message, and the documented classification would be unreachable.
     [string]$RunMode = 'SingleStep',
     [switch]$UserApproved,
@@ -81,12 +84,12 @@ function Info2($m) { if (-not $Quiet) { Write-Output $m } }
 
 $modes = @($Start, $Stop, $Status) | Where-Object { $_ }
 if ($modes.Count -ne 1) {
-    Out2 'FAILURE: NEED_MODE'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: NEED_MODE'; Out2 'RESULT: FAIL'
     Out2 'REASON: pass exactly one of -Start / -Stop / -Status'; exit 2
 }
 
 if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) {
-    Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
+    Out2 'USAGE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
 }
 $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
 
@@ -109,7 +112,7 @@ if ($Start) {
 # running iterate loop over the same target.
 $runSpec = Resolve-RunModeSpec -RunMode $RunMode -ConfirmLoad:$ConfirmLoad -UserApproved:$UserApproved -MaxLoads 1
 try { if ($CorePattern) { [void][regex]::new($CorePattern) } }
-catch { Out2 'FAILURE: INVALID_CORE_PATTERN'; Out2 'RESULT: FAIL'; exit 2 }
+catch { Out2 'USAGE: INVALID_CORE_PATTERN'; Out2 'RESULT: FAIL'; exit 2 }
 if (-not $Status) {
     $opName = if ($Start) { 'service -Start' } else { 'service -Stop' }
     Assert-RunModeInterlock -ProjectPath $ProjectPath -What $opName
@@ -141,6 +144,12 @@ function Test-ServiceAlive {
 
 $pwshExe = Join-Path $PSHOME 'pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
+
+# Learned probe wait (ti_c2000_probe.ps1): 5 s first, +5 s per failure, bisected against the
+# last remembered failure. Probes differ in how long Windows takes to enumerate them
+# after the DSS process releases the handle, so a fixed window turns a normal
+# re-enumeration into a false "the probe went missing" report.
+. (Join-Path $PSScriptRoot 'ti_c2000_probe.ps1')
 
 # ---------------------------------------------------------------- status -----
 if ($Status) {
@@ -207,7 +216,7 @@ if ($Stop) {
         exit 0
     }
     $lk = Enter-TargetLock -ProjectPath $ProjectPath -Mode 'Stop'
-    if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 5 }
+    if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 4 }
     $st = Get-ServiceState
     # ask the DSS script to leave its loop and disconnect, so the probe is released
     [IO.File]::WriteAllText($cmdFile, 'STOP', [Text.Encoding]::ASCII)
@@ -223,32 +232,38 @@ if ($Stop) {
         Start-Sleep -Milliseconds 500
         Info2 'NOTE    : service did not stop on request; process tree killed'
     }
+    $alive = Get-Process -Id ([int]$st.pid) -ErrorAction SilentlyContinue
+    if ($alive) {
+        Exit-TargetLock -ProjectPath $ProjectPath
+        Out2 'FAILURE: STOP_FAILED'; Out2 'RESULT: FAIL'
+        Out2 ('REASON: DSS pid {0} survived the STOP request and forced termination; state files were retained' -f $st.pid)
+        exit 1
+    }
     $cleanStop = (-not $alive) -and (Test-Path -LiteralPath $stoppedFile)
+    if (-not $alive) { Mark-ProbeReleased -ProjectPath $ProjectPath -Ccxml ([string]$st.ccxml) }
     foreach ($f in @($cmdFile, $resFile, $readyFile, $stateFile)) {
         if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     }
     # On the observed XDS100 setup, releasing the DSS process also releases the FTDI
     # handle and the probe temporarily disappears from PnP. Other probes may differ.
-    # Wait for the device adapter to report usable before a new Start can be attempted.
-    $probeBack = $false
+    # Wait for Windows enumeration after DSS releases its handle. This callback does not
+    # open a DSS target, so a PnP hit is not yet proof that the probe is usable.
     $debugScript = Join-Path $PSScriptRoot 'ti_c2000_debug.ps1'
     $probeArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$debugScript,
         '-ProjectPath',$ProjectPath,'-ProbeCheckOnly','-Quiet')
     if ($CcsRoot) { $probeArgs += @('-CcsRoot',$CcsRoot) }
-    for ($i = 0; $i -lt 6; $i++) {
-        Start-Sleep -Milliseconds ([Math]::Max(400,[int](Get-FwContract -Quiet).timing.minReconnectGapMs))
-        $probeResult = @(& $pwshExe @probeArgs 2>&1)
-        if ($LASTEXITCODE -eq 0 -and @($probeResult | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
-            $probeBack = $true; break
-        }
-        if ($i -lt 5) { Start-Sleep -Milliseconds 1600 }
+    $probeBack = $false
+    if (-not $alive) {
+        $probeBack = Wait-ProbeUsable -ProjectPath $ProjectPath -ProbeCheck {
+            $o = @(& $pwshExe @probeArgs 2>&1)
+            return ($LASTEXITCODE -eq 0 -and (@($o | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count -gt 0))
+        } -Ccxml ([string]$st.ccxml) -MaxSeconds 90
     }
     if ($probeBack) {
-        Info2 'PROBE   : re-enumerated after the session exited (USB handle released)'
-        Info2 'NOTE    : PnP lists it before its driver is ready - a -Start right now waits up to 12 s, then proceeds'
+        Info2 'PROBE   : enumerated again after the session exited; DSS access is checked on the next Start'
     } else {
-        Out2 'WARN    : the probe has not re-enumerated 12 s after the session exited'
-        Out2 'WARN    : check the USB cable; a -Start now would report NO_PROBE'
+        Out2 'WARN    : the probe was not observed after Stop (or the DSS process still owns it)'
+        Out2 'WARN    : inspect the USB and driver state; no cable or power cause is proven here'
     }
     $cnt = Get-LoadCount -ProjectPath $ProjectPath
     Exit-TargetLock -ProjectPath $ProjectPath
@@ -259,7 +274,7 @@ if ($Stop) {
     }
     if (-not $probeBack) {
         Out2 'FAILURE: PROBE_NOT_READY'; Out2 'RESULT: FAIL'
-        Out2 'REASON: DSS stopped, but the probe did not pass the usable probe check after reconnection'
+        Out2 'REASON: DSS stopped, but Windows did not enumerate the probe within the wait budget'
         exit 3
     }
     Out2 'SERVICE : STOPPED'
@@ -308,7 +323,7 @@ if (Test-Path -LiteralPath $projectFile) {
     try {
         [xml]$projectXml = Get-Content -LiteralPath $projectFile -Raw
         if ($projectXml.projectDescription.name) { $projName = [string]$projectXml.projectDescription.name }
-    } catch { Out2 'FAILURE: INVALID_PROJECT_NAME'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $_.Exception.Message); exit 2 }
+    } catch { Out2 'USAGE: INVALID_PROJECT_NAME'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $_.Exception.Message); exit 2 }
 }
 $projName = [IO.Path]::GetFileName($projName)
 $projName = [regex]::Replace($projName, '[^A-Za-z0-9._-]+', '_').Trim('.', '_')
@@ -318,7 +333,7 @@ if (-not $Ccxml) {
     if ($c) { $Ccxml = $c.FullName }
 }
 if (-not $Ccxml -or -not (Test-Path -LiteralPath $Ccxml)) {
-    Out2 'FAILURE: NO_CCXML'; Out2 'RESULT: FAIL'; Out2 'REASON: no .ccxml found; pass -Ccxml <file>'; exit 2
+    Out2 'USAGE: NO_CCXML'; Out2 'RESULT: FAIL'; Out2 'REASON: no .ccxml found; pass -Ccxml <file>'; exit 2
 }
 if (-not $OutFile) { $OutFile = Join-Path $ProjectPath "Debug\$projName.out" }
 
@@ -330,29 +345,38 @@ $skillRoot = Split-Path $PSScriptRoot -Parent
 $debugScript = Join-Path $skillRoot 'scripts\ti_c2000_debug.ps1'
 if (-not (Test-Path -LiteralPath $debugScript)) {
     Out2 'FAILURE: ENV_NO_DEBUG_SCRIPT'; Out2 'RESULT: FAIL'
-    Out2 'REASON: ti_c2000_debug.ps1 is missing from this skill installation'; exit 2
+    Out2 'REASON: ti_c2000_debug.ps1 is missing from this skill installation'; exit 1
 }
 
 $probeArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $debugScript, '-ProjectPath', $ProjectPath, '-ProbeCheckOnly')
 if ($CcsRoot) { $probeArgs += @('-CcsRoot', $CcsRoot) }
-# Retry up to 12 s. Right after a session exits, the FTDI device re-enumerates: PnP lists
-# it before the driver can actually open it, so a single check reports NO_PROBE for a probe
-# that answers a couple of seconds later (measured 2026-11-15: "-Stop then -Start" failed
-# every time with a 2 s NO_PROBE, and succeeded when retried by hand).
-$probeOut = @()
-$probeCode = 1
-$probeText = ''
-for ($try = 1; $try -le 6; $try++) {
-    $probeOut = @(& $pwshExe @probeArgs 2>&1)
-    $probeCode = $LASTEXITCODE
-    $probeText = (@($probeOut | ForEach-Object { [string]$_ }) -join "`n")
-    if ($probeCode -eq 0 -and $probeText -match 'RESULT: OK') { break }
-    if ($try -lt 6) { Start-Sleep -Milliseconds 2000 }
-}
-if ($probeCode -ne 0 -or $probeText -notmatch 'RESULT: OK') {
+# Learned wait, not a fixed window: 5 s first, +5 s per failure, starting next time from the
+# bisection of the last success and the last failure. Adapters differ (FTDI XDS100v2, CDC
+# XDS110, XDS200), so a number tuned on one of them turns a normal USB re-enumeration into a
+# false "the probe is gone / the board is under-powered" report on another.
+$script:c2000ProbeOut = @()
+$script:c2000ProbeCode = 1
+$script:c2000ProbeText = ''
+$probeOk = Wait-ProbeUsable -ProjectPath $ProjectPath -ProbeCheck {
+    $o = @(& $pwshExe @probeArgs 2>&1)
+    $script:c2000ProbeOut = $o
+    $script:c2000ProbeCode = $LASTEXITCODE
+    $script:c2000ProbeText = (@($o | ForEach-Object { [string]$_ }) -join "`n")
+    return ($LASTEXITCODE -eq 0 -and $script:c2000ProbeText -match 'RESULT: OK')
+} -Ccxml $Ccxml -MaxSeconds 90
+$probeOut = @($script:c2000ProbeOut)
+$probeCode = [int]$script:c2000ProbeCode
+$probeText = [string]$script:c2000ProbeText
+if (-not $probeOk) {
     foreach ($line in $probeOut) { Out2 ([string]$line) }
-    if ($probeCode -eq 3 -or $probeText -match 'NO_PROBE') { Out2 'FAILURE: NO_PROBE'; Out2 'RESULT: FAIL'; Out2 'REASON: no debug probe detected'; exit 3 }
-    Out2 'FAILURE: PROBE_CHECK_FAILED'; Out2 'RESULT: FAIL'; Out2 'REASON: probe pre-check did not return RESULT: OK'; exit 2
+    if ($probeText -match 'NO_PROBE') {
+        Out2 'FAILURE: NO_PROBE'; Out2 'RESULT: FAIL'
+        Out2 'REASON: Windows did not enumerate the probe within the learned wait budget; driver access was not tested'
+        Out2 'HINT    : readout\.service\probe-wait.json records okMs/failMs; a slow first run on a new adapter is normal'
+        Out2 'HINT    : inspect enumeration and the DSS log before diagnosing hardware'
+        exit 3
+    }
+    Out2 'FAILURE: PROBE_CHECK_FAILED'; Out2 'RESULT: FAIL'; Out2 'REASON: probe pre-check did not return RESULT: OK'; exit 3
 }
 if ($Build) {
     $buildScript = Join-Path $skillRoot 'scripts\ti_c2000_build.ps1'
@@ -371,33 +395,37 @@ if ($Build) {
 }
 if (-not (Test-Path -LiteralPath $OutFile)) {
     Out2 'FAILURE: NO_OUT_FILE'; Out2 'RESULT: FAIL'
-    Out2 "REASON: '$OutFile' not found - add -Build or build/stage first"; exit 2
+    Out2 "REASON: '$OutFile' not found - add -Build or build/stage first"; exit 4
 }
 Assert-SelectedOutFresh -ProjectPath $ProjectPath -OutFile $OutFile
 if (-not $MapFile) { $MapFile = [IO.Path]::ChangeExtension($OutFile, '.map') }
+$mapSha = ''
 if (-not (Test-Path -LiteralPath $MapFile)) {
-    Out2 'FAILURE: MAP_MISSING'; Out2 'RESULT: FAIL'
-    Out2 ('REASON: selected image has no matching linker map: ' + $MapFile); exit 2
+    Out2 ('NOTE    : linker map unavailable: ' + $MapFile + '; location will be UNKNOWN, download may proceed')
+    $MapFile = ''
+} else {
+    $MapFile = (Get-Item -LiteralPath $MapFile).FullName
+    $mapSha = (Get-FileHash -LiteralPath $MapFile -Algorithm SHA256).Hash
 }
-$MapFile = (Get-Item -LiteralPath $MapFile).FullName
-if ([Math]::Abs(((Get-Item -LiteralPath $MapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $OutFile).LastWriteTimeUtc).TotalSeconds) -gt 120) {
-    Out2 'FAILURE: STALE_MAP'; Out2 'RESULT: FAIL'
-    Out2 'REASON: selected .map and .out timestamps differ by more than two minutes; their layouts may describe different builds'; exit 2
+if ($MapFile -and [Math]::Abs(((Get-Item -LiteralPath $MapFile).LastWriteTimeUtc - (Get-Item -LiteralPath $OutFile).LastWriteTimeUtc).TotalSeconds) -gt 120) {
+    # Reported, not refused. A timestamp gap means the map MAY describe a different build;
+    # the readers report it as source metadata and the data judgements still run. Blocking
+    # here only prevented a download that the board was perfectly able to accept.
+    Out2 'NOTE    : .map and .out timestamps differ by more than two minutes - the map may describe a different build'
 }
-$mapSha = (Get-FileHash -LiteralPath $MapFile -Algorithm SHA256).Hash
 
 $ccsPath = ''
 if ($probeText -match '(?m)^CCS\s*:\s*(.+?)\s+\(v') { $ccsPath = $Matches[1].Trim() }
 if (-not $ccsPath -and $CcsRoot -and (Test-Path (Join-Path $CcsRoot 'ccs_base'))) { $ccsPath = (Get-Item -LiteralPath $CcsRoot).FullName }
-if (-not $ccsPath) { Out2 'FAILURE: ENV_NO_CCS'; Out2 'RESULT: FAIL'; Out2 'REASON: cannot resolve CCS; pass -CcsRoot'; exit 2 }
+if (-not $ccsPath) { Out2 'FAILURE: ENV_NO_CCS'; Out2 'RESULT: FAIL'; Out2 'REASON: cannot resolve CCS; pass -CcsRoot'; exit 1 }
 $dss = Join-Path $ccsPath 'ccs_base\scripting\bin\dss.bat'
-if (-not (Test-Path -LiteralPath $dss)) { Out2 'FAILURE: ENV_NO_DSS'; Out2 'RESULT: FAIL'; Out2 "REASON: dss.bat not found under '$ccsPath'"; exit 2 }
+if (-not (Test-Path -LiteralPath $dss)) { Out2 'FAILURE: ENV_NO_DSS'; Out2 'RESULT: FAIL'; Out2 "REASON: dss.bat not found under '$ccsPath'"; exit 1 }
 
 New-Item -ItemType Directory -Path $svcDir -Force | Out-Null
 # from here on the target is being taken: hold the lock so no read can attach while
 # the image is being written (checked after the cheap build/probe work on purpose)
 $lk = Enter-TargetLock -ProjectPath $ProjectPath -Mode 'Start'
-if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 5 }
+if (-not $lk.ok) { foreach ($l in $lk.message) { Out2 $l }; exit 4 }
 foreach ($f in @($readyFile, $stoppedFile, $errorFile, $cmdFile, $resFile, $coreFile, $stateFile)) {
     if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
@@ -460,10 +488,36 @@ var server = env.getServer("DebugServer.1");
 server.setConfig(CCXML);
 var cpuList = server.getListOfCPUs();
 var cpuMatches = [];
-var cpuPattern = CORE ? new RegExp(CORE) : null;
-for (var ci = 0; ci < cpuList.length; ci++) {
-    if (!cpuPattern || cpuPattern.test("" + cpuList[ci])) { cpuMatches.push("" + cpuList[ci]); }
+
+if (CORE) {
+    var cpuPattern = new RegExp(CORE);
+    for (var ci = 0; ci < cpuList.length; ci++) {
+        if (cpuPattern.test("" + cpuList[ci])) { cpuMatches.push("" + cpuList[ci]); }
+    }
+} else {
+    // No pattern: pick one instead of demanding one. getListOfCPUs() on an F28379D returns
+    // C28xx_CPU1, C28xx_CPU2, CLA cores and more, so "match everything" can never work;
+    // and a hard-coded CPU1 would open the wrong core on a CPU2-only project. So:
+    //   exactly one C28xx core  -> use it (every single-core part)
+    //   several C28xx cores     -> CPU1, and say so (dual-core part, CPU1 is the default run)
+    var c28 = [];
+    for (var cj = 0; cj < cpuList.length; cj++) {
+        if (("" + cpuList[cj]).indexOf("C28xx") >= 0) { c28.push("" + cpuList[cj]); }
+    }
+    if (c28.length === 1) {
+        cpuMatches = [c28[0]];
+    } else if (c28.length > 1) {
+        var cpu1 = [];
+        for (var ck = 0; ck < c28.length; ck++) {
+            if (/C28xx_CPU1$/.test(c28[ck])) { cpu1.push(c28[ck]); }
+        }
+        if (cpu1.length === 1) {
+            cpuMatches = [cpu1[0]];
+            print("DSS: dual-core device - selected CPU1 (pass -CorePattern '.*C28xx_CPU2$' for CPU2)");
+        }
+    }
 }
+
 if (cpuMatches.length !== 1) {
     // Name what was actually enumerated: without it the user cannot tell whether the
     // pattern was too loose or the target simply has several cores.
@@ -493,8 +547,12 @@ if (actualCpu !== cpuMatches[0] && actualCpu.indexOf(cpuMatches[0]) < 0 && cpuMa
     throw "DSS opened a different CPU";
 }
 writeText(WORK + "/core.txt", actualCpu);
-session.options.setBoolean("AllowInterruptsWhenHalted", true);
-session.options.setBoolean("PoliteRealtimeMode", true);
+// Do NOT set realtime options before connect. A fresh session is already realtime-off;
+// loadti.bat never sets them and connects fine, while setting PoliteRealtimeMode(true)
+// here made a running core reject connect with -1133. They are switched ON only after
+// load+run (see below), once the session exists to serve ReadOnly variable reads.
+// Note: options are readonly until the target is connected, so this is not the place
+// to force them false either - leaving them untouched IS the loadti behaviour.
 
 // connect() returning normally does NOT prove the link is up: measured 2026-11-15, it
 // returned cleanly and the very next reset() failed with "target is not connected", after
@@ -520,6 +578,11 @@ if (!dssRunVerified(session, print, 300)) {
     writeText(WORK + "/error.txt", "TARGET_HALTED_AFTER_RUN");
     throw "halted after run";
 }
+// The image is loaded and the core is running. Now turn realtime back on so the
+// ReadOnly readers attached to this session can read variables without halting it.
+// Keeping these on during connect caused -1133; setting them only here is the point.
+try { session.options.setBoolean("AllowInterruptsWhenHalted", true); } catch (eA) { print("DSS: AllowInterruptsWhenHalted on failed: " + eA); }
+try { session.options.setBoolean("PoliteRealtimeMode", true); } catch (eR) { print("DSS: PoliteRealtimeMode on failed: " + eR); }
 writeText(WORK + "/ready.txt", "ready");
 print("SERVICE: READY");
 
@@ -598,7 +661,7 @@ if (dssShutdown(session, print)) {
 $js = $js.Replace('__WORK__', $workJs).Replace('__CCXML__', $ccxmlJs).Replace('__OUT__', $outJs).Replace('__CORE__', $coreJs)
 $bootJs = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ti_c2000_dss_boot.js'))
 if ($js.Contains('//__BOOT__')) { $js = $js.Replace('//__BOOT__', $bootJs) }
-else { Write-Output 'FAILURE: DSS_BOOT_MISSING'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: the DSS template has no //__BOOT__ placeholder, so connect/reset/load would run unshared code'; exit 2 }
+else { Write-Output 'FAILURE: DSS_BOOT_MISSING'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: the DSS template has no //__BOOT__ placeholder, so connect/reset/load would run unshared code'; exit 1 }
 [IO.File]::WriteAllText($jsPath, $js, [Text.Encoding]::ASCII)
 
 Info2 "PROJECT : $ProjectPath"
@@ -612,6 +675,9 @@ Info2 'STEP    : connect -> reset -> load once -> run forever'
 # paths with spaces survive. Output is redirected by cmd itself; Start-Process
 # redirection would tie the log to this process and stop once it exits.
 $cmdLine = '/d /s /c ""' + $dss + '" "' + $jsPath + '" > "' + $logFile + '" 2>&1"'
+# Enumeration is only the first layer. Let build and setup time count toward the
+# learned Stop-to-DSS interval; the later connect result updates this record.
+Wait-ProbeDriverGap -ProjectPath $ProjectPath -Ccxml $Ccxml -Quiet:$Quiet
 Wait-MinLoadGap -ProjectPath $ProjectPath
 $psi = $null
 try { $psi = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdLine -PassThru -WindowStyle Hidden -ErrorAction Stop }
@@ -648,8 +714,35 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
     $logText = ''
     if (Test-Path -LiteralPath $logFile) { try { $logText = Get-Content -LiteralPath $logFile -Raw -Encoding utf8 } catch { } }
     if ($failReason -match '^(AMBIGUOUS_CORE|CORE_MISMATCH)\b') {
-        Out2 ('FAILURE: ' + $Matches[1]); Out2 'RESULT: FAIL'
-        Out2 ('REASON: ' + $failReason); exit 4
+        # USAGE, not FAILURE: nothing was measured and nothing was judged - the command
+        # could not say which core to open. exit 2 = "fix the command", while exit 3/4
+        # means "the board or the data is not trustworthy". Mixing the two made a missing
+        # parameter look like a validation that refused to download (2026-11-16).
+        Out2 ('USAGE: ' + $Matches[1]); Out2 'RESULT: FAIL'
+        Out2 ('REASON: ' + $failReason); exit 2
+    }
+    if ($failReason -match '^CONNECT_FAILED\b') {
+        # No reset or load has happened yet. A PnP hit may precede driver access, so
+        # add 5 s to the observed failed Stop-to-connect interval and retry once in a
+        # fresh process. Subsequent Stop/Start cycles begin at the good/bad midpoint.
+        Mark-ProbeDriverFailure -ProjectPath $ProjectPath -Ccxml $Ccxml
+        if (-not $env:TI_C2000_CONNECT_RETRY) {
+            Out2 'NOTE    : DSS connect failed before load; increasing the recovery interval for this probe configuration and retrying once'
+            $env:TI_C2000_CONNECT_RETRY = '1'
+            $retryArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
+                '-ProjectPath',$ProjectPath,'-Start','-ConfirmLoad','-OutFile',$OutFile,'-Ccxml',$Ccxml,
+                '-RunMode',$RunMode,'-StartTimeoutSec',[string]$StartTimeoutSec)
+            if ($MapFile) { $retryArgs += @('-MapFile',$MapFile) }
+            if ($CcsRoot) { $retryArgs += @('-CcsRoot',$CcsRoot) }
+            if ($CorePattern) { $retryArgs += @('-CorePattern',$CorePattern) }
+            if ($UserApproved) { $retryArgs += '-UserApproved' }
+            if ($Quiet) { $retryArgs += '-Quiet' }
+            try { & pwsh @retryArgs; exit $LASTEXITCODE }
+            finally { Remove-Item Env:TI_C2000_CONNECT_RETRY -ErrorAction SilentlyContinue }
+        }
+        Out2 'FAILURE: CONNECT_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
+        Out2 'HINT    : inspect DSS log and probe-driver-wait.json; two failed connections do not prove a cable or power fault'
+        exit 3
     }
     if ($logText -match 'Error -1138|Device refused to allow debug mode' -or $failReason -match 'board refused debug mode') {
         # -1138 is intermittent, and a fresh DSS process usually clears it on the first try:
@@ -661,12 +754,14 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
             Out2 'NOTE    : the chip refused debug mode (Error -1138) - retrying once with a fresh DSS process'
             $env:TI_C2000_START_RETRY = '1'
             $retryArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-                '-ProjectPath', $ProjectPath, '-Start', '-ConfirmLoad')
-            if ($Build) { $retryArgs += '-Build' }
+                '-ProjectPath', $ProjectPath, '-Start', '-ConfirmLoad', '-RunMode', $RunMode,
+                '-StartTimeoutSec', [string]$StartTimeoutSec)
             if ($CcsRoot) { $retryArgs += @('-CcsRoot', $CcsRoot) }
             if ($Ccxml) { $retryArgs += @('-Ccxml', $Ccxml) }
             if ($OutFile) { $retryArgs += @('-OutFile', $OutFile) }
             if ($MapFile) { $retryArgs += @('-MapFile', $MapFile) }
+            if ($CorePattern) { $retryArgs += @('-CorePattern', $CorePattern) }
+            if ($UserApproved) { $retryArgs += '-UserApproved' }
             if ($Quiet) { $retryArgs += '-Quiet' }
             try {
                 & pwsh @retryArgs
@@ -675,17 +770,14 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
                 Remove-Item Env:TI_C2000_START_RETRY -ErrorAction SilentlyContinue
             }
         }
-        # Second attempt in a row: the board really is refusing debug mode.
+        # Two attempts failed; this does not by itself identify the physical cause.
         Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
-        Out2 'HINT    : the chip refused debug mode (Error -1138) twice in a row - this is a board state, not a script problem'
-        Out2 'HINT    : power-cycle the board: unplug the USB cable, wait 3 s, plug it back in'
-        Out2 'HINT    : if a power cycle does not clear it, lower TCLK in the .ccxml and try again'
+        Out2 'HINT    : Error -1138 occurred twice; check probe recovery time, DSS logs and target configuration before changing hardware'
         exit 3
     }
     if ($tail -join "`n" -match 'Error -150|FTDI driver functions') {
         Out2 'HINT    : the probe driver did not become usable after the previous session; consult Error mode for this adapter'
-        Out2 'HINT    : unplug the USB cable, wait 3 s, plug it back in, then run -Start again'
-        Out2 'HINT    : if this repeats, check the cable/port and disable USB selective suspend for this device'
+        Out2 'HINT    : PnP enumeration passed, but DSS access failed; wait and inspect the DSS log before another Start'
     } elseif ($failReason -match 'Load failed|Failed to remove the debug state') {
         # measured 2026-11-15: the first load after an unclean disconnect can fail even
         # with in-process retries, and the very next whole -Start then succeeds
@@ -695,6 +787,9 @@ if (-not (Test-Path -LiteralPath $readyFile)) {
     Out2 'FAILURE: SERVICE_START_FAILED'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $failReason)
     exit 1
 }
+
+# READY is written only after DSS connected, verified the target, loaded and ran.
+Mark-ProbeDriverSuccess -ProjectPath $ProjectPath -Ccxml $Ccxml
 
 $resolvedCore = if (Test-Path -LiteralPath $coreFile) { ([string](Get-Content -LiteralPath $coreFile -Raw)).Trim() } else { '' }
 if (-not $resolvedCore) {

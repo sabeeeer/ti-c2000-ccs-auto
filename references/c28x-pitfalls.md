@@ -582,3 +582,42 @@ $bin='C:\ti\ccsv6\tools\compiler\ti-cgt-c2000_15.12.1.LTS\bin'
 隐式声明 + 外部调用，链接报 `___sinpuf32 unresolved`（本项目构建脚本已修：读 `.cproject` 的
 `compilerID.TMU_SUPPORT` 并传 `--tmu_support`）。同理 `math.h` 要让 `__sin` 生效需
 `--fp_mode=relaxed`，而 `__sinpuf32` 在严格模式下也可用——优先用后者。
+
+
+## 十、EALLOW / EDIS 的边界：不是"所有外设寄存器都要加"，但配置类默认加
+
+**规则**：写**受保护**寄存器必须夹在 `EALLOW; ... EDIS;` 之间。写在 `EDIS` 之后**静默失效**——不报错、不告警，只能靠读回或现象判断。而"受保护"不等于"所有外设寄存器"，照抄 TI **同器件**例程最可靠。
+
+### 10.1 两组官方例程给出的实际边界
+
+| 寄存器类别 | F2833x 例程的写法 | F2837xD 例程的写法 |
+|---|---|---|
+| GPIO：`GPxMUX` / `GPxGMUX` / `GPxDIR` / `GPxPUD` / `GPxQSEL` / `GPxODR` | **EALLOW**（`DSP2833x_ECan.c`） | EALLOW |
+| 外设时钟：`SysCtrlRegs.PCLKCRx` | **EALLOW**（`DSP2833x_Adc.c`） | EALLOW |
+| PIE 使能/标志：`PIEIERx` / `PIEIFRx` | **EALLOW**（`DSP2833x_DMA.c`） | **不加**（`F2837xD_PieCtrl.c` 的 `InitPieCtrl()` 整个函数无 EALLOW） |
+| PIE 应答：`PIEACK` | — | **不加**（`EnableInterrupts()` 与 `adc_ppb_delay_cpu01.c:362` 的 ISR 都是裸写） |
+| PIE 控制：`PIECTRL` | — | **不加** |
+| ADC 控制：`ADCTRLx` | **不加**（`DSP2833x_Adc.c`：`AdcRegs.ADCTRL3.all = 0x00E0;` 写在 `EDIS` 之后） | ADC SOC 配置在工程 `adc.c` 里加了 EALLOW |
+| 数据/结果：`DACVALS`、`ADCRESULTx` | 不加 | 不加 |
+| 标志清除：`ETCLR`、`ADCINTFLGCLR`、`ADCINTOVFCLR` | 不加 | 不加 |
+| PIE 向量表：`PieVectTable` | 需要 | 需要 |
+
+**2833x 与 28379D 在 PIE 上不同**：2833x 的 `PIEIER`/`PIEIFR` 必须 EALLOW，28379D 不需要。28379D 上多写 EALLOW 无害，2833x 上少写则静默失效——**跨器件不能套用**。
+
+### 10.2 实践规则
+
+1. **写配置类寄存器默认加**（GPIO、外设时钟、DMA 通道、ADC SOC、ePWM 时基/动作/死区、看门狗、Flash 选项、DCSM）：`EALLOW`/`EDIS` 各约 1 个周期，漏写的代价是静默失效。
+2. **写数据/结果/标志清除寄存器不必加**：`DACVALS`、`ADCRESULTx`、`ETCLR`、`ADCINTFLGCLR` 常在 ISR 里高频访问，加 EALLOW 只是浪费周期。
+3. **`EALLOW`/`EDIS` 不可嵌套**：外层 `EALLOW` 后内层再 `EALLOW`，内层的 `EDIS` 会把保护提前关掉。每个函数自成对，不要依赖调用者的 EALLOW 状态。
+4. **判断依据只有两个**：TI **同器件**例程的实际写法、头文件与 TRM 里该寄存器所在节的说明。不要用"别的 C2000 器件这样做"来推断。
+
+### 10.3 一次真实踩坑（2026-11-18，F28379D，LOAD #87~#90）
+
+新增 ePWM2 的 128 kHz 定时中断后，ePWM2 与 ePWM4 的中断**全部不响应**：`IFR=0`、`PIEIFR3=0x0A`、`PIEACK=4`、两个 `ETFLG` 都置位、ISR 计数器恒 0、`TBCTR` 正常变化。
+
+- **真因**：`main()` 只写了 `EINT; ERTM;`，缺少 TI `EnableInterrupts()` 里的 `PieCtrlRegs.PIEACK.all = 0xFFFF`。`PIEACK` 的待应答位把 GROUP3 挡在 PIE 层，请求根本到不了 CPU。
+- **误判**：曾归因成"`PIEACK` 受 EALLOW 保护，写在 `EDIS` 之后无效"。因为一次修复同时改了两处（`main` 加整体释放 + 把 `PIEACK` 挪进 EALLOW），无法区分。
+- **证伪**：把 `PIEACK` 移回 `EDIS` 之后、只保留 `main` 的整体释放，重新下载后一切正常（LOAD #90：`gDacIsrCount` 128 kHz、`gCtrlTick` 10 kHz、`PIEACK=0`）。
+- **教训**：**一次只改一个变量**；多改一处就必须做对照实验，否则会把"恰好同时生效"当成因果关系，并据此写下错误规则。
+
+完整过程见[案例](debug-cases/f28379d/2026-11-18-pieack-blocks-interrupts.md)。

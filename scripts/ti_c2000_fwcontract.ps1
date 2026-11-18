@@ -45,7 +45,9 @@ function Get-FwContract {
         heartbeat    = [ordered]@{ candidates = @('gMsTick', 'usMainLoop', 'gRunMs') }
         rate         = [ordered]@{ var = 'gMsTick'; perSec = 1000; tolerancePct = 20 }
         frozenBuffer = [ordered]@{ array = 'gDmaFrameA'; flag = 'gDmaReady'; flagValue = '1'; seq = 'gDmaSeq' }
-        readGate     = [ordered]@{ requireProbe = $true; requireLiveSession = $true; requireOutSha256 = $true; requireSourceFreshness = $true; requireCompleteDssResponse = $true; requireFirmwareIdentity = $true; requireRam = $true; requireHeartbeat = $true }
+        readGate     = [ordered]@{ requireProbe = $true; requireLiveSession = $true; requireCompleteDssResponse = $true }
+        dataVerdict  = [ordered]@{ checkOutSha256 = $true; checkSourceFreshness = $true; checkFirmwareIdentity = $true; checkHeartbeat = $true }
+        sourceMetadata = [ordered]@{ reportRam = $true }
         timing       = [ordered]@{ minLoadGapMs = 5000; minReadGapMs = 400; minReconnectGapMs = 400 }
         source       = '(built-in defaults)'
     }
@@ -53,21 +55,25 @@ function Get-FwContract {
     $path = @(Get-FwContractPaths) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $path) {
         Write-Output 'FAILURE: FW_CONTRACT_MISSING'; Write-Output 'RESULT: FAIL'
-        Write-Output 'REASON: references\firmware-contract.json is required'; exit 2
+        Write-Output 'REASON: references\firmware-contract.json is required'; exit 1
     }
 
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
     } catch {
         Write-Output 'FAILURE: FW_CONTRACT_INVALID'; Write-Output 'RESULT: FAIL'
-        Write-Output ('REASON: ' + $_.Exception.Message); exit 2
+        Write-Output ('REASON: ' + $_.Exception.Message); exit 1
     }
     $invalid = New-Object System.Collections.Generic.List[string]
-    if ([int]$raw.version -lt 3) { $invalid.Add('version < 3') }
+    if ([int]$raw.version -lt 4) { $invalid.Add('version < 4') }
     if (-not $raw.ramProof.counter -or -not $raw.ramProof.updater) { $invalid.Add('ramProof.counter/updater') }
-    foreach ($key in @('requireProbe','requireLiveSession','requireOutSha256','requireSourceFreshness','requireCompleteDssResponse','requireFirmwareIdentity','requireRam','requireHeartbeat')) {
+    foreach ($key in @('requireProbe','requireLiveSession','requireCompleteDssResponse')) {
         if ($raw.readGate.$key -isnot [bool] -or -not $raw.readGate.$key) { $invalid.Add("readGate.$key") }
     }
+    foreach ($key in @('checkOutSha256','checkSourceFreshness','checkFirmwareIdentity','checkHeartbeat')) {
+        if ($raw.dataVerdict.$key -isnot [bool] -or -not $raw.dataVerdict.$key) { $invalid.Add("dataVerdict.$key") }
+    }
+    if ($raw.sourceMetadata.reportRam -isnot [bool] -or -not $raw.sourceMetadata.reportRam) { $invalid.Add('sourceMetadata.reportRam') }
     foreach ($pair in @(@('minLoadGapMs',5000),@('minReadGapMs',400),@('minReconnectGapMs',400))) {
         $v = 0
         if (-not [int]::TryParse([string]$raw.timing.($pair[0]),[ref]$v) -or $v -lt [int]$pair[1]) {
@@ -76,7 +82,7 @@ function Get-FwContract {
     }
     if ($invalid.Count -gt 0) {
         Write-Output 'FAILURE: FW_CONTRACT_INVALID'; Write-Output 'RESULT: FAIL'
-        Write-Output ('REASON: missing or unsafe fields: ' + ($invalid -join ', ')); exit 2
+        Write-Output ('REASON: missing or unsafe fields: ' + ($invalid -join ', ')); exit 1
     }
 
     # merge over the defaults, so a partial file still yields a complete shape
@@ -98,13 +104,10 @@ function Get-FwContract {
         readGate = [ordered]@{
             requireProbe            = $true
             requireLiveSession      = $true
-            requireOutSha256        = $true
-            requireSourceFreshness  = $true
             requireCompleteDssResponse = $true
-            requireFirmwareIdentity = $true
-            requireRam              = $true
-            requireHeartbeat        = $true
         }
+        dataVerdict = $default.dataVerdict
+        sourceMetadata = $default.sourceMetadata
         timing = [ordered]@{
             minLoadGapMs      = [int]$raw.timing.minLoadGapMs
             minReadGapMs      = [int]$raw.timing.minReadGapMs

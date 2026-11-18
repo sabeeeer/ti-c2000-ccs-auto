@@ -21,6 +21,82 @@
 
 `loadti` 自身有 `-cpu/--cpu-name` 选核参数；本技能包装脚本当前未透传该参数，F28379D 下载前须确认实际加载核。`xds100serial.exe` 可在 `<CCS_ROOT>\ccs_base\common\uscif\` 下列出 XDS100 探针和串号；`dbgjtag.exe` 在同目录用于 JTAG 诊断。识别探针不需要下载程序；`loadti` 则会改变目标状态。
 
+## 一次成功下载的固定顺序与日志判读（2026-11-18，F28379D/CPU1 + XDS100v2 实测）
+
+工程 `F28379D_CPU1_BareMetal`（`CPU1_RAM` 配置、21 个源文件、COFF、`ti-cgt-c2000_15.12.1.LTS`）从"从未构建过"到"RAM 运行并被只读验证"一次跑通，命令只有三条：
+
+```powershell
+pwsh -NoProfile -File <skill>\scripts\ti_c2000_build.ps1   -ProjectPath <工程> -Stage -EntryPoint code_start
+pwsh -NoProfile -File <skill>\scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start -ConfirmLoad
+pwsh -NoProfile -Command "& '<skill>\scripts\ti_c2000_run_read.ps1' -ProjectPath '<工程>' -Variables usMainLoop,EPwm1Regs.TBPRD -Rounds 4 -IntervalMs 400"
+```
+
+DSS 侧只有四步（`scripts/ti_c2000_dss_boot.js`）：`server.openSession("C28xx_CPU1")` → `target.reset()` → `memory.loadProgram(<工程>\Debug\<工程>.out)` → `target.runAsynch()`。**`loadProgram` 是按 `.out` 段地址写内存**；`.out` 若是 RAM 链接（`2837xD_RAM_lnk_cpu1.cmd` + `F2837xD_Headers_nonBIOS_cpu1.cmd`），就不触发任何 Flash 擦写。
+
+成功三条判据，缺一不得写"下载成功"：
+
+| 判据 | 证据位置 | 本次实测值 |
+|---|---|---|
+| 目标是 RAM 镜像 | `.map` 的 MEMORY CONFIGURATION | `FLASHA~FLASHN` used 全 `00000000`；`ENTRY POINT SYMBOL: "code_start" address: 00000000` |
+| 镜像真的写进去了 | `server.log` | `DSS: loaded`（`DSS: reset` 之后） |
+| 程序真的在跑 | 只读附着读计数器 | `usMainLoop` 369,300,672 → 374,378,552 → 378,189,143；`gFwId = 65537` |
+
+`server.log` 的正确读法（本次原文顺序，**前半段看起来全是错，但最后确实是成功的**）：
+
+```text
+SEVERE: ... (Error -1133 @ 0x0) Device blocked debug access ... non-debuggable code
+DSS: PoliteRealtimeMode off, retrying connect for -1133     <- 自动降级，属正常过程
+SEVERE: ... Trouble Reading Memory Block at 0x5f05e / 0x5f060 / 0x7026d (Error -150) ...  <- GEL 试探读
+DSS: connected (realtime off)                                <- 连接建立（注意：在 -150 之后）
+SEVERE: C28xx_CPU1: Failed CPU Reset: (Error -6310) PRSC module failed to read a register
+SEVERE: C28xx_CPU1: JTAG Communication Error: (Error -150) ...
+SEVERE: C28xx_CPU1: Failed to remove the debug state from the target before disconnecting
+SEVERE: GEL: ... Could not write 0x0005D122@Data: target is not connected
+SEVERE: Target reset failed. Error: -1
+DSS: reset failed (...)                                      <- 复位失败，链路丢失
+DSS: link lost after connect, reconnecting
+DSS: reconnect 1 failed: ... (IcePick_C_0: Error -151 ...)    <- 退避 900 ms
+DSS: reconnect 2 failed: ... (IcePick_C_0: Error -151 ...)    <- 退避 1800 ms
+C28xx_CPU1: GEL Output: Memory Map Initialization Complete
+DSS: reset after reconnect (try 3)
+DSS: loaded                                                  <- 写成功，只有这一行算数
+SERVICE: READY
+```
+
+- `-1133` 是实时选项（`PoliteRealtimeMode=true` 供运行态读用）被拒绝；`loadti` 从不设这些选项，所以"loadti 能下、自己写的 DSS 下不进"的差异就在这里。**这条错误在本工程里是 skill 自己的连接选项造成的，修好降级逻辑后消失**，不要记成 Flash/硬件状态。
+- `-150` 判据不是"出现位置"而是"影响"：本次 `DSS: connected` **之前**出现 3 次（GEL 试探读），链路建立后**又出现 1 次** `JTAG Communication Error`，两次都没阻止最终 `DSS: loaded`。要做的操作还能成功 → 瞬时 FTDI 噪声；同一操作反复失败 → 才查探针/驱动。
+- `reset()` 报 `-6310`（PRSC 读失败）或 `Target reset failed. Error: -1` 时不要当场放弃：链路还在就 `halt()` 后直接加载；链路已丢（GEL 报 `target is not connected`）则进重连分支（最多 3 次、退避 900/1800/2700 ms）。本次是第 3 次重连后才 `DSS: reset after reconnect (try 3)` → `DSS: loaded`。只有 3 次全失败才是连接故障。
+- 入口点必须是 `code_start`：不加 `-EntryPoint code_start` 时构建只打印 `LINK : .cproject declares ENTRY_POINT=code_start; NOT applied`，`.map` 里是 `ENTRY POINT SYMBOL: "_c_int00"`，`codestart` 的关狗分支被跳过。判据与原因见 [RAM 与链接](ram-and-linker.md)「入口点」小节。
+- 第一次探针检查可能直接 `NO_PROBE`：本次 15:52 报 `PROBE : NOT FOUND` + exit 3，插好后**同一条命令**报 `XDS100 Class Debug Port` / `Auxiliary Port` / `USB Serial Port (COM11)` + `RESULT: OK`。PnP 需要时间，一次 `NO_PROBE` 不构成硬件结论。
+
+### 实时模式与"下一次下载"的关系（别把它记成"必须人工关掉"）
+
+- `ti_c2000_service.ps1` 在 connect **之前**就把 `PoliteRealtimeMode=true`、`AllowInterruptsWhenHalted=true` 打开，因为 `ReadOnly` 要在程序**运行中**读数、不能靠停核。
+- `-1133` 发生在 **connect 阶段**；连不上就谈不上 `loadProgram`，所以"下不进"的第一现场往往是连接而不是写内存。
+- 这两个选项属于**当次 DSS 会话**，不写进板子、不跨进程保留。下一次下载会**重新以 realtime on 开始**，再由 `dssConnectVerified` 捕获 `-1133`/`non-debuggable code`/`emulation failure` 自动降级（`disconnect` → 等 500 ms → 关两个选项 → 重连一次）。**不需要人工去关**，日志里的 `PoliteRealtimeMode off, retrying connect` 就是它自己做的。
+- `loadti`（以及 `ti_c2000_debug.ps1 -Run`）**从不设置**这些选项，所以"它没关什么"也能连上；若 `loadti` 同样报 `-1133`，说明原因不在实时模式，要查复位循环、正在执行的非调试代码或另一个核。
+- 降级后的会话是 realtime off：本次读数仍然成功（`usMainLoop` 跨轮递增），但别把"realtime off 也能读"当成所有目标状态的保证。
+
+### `-150` 有两副面孔（同一次实测，同一份日志）
+
+| 位置 | 含义 | 处置 |
+|---|---|---|
+| `DSS: connected` **之前**，常伴随 `flash operation: Target failed to read 0x05F05E@Program` | GEL/仿真包在连接阶段试探读，**与本次镜像无关**（本次 .out 的 Flash used=0） | 忽略；继续看是否出现 `DSS: loaded` |
+| 出现在写/校验失败之后（`Target failed to write 0x008000@Program`），或链路已建立后反复出现，或探针掉出 PnP | 探针/驱动真的没准备好 | 允许重新枚举、重新做可用性检查，不要立刻重连 |
+
+判据只有一条：**`-150` 之前有没有 `DSS: connected`**。有 → 噪声；没有 → 按探针故障处理。
+
+### 读回符号必须用当前器件的名字（同一次实测踩到）
+
+| 写法 | 结果 | 正确写法 |
+|---|---|---|
+| `AdcRegs.ADCCTL1.all` | `identifier not found: AdcRegs`（2833x 才有 `AdcRegs`） | `AdcaRegs.ADCCTL1.all`（F2837xD 按 A/B/C/D 分实例） |
+| `AdcaRegs.ADCTRL1.all` | `member 'ADCTRL1' not found`（F2837xD 无 `ADCTRL1/ADCTRL2`） | `AdcaRegs.ADCCTL1.all`、`ADCCTL2.all`、`ADCSOC0CTL.all` |
+| `EPwm1Regs.CMPA.all` | 读回 128122880 / 34209792 等 >16 位的值，与 `TBPRD=4999` 矛盾 | `EPwm1Regs.CMPA.bit.CMPA`（本次 3492 → 1587 → 1245，与环路写占空比一致） |
+| `EPwm1Regs.TBCTL.all` | `0`，这是**正确**值（CTRMODE=UP、`HSPCLKDIV/CLKDIV=/1`） | 不要因为读 0 就判"寄存器没配上" |
+
+**`pwsh -File` 传数组参数会带字面引号**：`-Variables 'gFwId','usMainLoop'` 到达脚本时是**一个**字符串 `'gFwId','usMainLoop'`（含引号），于是路径正则不匹配，报 `USAGE: INVALID_READ_REQUEST`。改用 `-Variables gFwId,usMainLoop`（不加引号，脚本自己按逗号拆）或用 `& <脚本> -Variables 'gFwId','usMainLoop'` 在当前进程内调用。
+
 ## 单会话读数入口（取代已删除的只读脚本）
 
 ```powershell

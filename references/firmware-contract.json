@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "about": [
     "The variables this skill expects the FIRMWARE to declare. One file, because these names used",
     "to be hard-coded in twelve places and had already drifted: FrozenValue was 'true' in",
@@ -18,8 +18,8 @@
   "ramProof": {
     "counter": "gRamProofTick",
     "updater": "TiC2000_RamProofTick",
-    "why": "The updater function must be retained and linked to a RAM run region, and only that function may advance the counter. A retained DSS session checks both symbol addresses against the exact loaded map and observes the counter advancing. This avoids a PC read. The program must call the updater periodically; a missing map, symbol or moving counter is a refusal.",
-    "firmware": "See references/ram-proof-firmware.md for an illustrative C and linker integration pattern; compile it with the selected project before accepting reads.",
+    "why": "When present, the RAM updater, counter and pinned map give source-location evidence without reading PC. Missing or nonadvancing evidence is reported as metadata, never a load or read veto.",
+    "firmware": "See references/ram-proof-firmware.md for an optional C and linker integration pattern.",
     "integration": "Place the function in a section whose RUN address is RAM according to the selected .cmd/.map, call it every 1-10 ms from the running application, keep the counter in RAM, and ensure no other code writes the counter. Compiler and linker syntax are checked against the selected project before adding it."
   },
   "heartbeat": {
@@ -39,19 +39,25 @@
     "flag": "gDmaReady",
     "flagValue": "1",
     "seq": "gDmaSeq",
-    "why": "A DMA buffer is only consistent if the firmware freezes it first. flagValue is what the flag reads WHEN frozen (1 and 'true' are the same statement in C; readers normalise).",
-    "note": "A waveform read requires a frozen buffer and the expected completed flag value; no empty flag bypass."
+    "why": "Continuous capture is the only waveform read path: the control ISR appends one sample set per tick into a static array, sets the frozen flag when full, then stops writing. The host reads a static array, so transfer time never corrupts it. DMA ping-pong and bank selection were removed on 2026-11-18.",
+    "note": "Needs exactly three symbols: one static array (in a named RAM section), one completed/frozen flag (set to 1 only after the last point is written), and one point counter or sequence number. Size the array as f_ctrl * T * V first; anything above 4096 words needs the RAMGS blocks merged into a single MEMORY entry."
   },
   "readGate": {
     "requireProbe": true,
     "requireLiveSession": true,
-    "requireOutSha256": true,
-    "requireSourceFreshness": true,
     "requireCompleteDssResponse": true,
-    "requireFirmwareIdentity": true,
-    "requireRam": true,
-    "requireHeartbeat": true,
-    "why": "A read is accepted only when the retained DSS session and target are live, the selected image hash matches the load record, the firmware identity is readable and unchanged, a counter advances, and RAM execution has independent evidence. A repeated firmware ID is a known residual risk."
+    "why": "These operational checks determine whether any current data can be read. They do not judge the captured numbers."
+  },
+  "dataVerdict": {
+    "checkOutSha256": true,
+    "checkSourceFreshness": true,
+    "checkFirmwareIdentity": true,
+    "checkHeartbeat": true,
+    "why": "When a target answers, deliver the captured values and mark the verdict FAIL if any identity, freshness, liveness or numeric check fails."
+  },
+  "sourceMetadata": {
+    "reportRam": true,
+    "why": "Report RAM, Flash or UNKNOWN with evidence; location alone cannot reject a download or suppress captured data."
   },
   "timing": {
     "minLoadGapMs": 5000,

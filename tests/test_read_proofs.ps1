@@ -25,7 +25,7 @@ New-Item -ItemType Directory -Force -Path $scripts, $project, $empty, (Join-Path
 [IO.File]::WriteAllText((Join-Path $project 'targetConfigs/x.ccxml'), '<configurations/>', (New-Object Text.UTF8Encoding($false)))
 
 try {
-    foreach ($n in @('ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1', 'ti_c2000_readmode.ps1', 'ti_c2000_loadcount.ps1')) {
+    foreach ($n in @('ti_c2000_run_read.ps1', 'ti_c2000_read_dma.ps1', 'ti_c2000_readmode.ps1', 'ti_c2000_probe.ps1', 'ti_c2000_loadcount.ps1')) {
         Copy-Item -LiteralPath (Join-Path $root "scripts/$n") -Destination $scripts
     }
     Copy-Item -LiteralPath (Join-Path $root 'scripts/ti_c2000_fwcontract.ps1') -Destination $scripts
@@ -36,16 +36,16 @@ try {
     # --- 1. the two weakening switches belong to ReadOnly only -------------------
     $r = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_run_read.ps1'),
         '-ProjectPath', $project, '-Variables', 'gMsTick', '-Mode', 'LoadRead', '-ConfirmLoad', '-AllowUnverified')
-    Expect 'LoadRead+AllowUnverified' $r 2 'FAILURE: MUTUALLY_EXCLUSIVE'
+    Expect 'LoadRead+AllowUnverified' $r 2 'USAGE: MUTUALLY_EXCLUSIVE'
 
     $r = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_read_dma.ps1'),
         '-ProjectPath', $project, '-ArrayName', 'gBuf', '-FrozenBufferReady', '-Mode', 'LoadRead', '-ConfirmLoad', '-NoProbeCheck')
-    Expect 'LoadRead+NoProbeCheck' $r 2 'FAILURE: MUTUALLY_EXCLUSIVE'
+    Expect 'LoadRead+NoProbeCheck' $r 2 'USAGE: MUTUALLY_EXCLUSIVE'
 
     # --- 2. ReadOnly refuses weakened proofs before any session work --------
     $r = Invoke-Script @('-NoProfile', '-File', (Join-Path $scripts 'ti_c2000_run_read.ps1'),
         '-ProjectPath', $project, '-Variables', 'gMsTick', '-Mode', 'ReadOnly', '-AllowUnverified', '-NoProbeCheck')
-    Expect 'ReadOnly+AllowUnverified' $r 2 'FAILURE: READ_PROOF_BYPASS'
+    Expect 'ReadOnly+AllowUnverified' $r 2 'USAGE: READ_PROOF_BYPASS'
 
     # --- 3. missing pinned map is fail-closed without a PC read ----------
     $lib = Join-Path $scripts 'ti_c2000_readmode.ps1'
@@ -62,7 +62,14 @@ try {
     $fake = Join-Path $fixture 'no_probe.ps1'
     [IO.File]::WriteAllText($fake, "Write-Output 'FAILURE: NO_PROBE'`nWrite-Output 'RESULT: FAIL'`nWrite-Output 'REASON: stub says no probe'`nexit 3`n", (New-Object Text.UTF8Encoding($false)))
     $gate = Join-Path $fixture 'probe_gate.ps1'
-    [IO.File]::WriteAllText($gate, ". '$lib'`nAssert-ProbeOnline -ProjectPath '$project' -DebugScript '$fake'`n'PROBE gate passed (WRONG)'`n", (New-Object Text.UTF8Encoding($false)))
+    $gateText = ". '$lib'`n" + @'
+function Wait-ProbeUsable {
+    param($ProjectPath, $ProbeCheck, $MaxSeconds, $Quiet)
+    & $ProbeCheck | Out-Null
+    return $false
+}
+'@ + "`nAssert-ProbeOnline -ProjectPath '$project' -DebugScript '$fake'`n'PROBE gate passed (WRONG)'`n"
+    [IO.File]::WriteAllText($gate, $gateText, (New-Object Text.UTF8Encoding($false)))
     $g = Invoke-Script @('-NoProfile', '-File', $gate)
     Expect 'probe gate' $g 3 'FAILURE: NO_PROBE'
     if ($g.text -match 'FAILURE: NO_PROBE[\s\S]*FAILURE: NO_PROBE') { throw "the gate must report NO_PROBE exactly once`n$($g.text)" }

@@ -1,6 +1,5 @@
 #requires -Version 7.0
-# PREFLIGHT must refuse BEFORE any data exists. The cases here fail on purpose and check
-# that (a) the run stops, (b) no data.csv survives, and (c) verdict.txt says FAIL.
+# Source and data doubts must retain current values and produce a FAIL verdict.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('c2000-preflight-' + [guid]::NewGuid().ToString('N'))
@@ -121,20 +120,20 @@ while ($true) {
         }
     }
 
-    # 1. firmware identity differs from what the session loaded -> refuse, clear stale data
+    # 1. firmware identity differs from what the session loaded -> deliver and mark FAIL
     Reset-Stale
     $r = Run-Read '999' 900
-    Check 'different firmware -> PREFLIGHT_FAILED' ($r.code -eq 4 -and $r.text -match 'FAILURE: PREFLIGHT_FAILED') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
+    Check 'different firmware -> failed data verdict' ($r.code -eq 1 -and $r.text -match 'FAILURE: FW_ID_MISMATCH') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
     Check 'reason names the identity' ($r.text -match 'ANOTHER BUILD') ('text=' + ($r.text -replace "`n", ' | '))
-    Check 'stale data.csv removed' (-not (Test-Path (Join-Path $data 'data.csv'))) 'data.csv survived a refusal'
+    Check 'current data.csv delivered' ((Test-Path (Join-Path $data 'data.csv')) -and (Get-Content (Join-Path $data 'data.csv') -Raw) -match '2,') 'current data.csv missing'
     $v = Get-Content (Join-Path $check 'verdict.txt') -Raw
     Check 'verdict overwritten with FAIL' ($v -match 'result: FAIL' -and $v -notmatch 'result: OK') ('verdict=' + ($v -replace "`n", ' | '))
 
-    # 2. counter frozen -> refuse before reading
+    # 2. counter frozen -> deliver samples with FAIL verdict
     Reset-Stale
     $r = Run-Read '65537' 0
-    Check 'frozen counter -> PREFLIGHT_FAILED' ($r.code -eq 4 -and $r.text -match 'not advancing') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
-    Check 'no data written for a frozen program' (-not (Test-Path (Join-Path $data 'data.csv'))) 'data.csv written'
+    Check 'frozen counter -> failed data verdict' ($r.code -eq 1 -and $r.text -match 'FAILURE: HEARTBEAT_FAIL') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
+    Check 'frozen counter retains data' (Test-Path (Join-Path $data 'data.csv')) 'data.csv missing'
 
     # 3. identity matches and counter advances -> the read proceeds
     Reset-Stale
@@ -150,9 +149,20 @@ while ($true) {
     (Get-Item -LiteralPath $editedSource).LastWriteTimeUtc = (Get-Item -LiteralPath $outFile).LastWriteTimeUtc.AddSeconds(10)
     Reset-Stale
     $r = Run-Read '65537' 900
-    Check 'newer source blocks stale image' ($r.code -eq 4 -and $r.text -match 'selected image is stale') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
-    Check 'stale image clears previous CSV' (-not (Test-Path (Join-Path $data 'data.csv'))) 'data.csv survived a stale-image refusal'
+    Check 'newer source marks data untrusted' ($r.code -eq 1 -and $r.text -match 'FAILURE: DATA_UNRELIABLE' -and $r.text -match 'selected image is stale') ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
+    Check 'stale image still delivers current CSV' (Test-Path (Join-Path $data 'data.csv')) 'data.csv missing'
     Remove-Item -LiteralPath $editedSource -Force
+
+    # 5. the running image remains readable if its disk file was later removed;
+    # the missing SHA proof must travel with the captured data as a FAIL verdict.
+    $savedOut = [IO.File]::ReadAllBytes($outFile)
+    Remove-Item -LiteralPath $outFile -Force
+    Reset-Stale
+    $r = Run-Read '65537' 900
+    Check 'missing disk image does not withhold live data' ($r.code -eq 1 -and
+        $r.text -match 'selected disk \.out is missing' -and (Test-Path (Join-Path $data 'data.csv'))) ('exit=' + $r.code + ' text=' + ($r.text -replace "`n", ' | '))
+    Check 'missing image gets FAIL verdict' ((Get-Content (Join-Path $check 'verdict.txt') -Raw) -match 'result: FAIL') 'verdict missing FAIL'
+    [IO.File]::WriteAllBytes($outFile, $savedOut)
 
     # One automatic re-run. Each case drives an external stub process over files in %TEMP%,
     # and on this machine such a request is occasionally lost to process-startup jitter

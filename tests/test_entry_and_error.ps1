@@ -16,6 +16,17 @@ try {
     if ($LASTEXITCODE -ne 0 -or ($c -join "`n") -notmatch 'RESULT: OK') { throw "entry audit failed: $($c -join '; ')" }
     $e = @(& pwsh -NoProfile -File $err -Code RESET_FAILED 2>&1)
     if ($LASTEXITCODE -ne 0 -or ($e -join "`n") -notmatch 'RESULT: OK' -or ($e -join "`n") -notmatch 'halt') { throw "error lookup failed: $($e -join '; ')" }
+    foreach ($pair in @(@('COMPILER_VERSION_MISSING','validation'),@('NO_PROBE','download_probe'),@('FRAME_CHANGED','data_verdict'))) {
+        $e = @(& pwsh -NoProfile -File $err -Code $pair[0] 2>&1)
+        if ($LASTEXITCODE -ne 0 -or ($e -join "`n") -notmatch ('CATEGORY: ' + $pair[1])) { throw "error category lookup failed: $($pair[0])" }
+    }
+    $log = Join-Path $fixture 'usage.log'
+    [IO.File]::WriteAllText($log, "USAGE: BAD_DIMENSIONS`nRESULT: FAIL`n")
+    $e = @(& pwsh -NoProfile -File $err -LogPath $log 2>&1)
+    if ($LASTEXITCODE -ne 0 -or ($e -join "`n") -notmatch 'CATEGORY: parameter') { throw 'USAGE log was not classified' }
+    [IO.File]::WriteAllText($log, "Error -1138 recovered`nFAILURE: FRAME_CHANGED`nRESULT: FAIL`n")
+    $e = @(& pwsh -NoProfile -File $err -LogPath $log 2>&1)
+    if ($LASTEXITCODE -ne 0 -or ($e -join "`n") -notmatch 'CODE    : FRAME_CHANGED') { throw 'an earlier recovered GEL error overrode the final failure' }
     $bad = @(& pwsh -NoProfile -File $err -Code NOT_IN_INDEX 2>&1)
     if ($LASTEXITCODE -ne 2 -or ($bad -join "`n") -notmatch 'ERROR_NOT_INDEXED') { throw 'unknown error was not refused' }
     Write-Output 'CHECK   : AI entries are identical and Error mode is offline and fail-closed'

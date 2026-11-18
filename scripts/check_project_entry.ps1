@@ -34,7 +34,7 @@ function Info2($m) { if (-not $Quiet) { Write-Output $m } }
 . (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
 
 if (-not (Test-Path -LiteralPath $ProjectPath)) {
-    Out2 'FAILURE: NO_PROJECT'
+    Out2 'USAGE: NO_PROJECT'
     Out2 'RESULT: FAIL'
     Out2 ("REASON: '{0}' does not exist" -f $ProjectPath)
     exit 2

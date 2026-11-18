@@ -318,22 +318,26 @@ Head '结论'
 Say ("  检查文件: {0} 个 ｜ 拦截项: {1} ｜ 警告项: {2}" -f $files.Count, $script:blockers.Count, $script:warnings.Count) 'White'
 
 if ($script:blockers.Count -gt 0) {
+    Say 'FAILURE: PORTABILITY_BLOCKED' 'Red'
     Say ''
     Say '  ✖ 门禁未通过 —— 禁止上传到 GitHub。' 'Red'
     Say '    处置：① 修掉上面的"拦截"项；② 若确属合理（如迁移工具本职），' 'Red'
     Say '          在仓库根 .portability-allow 里加正则豁免，或文件内写 portability:ignore-path。' 'Red'
     Say ''
+    Say 'RESULT: FAIL' 'Red'
     exit 1
 }
 elseif ($script:warnings.Count -gt 0) {
     Say ''
     Say '  ⚠ 门禁通过（有警告）—— 允许上传，但建议逐条确认。' 'Yellow'
     Say ''
-    exit 2
+    Say 'RESULT: OK' 'Yellow'
+    exit 0
 }
 else {
     Say ''
     Say '  ✓ 门禁通过 —— 内容满足可迁移性要求。' 'Green'
     Say ''
+    Say 'RESULT: OK' 'Green'
     exit 0
 }

@@ -100,12 +100,16 @@ function Get-ContractProblems {
 
     # Safety policy is part of the contract too. A missing/relaxed gate must be a
     # contract error, not a silent fallback to whatever an entry script happens to do.
-    if ([int]$c.version -lt 3) { $problems.Add('contract version must be 3 or newer (freshness/response gates required)') }
-    foreach ($key in @('requireProbe','requireLiveSession','requireOutSha256','requireSourceFreshness','requireCompleteDssResponse','requireFirmwareIdentity','requireRam','requireHeartbeat')) {
+    if ([int]$c.version -lt 4) { $problems.Add('contract version must be 4 or newer (operational gates separated from data verdicts)') }
+    foreach ($key in @('requireProbe','requireLiveSession','requireCompleteDssResponse')) {
         if ($c.readGate.$key -isnot [bool] -or -not $c.readGate.$key) {
             $problems.Add("readGate.$key must be true")
         }
     }
+    foreach ($key in @('checkOutSha256','checkSourceFreshness','checkFirmwareIdentity','checkHeartbeat')) {
+        if ($c.dataVerdict.$key -isnot [bool] -or -not $c.dataVerdict.$key) { $problems.Add("dataVerdict.$key must be true") }
+    }
+    if ($c.sourceMetadata.reportRam -isnot [bool] -or -not $c.sourceMetadata.reportRam) { $problems.Add('sourceMetadata.reportRam must be true') }
     foreach ($pair in @(@('minLoadGapMs',5000),@('minReadGapMs',400),@('minReconnectGapMs',400))) {
         $v = 0
         if (-not [int]::TryParse([string]$c.timing.($pair[0]),[ref]$v) -or $v -lt [int]$pair[1]) {
@@ -224,7 +228,7 @@ param(
         if ($text -notmatch 'FrozenValue') { $miss += 'FrozenValue drift' }
         if ($text -notmatch 'heartbeat candidates') { $miss += 'heartbeat set drift' }
         if ($text -notmatch 'gSomeOtherId') { $miss += 'symbol outside the contract' }
-        if ($text -notmatch 'readGate.requireSourceFreshness') { $miss += 'missing source freshness gate' }
+        if ($text -notmatch 'dataVerdict.checkSourceFreshness') { $miss += 'missing source freshness verdict' }
         if ($text -notmatch 'readGate.requireCompleteDssResponse') { $miss += 'missing DSS response gate' }
         $noise = @($found | Where-Object { $_ -match 'good\.ps1' })
 
@@ -249,7 +253,7 @@ param(
 
 # ------------------------------------------------------------------- audit -----
 if (-not (Test-Path -LiteralPath $contractPath)) {
-    Out2 'FAILURE: FW_CONTRACT_MISSING'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: FW_CONTRACT_MISSING'; Out2 'RESULT: FAIL'
     Out2 ('REASON: ' + $contractPath)
     Out2 'HINT    : the contract is the only place firmware symbols may be named; without it every script invents its own'
     exit 2

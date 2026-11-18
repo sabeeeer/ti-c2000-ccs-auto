@@ -37,7 +37,7 @@ try {
     $g = Join-Path $fixture 'block.ps1'
     Write-Text $g ". '$lib'`nInitialize-SkillRun -ProjectPath '$proj' -Script 'x' -Mode 'Start' -Block`n'CONTINUED (WRONG)'`n"
     $r = Invoke-Script @('-NoProfile', '-File', $g)
-    if ($r.code -ne 2) { throw "a copied skill script did not block a -Start (exit $($r.code))`n$($r.text)" }
+    if ($r.code -ne 4) { throw "a copied skill script did not block a -Start (exit $($r.code))`n$($r.text)" }
     if ($r.text -notmatch 'FAILURE: PROJECT_NOT_CLEAN') { throw "wrong failure for a dirty project`n$($r.text)" }
     if ($r.text -match 'CONTINUED') { throw "the run continued past a dirty project`n$($r.text)" }
     if (Test-Path (Join-Path $proj 'readout/skill-runs.jsonl')) { throw 'a refused run still stamped the run log' }

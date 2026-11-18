@@ -41,8 +41,10 @@ function Say([string]$m) { Write-Output $m }
 function Fail([string]$cat, [string]$reason) {
     Say ''
     Say 'RESULT: FAIL'
-    Say ("FAILURE: {0}" -f $cat)
+    $usage = $cat -in @('BAD_PARAM','NO_CCXML','INVALID_SERIAL','BAD_PROBE','SERIAL_REQUIRED')
+    Say ("{0}: {1}" -f $(if ($usage) { 'USAGE' } else { 'FAILURE' }), $cat)
     Say ("REASON: {0}" -f $reason)
+    if ($usage) { exit 2 }
     exit 1
 }
 
@@ -168,50 +170,100 @@ if ($usesSerial -and -not $Serial) {
     Fail 'SERIAL_REQUIRED' '原 ccxml 按串号选探针；请先读取当前实物串号，并用 -Serial 显式传入，避免清掉或沿用旧串号'
 }
 
-# ---------- 5. 找配套的 C28x 驱动 xml ----------
-# 规则（targetdb 实测）：驱动名 = connection xml 里 <connectionType Type="XXX"/> 的小写 + "c28x.xml"
-#   XDS100v1 -> TIXDS100    -> tixds100c28x.xml
-#   XDS100v2 -> TIXDS100v2  -> tixds100v2c28x.xml
-#   XDS100v3 -> TIXDS100v2  -> tixds100v2c28x.xml   （v3 复用 v2 的驱动，实测如此）
-$drvDir  = Join-Path $tdb 'drivers'
-$drvName = ''
-$drvPath = ''
-if ($target.ConnType) {
-    $drvName = ($target.ConnType.ToLower() + 'c28x.xml')
-    $drvPath = Join-Path $drvDir $drvName
+# ---------- 5. 最小侵入式改写：只换连接类型字段，绝不重建 ccxml ----------
+# 2026-11-18 修复：旧版从零拼出整份 XML，只保留一行 device instance + 一个 c28x driver，
+# 丢掉了 icepick_c / cla1 / cs_child 三个 driver 和整个 <device> 节点（ICEPick_C router +
+# Subpath = JTAG 链路定义），configuration id 也被改成泛化名。后果：DSS openSession 报
+# "invalid processor ID / Can't generate board data"，板子无法连接。
+# 现在改为逐 attribute 替换：原文件所有节点（device/router/全部 driver/configuration id）
+# 原样保留，只替换连接类型名与驱动前缀；写回前验证每个 driver 换前缀后确实存在。
+function Get-XmlAttr([string]$tagText, [string]$name) {
+    $m = [regex]::Match($tagText, '\b' + [regex]::Escape($name) + '="([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
 }
-if (-not $drvPath -or -not (Test-Path $drvPath)) {
-    # 回退：按 connection 文件名推（去 _Connection.xml / _Dot7 / usb）后模糊匹配
-    $base = $target.File -replace '_Connection\.xml$', '' -replace '_Dot7$', '' -replace 'usb$', ''
-    $cand = @(Get-ChildItem $drvDir -Filter '*c28x*.xml' -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name.ToLower().StartsWith($base.ToLower()) } | Select-Object -First 1)
-    if ($cand) { $drvPath = $cand.FullName; $drvName = $cand.Name } else { $drvPath = '' }
-}
-if (-not $drvPath) {
-    $all = @(Get-ChildItem $drvDir -Filter '*c28x*.xml' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-    Fail 'NO_DRIVER' ("找不到与 {0}（ConnType={1}）配套的 C28x 驱动；drivers 里可选: {2}" -f $target.File, $target.ConnType, ($all -join ', '))
-}
-Say ("DRIVER    : {0}" -f $drvName)
 
-# ---------- 6. 生成新 ccxml（保留器件 platform 行）----------
-$devLine = ''
-if ($ccxmlTxt -match '(?m)^\s*(<instance[^>]*xmlpath="devices"[^>]*/>)\s*$') { $devLine = $Matches[1].Trim() }
-if (-not $devLine) { Fail 'NO_DEVICE' 'ccxml 里找不到 devices 那一行（器件定义），无法保留器件设置' }
+$connTagM = [regex]::Match($ccxmlTxt, '<instance\b[^>]*href="connections/[^"]+"[^>]*/>')
+$devTagM  = [regex]::Match($ccxmlTxt, '<instance\b[^>]*href="devices/[^"]+"[^>]*/>')
+if (-not $connTagM.Success -or -not $devTagM.Success -or $ccxmlTxt -notmatch '<platform\b') {
+    Fail 'CCXML_INCOMPLETE' 'ccxml 缺 connection instance / device instance / platform 之一；拒绝改写半截配置'
+}
+$connTag = $connTagM.Value
+$oldDesc = Get-XmlAttr $connTag 'desc'
+$oldId   = Get-XmlAttr $connTag 'id'
+$oldXml  = Get-XmlAttr $connTag 'xml'
+if (-not $oldXml) { Fail 'CCXML_INCOMPLETE' 'connection instance 缺 xml 属性' }
+# instance desc/id 可能带 "_\d" 实例后缀（如 "...Debug Probe_0"），而 targetdb 的规范
+# desc/id 不带。保留后缀拼到新值上：configuration id / connection id 里也带同一后缀，
+# 直接整串替换才能同时改对 instance、configuration、connection 三处而不丢/重复后缀。
+$descSuffix = ''
+$descBase = $oldDesc
+if ($oldDesc -match '^(.*?)(_\d+)$') { $descBase = $Matches[1]; $descSuffix = $Matches[2] }
+$idSuffix = ''
+$idBase = $oldId
+if ($oldId -match '^(.*?)(_\d+)$') { $idBase = $Matches[1]; $idSuffix = $Matches[2] }
+$newDescWithSuffix = $target.Desc + $descSuffix
+$newIdWithSuffix   = $target.Id + $idSuffix
+
+$driverTags = @([regex]::Matches($ccxmlTxt, '<instance\b[^>]*xmlpath="drivers"[^>]*/>') | ForEach-Object { $_.Value })
+$oldDriverNames = @($driverTags | ForEach-Object { Get-XmlAttr $_ 'xml' } | Where-Object { $_ })
+if ($oldDriverNames.Count -eq 0) { Fail 'CCXML_INCOMPLETE' 'ccxml 里没有 driver instance；拒绝改写' }
+$c28 = @($oldDriverNames | Where-Object { $_ -match 'c28x\.xml$' } | Select-Object -First 1)
+if ($c28.Count -eq 0) { Fail 'CCXML_INCOMPLETE' 'driver 列表里没有 c28x.xml，无法确定驱动前缀' }
+$oldPrefix = [regex]::Replace($c28[0], 'c28x\.xml$', '')
+$newPrefix = [string]$target.ConnType.ToLower()
+if (-not $newPrefix) { Fail 'NO_DRIVER' ("连接 {0} 没有 ConnType，无法推导 driver 前缀" -f $target.File) }
+
+# 写前提示：driver 集合由「器件 + 探针版本」共同决定，v1 与 v2 的 driver 数量本就不同
+# （例：tixds100v2cs_child.xml 存在，tixds100cs_child.xml 不存在）。因此不能要求每个
+# driver 换前缀后都存在——下面是逐节点「存在才换，不存在保留 + NOTE」，绝不删节点。
+$drvDir = Join-Path $tdb 'drivers'
 
 $nl = "`r`n"
-$newXml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>' + $nl +
-'<configurations XML_version="1.2" id="configurations_0">' + $nl +
-'    <configuration XML_version="1.2" id="configuration_0">' + $nl +
-('        <instance XML_version="1.2" desc="{0}" href="connections/{1}" id="{2}" xml="{1}" xmlpath="connections"/>' -f $target.Desc, $target.File, $target.Id) + $nl +
-('        <connection XML_version="1.2" id="{0}">' -f $target.Id) + $nl +
-('            <instance XML_version="1.2" href="drivers/{0}" id="drivers" xml="{0}" xmlpath="drivers"/>' -f $drvName) + $nl +
-$(if ($Serial) { '            <property Type="choicelist" Value="1" id="Emulator Selection">' + $nl + '                <choice Name="Select by serial number" value="0">' + $nl + ('                    <property Type="stringfield" Value="{0}" id="-- Enter the serial number"/>' -f $Serial) + $nl + '                </choice>' + $nl + '            </property>' + $nl } else { '' }) +
-'            <platform XML_version="1.2" id="platform_0">' + $nl +
-('                ' + $devLine) + $nl +
-'            </platform>' + $nl +
-'        </connection>' + $nl +
-'    </configuration>' + $nl +
-'</configurations>' + $nl
+$newXml = $ccxmlTxt
+
+# (1) 连接类型名：desc / id / connection 文件名。整串替换（旧完整值 -> 新名+同名后缀），
+#     instance / configuration / connection 三处的 "_0" 都能各自保留。
+if ($target.Desc -and $oldDesc -and $oldDesc -ne $target.Desc) { $newXml = $newXml.Replace($oldDesc, $newDescWithSuffix) }
+if ($target.Id   -and $oldId   -and $oldId   -ne $target.Id)   { $newXml = $newXml.Replace($oldId, $newIdWithSuffix) }
+if ($oldXml -ne $target.File) { $newXml = $newXml.Replace($oldXml, $target.File) }
+
+# (2) driver 前缀：逐节点处理。目标前缀版本在 targetdb 里存在才换名；不存在就原样保留
+#     并打印 NOTE（例如 v1 无 cs_child）。device / router / platform 文本完全不动。
+$renamed = 0
+$keptOld = @()
+if ($oldPrefix -ne $newPrefix) {
+    foreach ($tag in $driverTags) {
+        $oldName = Get-XmlAttr $tag 'xml'
+        if (-not $oldName -or -not $oldName.StartsWith($oldPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $newName = $newPrefix + $oldName.Substring($oldPrefix.Length)
+        if (Test-Path (Join-Path $drvDir $newName)) {
+            $newXml = $newXml.Replace(('drivers/' + $oldName), ('drivers/' + $newName))
+            $newXml = $newXml.Replace(('xml="' + $oldName + '"'), ('xml="' + $newName + '"'))
+            $renamed++
+        } else {
+            $keptOld += $oldName
+        }
+    }
+}
+Say ("DRIVER    : {0} 个换成 {1} 前缀；driver 节点总数 {2}（一个都不删）" -f $renamed, $newPrefix, $oldDriverNames.Count)
+if ($keptOld.Count -gt 0) {
+    Say ("NOTE      : 以下 driver 在 {0} 下无对应版本，节点原样保留（DSS 通常忽略不适用项）：{1}" -f $newPrefix, ($keptOld -join ', '))
+}
+
+# (3) 串号块：已有则改 Value，没有且传了 -Serial 则在 <platform> 前插入
+$serialBlock = '            <property Type="choicelist" Value="1" id="Emulator Selection">' + $nl +
+               '                <choice Name="Select by serial number" value="0">' + $nl +
+               ('                    <property Type="stringfield" Value="{0}" id="-- Enter the serial number"/>' -f $Serial) + $nl +
+               '                </choice>' + $nl +
+               '            </property>' + $nl
+if ($usesSerial) {
+    $newXml = [regex]::Replace($newXml, '(<property[^>]*id="-- Enter the serial number"[^>]*/>)', {
+        param($m) [regex]::Replace($m.Value, 'Value="[^"]*"', ('Value="{0}"' -f $Serial))
+    })
+} elseif ($Serial) {
+    $newXml = [regex]::Replace($newXml, '(<platform\b)', $serialBlock + '$1', 1)
+}
 
 # ---------- 7. 写回（备份 + 更新 .ccsproject）----------
 if ($DryRun) {

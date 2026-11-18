@@ -1,4 +1,4 @@
-﻿#requires -Version 7.0
+#requires -Version 7.0
 # =====================================================================
 # ti_c2000_debug.ps1
 #   Execution workflow only: build / load / run with TI C2000 in CCS.
@@ -45,7 +45,7 @@ Out2 ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
 # `pwsh -File` those do not fail binding; they land in $args. Say so explicitly
 # instead of silently building or loading nothing.
 if ($args.Count -gt 0) {
-    Out2 'FAILURE: UNKNOWN_ARGUMENT'
+    Out2 'USAGE: UNKNOWN_ARGUMENT'
     Out2 'RESULT: FAIL'
     Out2 ('REASON: unrecognized argument(s): ' + ($args -join ' ') + ' - the read-only switches were removed; read with ti_c2000_run_read.ps1 or ti_c2000_read_dma.ps1')
     exit 2
@@ -53,24 +53,24 @@ if ($args.Count -gt 0) {
 # Reject incompatible arguments before a background process, build or loader
 # can start. This script never reads values back.
 if ($ProbeCheckOnly -and ($Build -or $AllowCompilerFallback -or $Run -or $LoadOnly -or $NoProbeCheck -or $ConfirmLoad)) {
-    Out2 "FAILURE: MODE_CONFLICT"
+    Out2 "USAGE: MODE_CONFLICT"
     Out2 "RESULT: FAIL"
     Out2 "REASON: -ProbeCheckOnly cannot build, access the target or skip the probe check"
     exit 2
 }
 if ($AllowCompilerFallback -and -not $Build) {
-    Out2 "FAILURE: MODE_CONFLICT"
+    Out2 "USAGE: MODE_CONFLICT"
     Out2 "RESULT: FAIL"
     Out2 "REASON: -AllowCompilerFallback only applies when -Build is specified"
     exit 2
 }
 if ($LoadOnly -and $Run) {
-    Out2 "FAILURE: MODE_CONFLICT"
+    Out2 "USAGE: MODE_CONFLICT"
     Out2 "RESULT: FAIL"
     Out2 "REASON: -LoadOnly cannot be combined with -Run"
     exit 2
 } elseif (-not $Build -and -not $Run -and -not $LoadOnly -and -not $ProbeCheckOnly) {
-    Out2 "FAILURE: ACTION_REQUIRED"
+    Out2 "USAGE: ACTION_REQUIRED"
     Out2 "RESULT: FAIL"
     Out2 "REASON: choose -Build, -Run, -LoadOnly or -ProbeCheckOnly; no implicit action"
     exit 2
@@ -117,7 +117,7 @@ if (-not $ProjectPath) {
 }
 if (-not $ProjectPath -or -not (Test-Path -LiteralPath $ProjectPath -PathType Container) -or
     -not (Test-Path -LiteralPath (Join-Path $ProjectPath '.cproject') -PathType Leaf)) {
-    Out2 "FAILURE: NO_PROJECT"
+    Out2 "USAGE: NO_PROJECT"
     Out2 "RESULT: FAIL"; Out2 "REASON: project (.cproject) not found"; exit 2
 }
 $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
@@ -163,7 +163,7 @@ if ($CcsRoot -and (Test-Path (Join-Path $CcsRoot 'ccs_base'))) {
 } else {
     $roots = Get-CcsRoots
 }
-if ($roots.Count -eq 0) { Out2 "FAILURE: ENV_NO_CCS"; Out2 "RESULT: FAIL"; Out2 "REASON: no CCS installation found"; exit 2 }
+if ($roots.Count -eq 0) { Out2 "FAILURE: ENV_NO_CCS"; Out2 "RESULT: FAIL"; Out2 "REASON: no CCS installation found"; exit 1 }
 $ccs = $roots[0]
 Info2 "CCS     : $($ccs.Path)  (v$($ccs.Version))"
 
@@ -172,7 +172,9 @@ function Get-ConnectedProbes {
     $found = @()
     try {
         $found = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop 2>$null |
-                   Where-Object { $_.Name -match $probePatterns })
+                   Where-Object { $_.Name -match $probePatterns -and
+                       ($null -eq $_.ConfigManagerErrorCode -or $_.ConfigManagerErrorCode -eq 0) -and
+                       (-not $_.PSObject.Properties['Present'] -or $_.Present) })
     } catch { $found = @() }
     if ($found.Count -eq 0) {
         $xdsTool = Join-Path $ccs.Path 'ccs_base\common\uscif\xds100serial.exe'
@@ -204,7 +206,7 @@ if ($ProbeCheckOnly -or ($Build -and ($Run -or $LoadOnly) -and -not $NoProbeChec
         if ($candidate) { $preCcxml = $candidate.FullName }
     }
     if (-not $preCcxml -or -not (Test-Path -LiteralPath $preCcxml)) {
-        Out2 "FAILURE: NO_CCXML"
+        Out2 "USAGE: NO_CCXML"
         Out2 "RESULT: FAIL"
         Out2 "REASON: no .ccxml target configuration found - pass -Ccxml <file>"
         exit 2
@@ -264,7 +266,7 @@ if ($Build) {
 if (-not $OutFile) { $OutFile = Join-Path $ProjectPath "Debug\$projName.out" }
 if (-not (Test-Path -LiteralPath $OutFile)) {
     Out2 "FAILURE: NO_OUT_FILE"
-    Out2 "RESULT: FAIL"; Out2 "REASON: $OutFile not found - run the build first (add -Build)"; exit 2
+    Out2 "RESULT: FAIL"; Out2 "REASON: $OutFile not found - run the build first (add -Build)"; exit 4
 }
 if ($Run -or $LoadOnly) {
     . (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
@@ -276,7 +278,7 @@ if (-not $Ccxml) {
     if ($c) { $Ccxml = $c.FullName }
 }
 if (-not $Ccxml -or -not (Test-Path -LiteralPath $Ccxml)) {
-    Out2 "FAILURE: NO_CCXML"
+    Out2 "USAGE: NO_CCXML"
     Out2 "RESULT: FAIL"; Out2 "REASON: no .ccxml target configuration found - pass -Ccxml <file>"; exit 2
 }
 # what device / emulator does this target configuration ask for?
@@ -301,7 +303,7 @@ if (-not (Test-Path $loadti)) {
     }
 }
 if (-not (Test-Path -LiteralPath $loadti)) {
-    Out2 "FAILURE: ENV_NO_LOADTI"; Out2 "RESULT: FAIL"; Out2 "REASON: loadti.bat not found under any CCS installation"; exit 2
+    Out2 "FAILURE: ENV_NO_LOADTI"; Out2 "RESULT: FAIL"; Out2 "REASON: loadti.bat not found under any CCS installation"; exit 1
 }
 Info2 "OUTCARD : $OutFile"
 Info2 "CCXML   : $Ccxml"
@@ -331,7 +333,7 @@ if (@(Get-Process ccstudio, ccstudio64, eclipsec -ErrorAction SilentlyContinue).
 # Reaching this point without an explicit download request must never turn
 # into an implicit load (that used to download and halt the target silently).
 if (-not $LoadOnly -and -not $Run) {
-    Out2 "FAILURE: ACTION_REQUIRED"
+    Out2 "USAGE: ACTION_REQUIRED"
     Out2 "RESULT: FAIL"
     Out2 "REASON: no download requested; add -Run or -LoadOnly, or use -Build alone"
     exit 2

@@ -126,6 +126,29 @@ SECTIONS
    ```
    若有 `#pragma DATA_SECTION(buf,"DMARAML6")` 之类，说明那个块被 DMA 借用，不能挪（或要同步改宏）。
 
+### 入口点：`-e code_start` 不是可选项（2026-11-18 实测）
+
+`.cproject` 里写着 `ENTRY_POINT=code_start` **不等于**链接时会用上它。用本 skill 的构建脚本时，不传 `-EntryPoint code_start` 的输出是：
+
+```text
+LINK    : .cproject declares ENTRY_POINT=code_start; NOT applied (use -EntryPoint code_start to force it)
+ENTRY POINT SYMBOL: "_c_int00" address: 000088e2
+```
+
+传了之后：
+
+```text
+ENTRY POINT SYMBOL: "code_start" address: 00000000
+```
+
+差别不只是一个地址：`F2837xD_CodeStartBranch.asm` 的 `codestart` 里带 `WD_DISABLE` 分支（`LB wd_disable` → 写 `WDCR` → `LB _c_int00`）。入口直接是 `_c_int00` 就**跳过关狗**，只能指望后面的 `InitSysCtrl()`（其中也有 `DisableDog`）足够早。本工程靠后者没出事，但这是运气，不是设计。
+
+**判据（下载 RAM 镜像时必须看）**：`.map` 出现 `ENTRY POINT SYMBOL: "code_start"`，且 `codestart` 落在 `BEGIN`（`0x000000`）。构建命令固定写：
+
+```powershell
+pwsh -NoProfile -File scripts\ti_c2000_build.ps1 -ProjectPath <工程> -Stage -EntryPoint code_start
+```
+
 ---
 
 ## 4. 隐蔽陷阱：编译器默认不按函数分段

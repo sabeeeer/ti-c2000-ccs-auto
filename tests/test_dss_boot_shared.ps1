@@ -125,6 +125,28 @@ if (Test-Path -LiteralPath $fwAudit) {
     $problems.Add('tools\audit_fw_contract.ps1 is missing, so firmware symbols can drift between scripts again')
 }
 
+# 7. every error code must use the prefix matching its exit code: USAGE + exit 2 for a wrong
+# command, FAILURE + exit 1/3/4 for a failed validation. Mixing them made a missing
+# -CorePattern read as "a check refused to download" (2026-11-16). Environment problems
+# (ENV_*, NO_*, MAP_MISSING) legitimately keep FAILURE + exit 2.
+$prefixAudit = Join-Path $root 'tools\audit_error_prefix.ps1'
+if (Test-Path -LiteralPath $prefixAudit) {
+    $selfOut = @(& pwsh -NoProfile -File $prefixAudit -SelfTest 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $problems.Add('the error-prefix detector failed its own self-test: ' + (($selfOut | ForEach-Object { [string]$_ }) -join '; '))
+    } else {
+        $prefOut = @(& pwsh -NoProfile -File $prefixAudit 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($l in $prefOut) { if ([string]$l -match '^\s{2}\S+:\d+') { $problems.Add([string]$l) } }
+            if (-not @($prefOut | Where-Object { [string]$_ -match '^\s{2}\S+:\d+' }).Count) {
+                $problems.Add('the error-prefix audit failed without naming a site: ' + (($prefOut | ForEach-Object { [string]$_ }) -join '; '))
+            }
+        }
+    }
+} else {
+    $problems.Add('tools\audit_error_prefix.ps1 is missing, so USAGE/FAILURE can drift apart again')
+}
+
 if ($problems.Count -gt 0) {
     Write-Output 'FAILURE: DSS_BOOT_NOT_SHARED'
     foreach ($p in $problems) { Write-Output ('VIOLATION: ' + $p) }

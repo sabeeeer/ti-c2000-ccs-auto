@@ -40,7 +40,7 @@ function Info2($m) { if (-not $Quiet) { Write-Output $m } }
 $source = Split-Path $PSScriptRoot -Parent
 $name = Split-Path -Leaf $source
 if (-not (Test-Path (Join-Path $source 'SKILL.md'))) {
-    Out2 'FAILURE: NOT_A_SKILL'
+    Out2 'USAGE: NOT_A_SKILL'
     Out2 'RESULT: FAIL'
     Out2 ("REASON: no SKILL.md above '{0}'" -f $PSScriptRoot)
     exit 2

@@ -14,7 +14,7 @@ try {
 '@ | Set-Content -LiteralPath (Join-Path $project '.cproject') -Encoding utf8
     $build = Join-Path $skillRoot 'scripts\ti_c2000_build.ps1'
     $output = @(& pwsh -NoProfile -File $build -ProjectPath $project -CcsRoot $ccs 2>&1)
-    if ($LASTEXITCODE -ne 2 -or -not @($output | Where-Object { $_ -match '^FAILURE: COMPILER_VERSION_MISSING$' }).Count -or
+    if ($LASTEXITCODE -ne 1 -or -not @($output | Where-Object { $_ -match '^FAILURE: COMPILER_VERSION_MISSING$' }).Count -or
         @($output | Where-Object { $_ -match '^COMPILER:' }).Count) {
         throw "Missing declared compiler did not stop before compilation: $($output -join '; ')"
     }
@@ -28,3 +28,6 @@ try {
         Remove-Item -LiteralPath $resolved -Recurse -Force
     }
 }
+# Without an explicit exit, the child build's deliberate FAILURE exit 1 leaks out
+# as this test's own exit code, so RESULT: OK would be reported with a failing code.
+exit 0

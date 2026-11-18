@@ -56,6 +56,7 @@ function Read-Smart([string]$path) {
 Head "1) 定位工程的链接脚本"
 
 if (-not (Test-Path $ProjectPath)) {
+    Say 'USAGE: NO_PROJECT'
     Bad "工程目录不存在：$ProjectPath"
     exit 2
 }
@@ -101,6 +102,7 @@ else {
                  Where-Object { $_.FullName -notmatch '\\Debug\\' })
         if ($all.Count -eq 1) { $cmdFile = $all[0].FullName }
         elseif ($all.Count -gt 1) {
+            Say 'USAGE: AMBIGUOUS_LINK_CMD'
             Warn "找到多个 .cmd，请用 -LinkCmd 指定："
             $all | ForEach-Object { Say ("         " + $_.FullName.Replace($proj + '\','')) }
             exit 3
@@ -109,6 +111,7 @@ else {
 }
 
 if (-not $cmdFile) {
+    Say 'USAGE: NO_LINK_CMD'
     Bad "没找到链接脚本（.cmd）。请用 -LinkCmd 明确指定。"
     exit 2
 }
@@ -141,7 +144,7 @@ foreach ($line in ($tx -split "`r?`n")) {
     }
 }
 
-if ($mem.Count -eq 0) { Bad "没解析出任何 MEMORY 段（格式可能不标准，请人工看 $cmdFile）"; exit 4 }
+if ($mem.Count -eq 0) { Say 'FAILURE: LINK_CMD_PARSE'; Bad "没解析出任何 MEMORY 段（格式可能不标准，请人工看 $cmdFile）"; exit 4 }
 
 foreach ($p in ($mem | Group-Object Page | Sort-Object Name)) {
     Say ("  PAGE " + $p.Name + " :")

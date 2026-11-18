@@ -61,11 +61,11 @@ param(
 $ErrorActionPreference = 'Continue'   # native compiler stderr must not abort the loop
 . (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
 Write-Output ('SKILL   : ti-c2000-ccs-auto@' + (Get-SkillIdentity).version)
-if ($Stage -and $NoStage) { Write-Output 'FAILURE: MODE_CONFLICT'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: -Stage and -NoStage cannot be combined'; exit 2 }
+if ($Stage -and $NoStage) { Write-Output 'USAGE: MODE_CONFLICT'; Write-Output 'RESULT: FAIL'; Write-Output 'REASON: -Stage and -NoStage cannot be combined'; exit 2 }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 
 function Fail([string]$msg, [int]$code, [string]$failure = 'ENV') {
-    Write-Output ("FAILURE: {0}" -f $failure)
+    Write-Output ("{0}: {1}" -f $(if ($code -eq 2) { 'USAGE' } else { 'FAILURE' }), $failure)
     Write-Output "RESULT: FAIL"
     Write-Output "REASON: $msg"
     exit $code
@@ -218,7 +218,7 @@ $siliconVer = '28'
 $v = Get-OptionValue 'compilerID.SILICON_VERSION'
 if ($v -match '\.(\d+)\s*$') { $siliconVer = $Matches[1] }
 if ($siliconVer -ne '28') {
-    Fail "compilerID.SILICON_VERSION=$v is outside this cl2000/C28x build helper; use the matching device toolchain" 2 'UNSUPPORTED_DEVICE'
+    Fail "compilerID.SILICON_VERSION=$v is outside this cl2000/C28x build helper; use the matching device toolchain" 4 'UNSUPPORTED_DEVICE'
 }
 $largeMem = (Get-OptionValue 'compilerID.LARGE_MEMORY_MODEL') -eq 'true'
 $unified  = (Get-OptionValue 'compilerID.UNIFIED_MEMORY')    -eq 'true'
@@ -275,7 +275,7 @@ if (-not $cgRoot -and $cgVersion) {
     }
 }
 if (-not $cgRoot -and $cgVersion -and -not $AllowCompilerFallback) {
-    Fail ".cproject requires TI C2000 compiler $cgVersion, but it was not found; install that version or explicitly pass -AllowCompilerFallback" 2 'COMPILER_VERSION_MISSING'
+    Fail ".cproject requires TI C2000 compiler $cgVersion, but it was not found; install that version or explicitly pass -AllowCompilerFallback" 1 'COMPILER_VERSION_MISSING'
 }
 if (-not $cgRoot) {
     foreach ($root in $ccsRoots) {
@@ -296,9 +296,9 @@ if (-not $cgRoot) {
            Sort-Object Name -Descending) | Select-Object -First 1
     if ($c) { $cgRoot = $c.FullName }
 }
-if (-not $cgRoot) { Fail "no TI C2000 codegen tools found (check your CCS installation)" 2 'ENV_NO_COMPILER' }
+if (-not $cgRoot) { Fail "no TI C2000 codegen tools found (check your CCS installation)" 1 'ENV_NO_COMPILER' }
 $cl2000 = Join-Path $cgRoot 'bin\cl2000.exe'
-if (-not (Test-Path $cl2000)) { Fail "cl2000.exe not found under $cgRoot" 2 'ENV_NO_COMPILER' }
+if (-not (Test-Path $cl2000)) { Fail "cl2000.exe not found under $cgRoot" 1 'ENV_NO_COMPILER' }
 
 # CCS SDK examples often declare INSTALLROOT_* macros and linked sources in .project.
 # Resolve them before parsing includes, sources and linker inputs. Ordinary self-contained
@@ -368,7 +368,7 @@ foreach ($p in $rawInc) {
     }
     $includes += $q
 }
-if (-not $includes) { Fail "no usable include path parsed from .cproject" 2 'ENV_BAD_CPROJECT' }
+if (-not $includes) { Fail "no usable include path parsed from .cproject" 4 'ENV_BAD_CPROJECT' }
 
 # ---- device family fingerprint (for the log + docs, not for logic) ----
 $devHdr = ''
@@ -381,7 +381,7 @@ foreach ($d in ($includes + $ProjectPath)) {
     if ($devHdr) { break }
 }
 $devNote = ''
-if ($devHdr -eq 'F29H85x_Device.h') { Fail 'F29/C29x is outside this cl2000/C28x build helper' 2 'UNSUPPORTED_DEVICE' }
+if ($devHdr -eq 'F29H85x_Device.h') { Fail 'F29/C29x is outside this cl2000/C28x build helper' 4 'UNSUPPORTED_DEVICE' }
 if ($devHdr -match 'driverlib\.h|^device\.h$') { $devNote = ' (driverlib/SysConfig style: verify the project ABI and library variant)' }
 
 # ---- runtime library ----
@@ -396,7 +396,7 @@ $rtsCandidates += "$base.lib"
 if ($base -ne 'rts2800_ml') { $rtsCandidates += 'rts2800_ml.lib' }
 $rts = $null
 foreach ($c in $rtsCandidates) { if (Test-Path (Join-Path $cgRoot "lib\$c")) { $rts = $c; break } }
-if (-not $rts) { Fail "no runtime library found under $cgRoot\lib (tried: $($rtsCandidates -join ', '))" 2 'ENV_NO_RUNTIME' }
+if (-not $rts) { Fail "no runtime library found under $cgRoot\lib (tried: $($rtsCandidates -join ', '))" 1 'ENV_NO_RUNTIME' }
 
 Info ("DEVICE  : {0}{1}" -f $(if ($devHdr) { $devHdr } else { '<unknown device header>' }), $devNote)
 Info ("CONFIG  : {0}{1}" -f $(if ($cfgName) { $cfgName } else { '<first configuration>' }),
@@ -512,7 +512,7 @@ $cfiles = @($srcAll | Where-Object { -not (Test-Excluded $_.FullName) } | ForEac
 foreach ($f in @($linkedFiles | Where-Object { [IO.Path]::GetExtension($_) -in @('.c', '.asm', '.cla', '.cpp') })) {
     if ($cfiles -notcontains $f) { $cfiles += $f }
 }
-if ($cfiles.Count -eq 0) { Fail "no C/ASM sources found under: $($srcRoots -join ', ')" 2 'NO_SOURCES' }
+if ($cfiles.Count -eq 0) { Fail "no C/ASM sources found under: $($srcRoots -join ', ')" 4 'NO_SOURCES' }
 if ($srcExcluded.Count -gt 0) {
     Info ("EXCLUDED: source skipped (exclude from build in .cproject): " + (($srcExcluded | ForEach-Object { $_.Name }) -join ', '))
 }
@@ -710,12 +710,13 @@ if ($ok) {
         New-Item -ItemType Directory -Force -Path (Split-Path $stagedOut -Parent) | Out-Null
         Copy-Item -LiteralPath $outFile -Destination $stagedOut -Force
         $linkedMap = Join-Path $OutputDir "$projName.map"
-        if (-not (Test-Path -LiteralPath $linkedMap)) {
-            Write-Output 'FAILURE: MAP_MISSING'; Write-Output 'RESULT: FAIL'
-            Write-Output 'REASON: linker reported success without its map; RAM proof cannot be checked'
-            exit 1
+        $stagedMap = [IO.Path]::ChangeExtension($stagedOut, '.map')
+        if (Test-Path -LiteralPath $linkedMap) {
+            Copy-Item -LiteralPath $linkedMap -Destination $stagedMap -Force
+        } else {
+            if (Test-Path -LiteralPath $stagedMap) { Remove-Item -LiteralPath $stagedMap -Force }
+            Write-Output 'NOTE    : linker map is missing; the image was staged and source location will be UNKNOWN'
         }
-        Copy-Item -LiteralPath $linkedMap -Destination ([IO.Path]::ChangeExtension($stagedOut, '.map')) -Force
         Write-Output ("staged    : {0}" -f $stagedOut)
     }
     Write-Output ("log       : {0}" -f $logFile)

@@ -31,6 +31,10 @@ param(
     [string]$FrozenFlag = 'gDmaReady',
     [string]$FrozenValue = 'true',
     [string]$SeqVar = 'gDmaSeq',
+    [switch]$LatestFrame,
+    [string]$BankVar = '',
+    [string]$Bank0Array = '',
+    [string]$Bank1Array = '',
     [string]$HeartbeatExpr = 'gMsTick,gRunMs,usMainLoop',
     # ---- firmware self-proof: the portable way to ask "is this image running?" ----
     # A number the firmware owns (gFwId) plus the rate of a counter it increments.
@@ -48,6 +52,7 @@ param(
     [int]$WaitMs = 10000,
     [Nullable[double]]$ValueMin = $null,
     [Nullable[double]]$ValueMax = $null,
+    [string]$PreflightIssues = '',
     [switch]$NoHeartbeat,
     # This protocol client is internal; the public readers hold the project lock and
     # complete the probe/image preflight before they launch it.
@@ -87,31 +92,35 @@ function Test-FlagEquals {
 }
 
 if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) {
-    Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
+    Out2 'USAGE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
 }
 $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
 $owner = Get-TargetLockInfo -ProjectPath $ProjectPath
 if ($ParentPid -le 0 -or -not $owner -or $owner.pid -ne $ParentPid -or $owner.mode -ne 'ReadOnly' -or
     -not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
-    Out2 'FAILURE: INTERNAL_ONLY'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: INTERNAL_ONLY'; Out2 'RESULT: FAIL'
     Out2 'REASON: use ti_c2000_run_read.ps1 or ti_c2000_read_dma.ps1; their preflight owns the ReadOnly lock'
     exit 2
 }
 $names = @($Variables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if ($names.Count -eq 0 -and -not $ArrayName) {
-    Out2 'FAILURE: NEED_REQUEST'; Out2 'RESULT: FAIL'
+if ($names.Count -eq 0 -and -not $ArrayName -and -not $LatestFrame) {
+    Out2 'USAGE: NEED_REQUEST'; Out2 'RESULT: FAIL'
     Out2 'REASON: pass -Variables or -ArrayName'; exit 2
 }
-if ($names.Count -gt 0 -and $ArrayName) {
-    Out2 'FAILURE: AMBIGUOUS_REQUEST'; Out2 'RESULT: FAIL'
+if ($names.Count -gt 0 -and ($ArrayName -or $LatestFrame)) {
+    Out2 'USAGE: AMBIGUOUS_REQUEST'; Out2 'RESULT: FAIL'
     Out2 'REASON: use -Variables or -ArrayName, not both'; exit 2
 }
-if ($ArrayName -and -not $FrozenValue.Trim()) {
-    Out2 'FAILURE: FROZEN_VALUE_REQUIRED'; Out2 'RESULT: FAIL'
+if ($LatestFrame -and (-not $SeqVar -or -not $BankVar -or -not $Bank0Array -or -not $Bank1Array)) {
+    Out2 'USAGE: INVALID_LATEST_FRAME'; Out2 'RESULT: FAIL'
+    Out2 'REASON: a ping-pong latest-frame read needs sequence, completed-bank selector and both array symbols'; exit 2
+}
+if ($ArrayName -and -not $LatestFrame -and -not $FrozenValue.Trim()) {
+    Out2 'USAGE: FROZEN_VALUE_REQUIRED'; Out2 'RESULT: FAIL'
     Out2 'REASON: a frozen array requires an explicit completed flag value'; exit 2
 }
 if ($NoHeartbeat) {
-    Out2 'FAILURE: READ_PROOF_BYPASS'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: READ_PROOF_BYPASS'; Out2 'RESULT: FAIL'
     Out2 'REASON: a trusted live read requires a heartbeat'; exit 2
 }
 $heartbeats = @($HeartbeatExpr -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -139,7 +148,7 @@ if ($state -and (Test-Path -LiteralPath $readyFile)) {
 if (-not $alive) {
     Out2 'FAILURE: NO_SERVICE'; Out2 'RESULT: FAIL'
     Out2 ('REASON: no running session for this project - start it once with: pwsh -File ti_c2000_service.ps1 -ProjectPath "{0}" -Start' -f $ProjectPath)
-    exit 2
+    exit 4
 }
 $svcPid = [int]$state.pid
 
@@ -150,9 +159,8 @@ $svcPid = [int]$state.pid
 if ($state.out -and (Test-Path -LiteralPath $state.out)) {
     $nowSha = (Get-FileHash -LiteralPath $state.out -Algorithm SHA256).Hash
     if ($nowSha -ne $state.outSha256) {
-        Out2 'FAILURE: STALE_SERVICE'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: {0} changed after the session loaded it - restart the service so a read cannot describe a stale image' -f (Split-Path -Leaf $state.out))
-        exit 2
+        $shaIssue = (Split-Path -Leaf $state.out) + ' changed after this session loaded it'
+        $PreflightIssues = (@($PreflightIssues, $shaIssue) | Where-Object { $_ }) -join ' | '
     }
 }
 
@@ -261,7 +269,7 @@ $utf8Bom = New-Object Text.UTF8Encoding($true)
 $verdictScript = Join-Path $PSScriptRoot 'ti_c2000_check_read.ps1'
 if (-not (Test-Path -LiteralPath $verdictScript)) {
     Out2 'FAILURE: ENV_NO_VERDICT_SCRIPT'; Out2 'RESULT: FAIL'
-    Out2 'REASON: mandatory CSV verdict script is missing'; exit 2
+    Out2 'REASON: mandatory CSV verdict script is missing'; exit 1
 }
 $pwshExe = Join-Path $PSHOME 'pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
@@ -279,114 +287,143 @@ Info2 ('LOAD    : #{0} (this session), reads never download' -f $(if ($loadIdx) 
 Info2 ('OUT     : {0}' -f $state.out)
 
 # ---------------------------------------------------------------- array ------
-if ($ArrayName) {
+if ($ArrayName -or $LatestFrame) {
     $total = $Rows * $Columns
-    if ($null -eq $ExpectFwId -or -not $FwIdVar) {
-        Out2 'FAILURE: FW_ID_UNREADABLE'; Out2 'RESULT: FAIL'
-        Out2 'REASON: frozen array reads require the loaded firmware identity'; exit 4
+    $softFail = New-Object System.Collections.Generic.List[string]
+    if ($PreflightIssues) { $softFail.Add($PreflightIssues) }
+    $fwBeforeValue = ''
+    if ($FwIdVar) {
+        $fwBefore = Request-Soft ('VARS ' + $FwIdVar)
+        if ($fwBefore -and $fwBefore.errors.Count -eq 0) { $fwBeforeValue = [string]$fwBefore.vars[$FwIdVar] }
     }
-    $fwBefore = Request ('VARS ' + $FwIdVar)
-    $fwBeforeValue = [string]$fwBefore.vars[$FwIdVar]
-    if (-not (Test-FlagEquals $fwBeforeValue ([string]$ExpectFwId))) {
-        Out2 'FAILURE: FW_ID_MISMATCH'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: firmware identity before array copy was {0}, expected {1}' -f $fwBeforeValue,$ExpectFwId); exit 4
+    if (-not $fwBeforeValue -or $null -eq $ExpectFwId) {
+        $softFail.Add('firmware identity was not proven before the array copy')
+    } elseif (-not (Test-FlagEquals $fwBeforeValue ([string]$ExpectFwId))) {
+        $softFail.Add(('firmware identity before copy was {0}, expected {1}' -f $fwBeforeValue,$ExpectFwId))
     }
-    if ($FrozenFlag) {
-        # a build without the freeze flag has nothing safe to copy; say so plainly
-        # instead of failing with a generic symbol error
-        $probeRaw = Send-Request ('VARS ' + $FrozenFlag) $RequestTimeoutMs
-        if ($null -eq $probeRaw) {
-            Out2 'FAILURE: SERVICE_TIMEOUT'; Out2 'RESULT: FAIL'
-            Out2 ('REASON: no response within {0} ms - see {1}' -f $RequestTimeoutMs, (Join-Path $svcDir 'server.log')); exit 1
-        }
-        $probe = ConvertFrom-Response $probeRaw
-        if ($probe.errors.Count -gt 0) {
-            if (($probe.errors -join ';') -match 'identifier not found') {
-                Out2 'FAILURE: NO_FROZEN_FLAG'; Out2 'RESULT: FAIL'
-                Out2 ('REASON: this build has no {0} - the firmware never freezes a buffer, so there is no consistent window to copy' -f $FrozenFlag)
-                exit 1
-            }
-            Out2 'FAILURE: VALUE_READ_FAILED'; Out2 'RESULT: FAIL'
-            Out2 ('REASON: ' + ($probe.errors -join '; ')); exit 1
+    if (-not $LatestFrame -and $FrozenFlag) {
+        $probe = Request-Soft ('VARS ' + $FrozenFlag)
+        if (-not $probe -or $probe.errors.Count -gt 0 -or -not $probe.vars.Contains($FrozenFlag)) {
+            $softFail.Add(('{0} was not readable before the array copy; the array will be returned without freeze proof' -f $FrozenFlag))
         }
     }
-    $deadline = (Get-Date).AddMilliseconds($WaitMs)
-    do {
-        $pre = Request (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|'))
-        if (Test-FlagEquals ([string]$pre.vars[$FrozenFlag]) $FrozenValue) { break }
-    } while ((Get-Date) -lt $deadline)
-    if (-not (Test-FlagEquals ([string]$pre.vars[$FrozenFlag]) $FrozenValue)) {
-        Out2 'FAILURE: BUFFER_NOT_FROZEN'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: {0} did not reach {1} within {2} ms' -f $FrozenFlag,$FrozenValue,$WaitMs)
-        exit 1
+    if ($LatestFrame) {
+        $pre = Request-Soft ('VARS ' + $SeqVar + '|' + $BankVar)
+    } else {
+        $deadline = (Get-Date).AddMilliseconds($WaitMs)
+        do {
+            $pre = Request-Soft (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|'))
+            if (-not $pre -or $pre.errors.Count -gt 0) { break }
+            if (Test-FlagEquals ([string]$pre.vars[$FrozenFlag]) $FrozenValue) { break }
+        } while ((Get-Date) -lt $deadline)
+        if (-not $pre -or -not (Test-FlagEquals ([string]$pre.vars[$FrozenFlag]) $FrozenValue)) {
+            $softFail.Add(('{0} did not reach {1} within {2} ms' -f $FrozenFlag,$FrozenValue,$WaitMs))
+        }
+    }
+    if (-not $pre) { $pre = [pscustomobject]@{ vars = [ordered]@{}; errors = @('no evidence response') } }
+    if ($pre.errors.Count -gt 0) { $softFail.Add(('pre-copy evidence read failed: ' + ($pre.errors -join '; '))) }
+    $preBank = if ($LatestFrame) { [string]$pre.vars[$BankVar] } else { '' }
+    if ($LatestFrame) {
+        if ($preBank -eq '0') { $ArrayName = $Bank0Array }
+        elseif ($preBank -eq '1') { $ArrayName = $Bank1Array }
+        else {
+            $ArrayName = $Bank0Array
+            $softFail.Add(('{0} did not identify completed bank 0 or 1; bank 0 was copied for diagnosis' -f $BankVar))
+        }
     }
     $arr = Request ('ARRAY ' + $ArrayName + '|' + $Rows + '|' + $Columns)
-    $post = Request (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|'))
+    $post = if ($LatestFrame) { Request-Soft ('VARS ' + $SeqVar + '|' + $BankVar) }
+            else { Request-Soft (('VARS ' + $FrozenFlag + '|' + $SeqVar).Trim('|')) }
+    if (-not $post) { $post = [pscustomobject]@{ vars = [ordered]@{}; errors = @('no evidence response') } }
+    if ($post.errors.Count -gt 0) { $softFail.Add(('post-copy evidence read failed: ' + ($post.errors -join '; '))) }
 
     $preFlag = [string]$pre.vars[$FrozenFlag]
     $postFlag = [string]$post.vars[$FrozenFlag]
+
+    # Data judgements no longer abort the read. The samples are already in memory, so
+    # withholding them helps nobody: the caller gets array.csv plus a verdict naming what
+    # is wrong. Only "there are no samples" (probe/timeout/protocol) still stops earlier.
     # The expected value was declared and documented but never read: a flag that sits at 0
     # does not change while the window is copied, so "did it change?" passed on a buffer
     # that was never frozen and the copy could mix old and new samples. Equality is what
     # proves "frozen"; stability alone only proves "constant" (found 2026-11-15 by
     # tools/audit_dead_params.ps1).
-    if ($FrozenFlag -and -not (Test-FlagEquals $preFlag $FrozenValue)) {
-        Out2 'FAILURE: BUFFER_NOT_FROZEN'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: {0} = {1}, expected {2} - the buffer is not in its frozen state, so a copy taken now could mix old and new samples' -f $FrozenFlag, $preFlag, $FrozenValue)
-        Out2 'HINT    : check the firmware freeze protocol and expected completed flag value'
-        exit 1
+    if (-not $LatestFrame -and $FrozenFlag -and -not (Test-FlagEquals $preFlag $FrozenValue)) {
+        Out2 ('CHECK frozen: FAILED - {0} = {1}, expected {2}' -f $FrozenFlag, $preFlag, $FrozenValue)
+        $softFail.Add(('{0} = {1}, expected {2}: the copy is not from a frozen window' -f $FrozenFlag, $preFlag, $FrozenValue))
     }
-    if ($FrozenFlag -and $preFlag -ne $postFlag) {
-        Out2 'FAILURE: BUF_CHANGED'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: {0} changed while copying ({1} -> {2})' -f $FrozenFlag, $preFlag, $postFlag); exit 1
+    if (-not $LatestFrame -and $FrozenFlag -and $preFlag -ne $postFlag) {
+        Out2 ('CHECK frozen_during_copy: FAILED - {0} changed {1} -> {2}' -f $FrozenFlag, $preFlag, $postFlag)
+        $softFail.Add(('{0} changed while copying ({1} -> {2}): the window is torn' -f $FrozenFlag, $preFlag, $postFlag))
     }
+    $frameChanged = $false
     if ($SeqVar) {
         $preSeq = [string]$pre.vars[$SeqVar]
         $postSeq = [string]$post.vars[$SeqVar]
-        if ($preSeq -ne $postSeq) {
-            Out2 'FAILURE: BUF_CHANGED'; Out2 'RESULT: FAIL'
-            Out2 ('REASON: {0} changed while copying ({1} -> {2})' -f $SeqVar, $preSeq, $postSeq); exit 1
+        if (-not $preSeq -or -not $postSeq) {
+            $softFail.Add(('{0} was not readable on both sides of the array copy' -f $SeqVar))
+        } elseif ($preSeq -ne $postSeq) {
+            $frameChanged = $LatestFrame
+            Out2 ('CHECK sequence_during_copy: FAILED - {0} changed {1} -> {2}' -f $SeqVar, $preSeq, $postSeq)
+            $softFail.Add(('{0} changed while copying ({1} -> {2}): the window is torn' -f $SeqVar, $preSeq, $postSeq))
+        }
+    }
+    if ($LatestFrame) {
+        $postBank = [string]$post.vars[$BankVar]
+        if (-not $postBank) { $softFail.Add(('{0} was not readable after the array copy' -f $BankVar)) }
+        elseif ($preBank -ne $postBank) {
+            $frameChanged = $true
+            $softFail.Add(('{0} changed while copying ({1} -> {2}): selected bank may have been reused' -f $BankVar,$preBank,$postBank))
         }
     }
     if ($arr.arr.Count -ne $total) {
-        Out2 'FAILURE: COUNT_MISMATCH'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: got {0} values, expected {1}' -f $arr.arr.Count, $total); exit 1
+        Out2 ('CHECK count: FAILED - got {0}, expected {1}' -f $arr.arr.Count, $total)
+        $softFail.Add(('got {0} values, expected {1}' -f $arr.arr.Count, $total))
     }
 
+    $got = $arr.arr.Count
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('index,value')
-    for ($i = 0; $i -lt $total; $i++) { $lines.Add(('{0},{1}' -f $i, $arr.arr[$i])) }
+    for ($i = 0; $i -lt $got; $i++) { $lines.Add(('{0},{1}' -f $i, $arr.arr[$i])) }
     $csvPath = Join-Path $dataDir 'array.csv'
 
     # anchor: the first element must read the same both ways while the buffer is frozen
-    $anchor = Request ('VARS ' + $ArrayName + '[0]')
-    $anchorVal = [string]$anchor.vars[($ArrayName + '[0]')]
-    if ($anchorVal -match '^-?\d+$' -and ([int64]$arr.arr[0]) -ne ([int64]$anchorVal)) {
-        Out2 'FAILURE: ARRAY_LAYOUT_MISMATCH'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: {0}[0] evaluate={1} readData={2}' -f $ArrayName, $anchorVal, $arr.arr[0]); exit 1
+    if ($got -gt 0) {
+        $anchor = Request-Soft ('VARS ' + $ArrayName + '[0]')
+        $anchorVal = if ($anchor -and $anchor.errors.Count -eq 0) { [string]$anchor.vars[($ArrayName + '[0]')] } else { '' }
+        if (-not $anchorVal) { $softFail.Add(('anchor {0}[0] could not be evaluated' -f $ArrayName)) }
+        elseif ($anchorVal -match '^-?\d+$' -and ([int64]$arr.arr[0]) -ne ([int64]$anchorVal)) {
+            Out2 ('CHECK anchor: FAILED - {0}[0] evaluate={1} readData={2}' -f $ArrayName, $anchorVal, $arr.arr[0])
+            $softFail.Add(('{0}[0] reads {1} by evaluate but {2} by readData: the array layout may not match' -f $ArrayName, $anchorVal, $arr.arr[0]))
+        }
     }
-    $fwAfter = Request ('VARS ' + $FwIdVar)
-    $fwAfterValue = [string]$fwAfter.vars[$FwIdVar]
-    if (-not (Test-FlagEquals $fwAfterValue ([string]$ExpectFwId)) -or -not (Test-FlagEquals $fwAfterValue $fwBeforeValue)) {
-        Out2 'FAILURE: FW_ID_MISMATCH'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: firmware identity changed during array copy ({0} -> {1})' -f $fwBeforeValue,$fwAfterValue); exit 4
+    $fwAfter = if ($FwIdVar) { Request-Soft ('VARS ' + $FwIdVar) } else { $null }
+    $fwAfterValue = if ($fwAfter -and $fwAfter.errors.Count -eq 0) { [string]$fwAfter.vars[$FwIdVar] } else { '' }
+    if (-not $fwAfterValue -or ($null -ne $ExpectFwId -and -not (Test-FlagEquals $fwAfterValue ([string]$ExpectFwId))) -or -not (Test-FlagEquals $fwAfterValue $fwBeforeValue)) {
+        Out2 ('CHECK fw id after copy: FAILED - {0} -> {1} (expected {2})' -f $fwBeforeValue, $fwAfterValue, $ExpectFwId)
+        $softFail.Add(('firmware identity changed during the copy ({0} -> {1}): the image may have been replaced' -f $fwBeforeValue, $fwAfterValue))
     }
     $ramAliveAfter = Test-AliveNow -ProjectPath $ProjectPath -Candidates @([string](Get-FwContract).ramProof.counter)
     if (-not $ramAliveAfter.ok) {
-        Out2 'FAILURE: RAM_PROOF_NOT_ADVANCING'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: RAM updater stopped after the array copy: ' + $ramAliveAfter.reason); exit 4
+        # Boolean result, not a veto: whether the RAM updater kept running is a property of
+        # the target, reported next to the data. It does not make the samples wrong.
+        Out2 ('NOTE    : ram_proof advancing=False after the copy (' + $ramAliveAfter.reason + ')')
     }
     $appAliveAfter = Test-AliveNow -ProjectPath $ProjectPath -Candidates @((Get-FwContract).heartbeat.candidates)
     if (-not $appAliveAfter.ok) {
-        Out2 'FAILURE: HEARTBEAT_FAIL'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: application heartbeat stopped after the array copy: ' + $appAliveAfter.reason); exit 4
+        Out2 ('CHECK heartbeat after copy: FAILED - ' + $appAliveAfter.reason)
+        $softFail.Add(('application heartbeat stopped after the copy: ' + $appAliveAfter.reason))
     }
     [IO.File]::WriteAllLines($csvPath, $lines, $utf8Bom)
 
     $mapLines = New-Object System.Collections.Generic.List[string]
     $mapLines.Add('role,name,first,last,delta,status')
     $mapLines.Add(('array,{0},,,,OK' -f $ArrayName))
-    $mapLines.Add(('frozen,{0},{1},{2},,OK' -f $FrozenFlag, $preFlag, $postFlag))
+    if ($LatestFrame) {
+        $mapLines.Add('capture,latest-frame,,,,SEQUENCE_AND_BANK_CHECK')
+        $mapLines.Add(('bank,{0},{1},{2},,{3}' -f $BankVar,$preBank,$postBank,$(if ($preBank -eq $postBank -and $preBank -in @('0','1')) { 'OK' } else { 'FAIL' })))
+    }
+    else { $mapLines.Add(('frozen,{0},{1},{2},,{3}' -f $FrozenFlag, $preFlag, $postFlag, $(if (Test-FlagEquals $preFlag $FrozenValue) { 'OK' } else { 'FAIL' }))) }
     if ($SeqVar) { $mapLines.Add(('sequence,{0},{1},{2},,OK' -f $SeqVar, $pre.vars[$SeqVar], $post.vars[$SeqVar])) }
     [IO.File]::WriteAllLines((Join-Path $checkDir 'variables.csv'), $mapLines, $utf8Bom)
 
@@ -397,24 +434,45 @@ if ($ArrayName) {
     if ($null -ne $ValueMax) { $arrayVerdictArgs += @('-ValueMax',([double]$ValueMax).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
     $vout = & $pwshExe @arrayVerdictArgs 2>&1
     $vcode = $LASTEXITCODE
-    foreach ($l in $vout) { if ([string]$l -notmatch '^RESULT:') { Out2 ([string]$l) } }
-    if ($vcode -ne 0) {
-        Out2 'FAILURE: ARRAY_VERDICT_FAILED'; Out2 'RESULT: FAIL'
-        Out2 ('REASON: verdict on {0} failed' -f $csvPath); exit 1
+    foreach ($l in $vout) {
+        $line = [string]$l
+        if ($line -match '^RESULT:') { continue }
+        if ($line -match '^FAILURE:') { Out2 ('CHECK   : ' + $line); continue }
+        Out2 $line
     }
+    if ($vcode -ne 0) {
+        $softFail.Add(('array numeric/count verdict failed on {0}' -f $csvPath))
+    }
+    $coreName = [string]$state.core
+    if ($coreName) { $coreName = ($coreName -split '/')[-1] }
+    $verdictResult = if ($softFail.Count -eq 0) { 'OK' } else { 'FAIL' }
     $verdict = @(
-        'result: OK', 'mode: live-service (no reload)', ('service_pid: ' + $svcPid),
+        ('result: ' + $verdictResult), 'mode: live-service (no reload)', ('service_pid: ' + $svcPid),
         ('service_started: ' + $state.started), ('out: ' + $state.out), ('out_sha256: ' + $state.outSha256),
-        ('array: {0} ({1}x{2}={3})' -f $ArrayName, $Rows, $Columns, $total),
-        ('frozen: {0} = {1}' -f $FrozenFlag, $preFlag),
+        ('core: ' + $coreName),
+        ('array: {0} ({1}x{2}={3}, got {4})' -f $ArrayName, $Rows, $Columns, $total, $got),
+        ('capture: ' + $(if ($LatestFrame) { 'latest-frame sequence check' } else { ('frozen {0} = {1}' -f $FrozenFlag, $preFlag) })),
         ('ram_proof_after: {0} {1}->{2}' -f $ramAliveAfter.name,$ramAliveAfter.first,$ramAliveAfter.last),
         ('heartbeat_after: {0} {1}->{2}' -f $appAliveAfter.name,$appAliveAfter.first,$appAliveAfter.last),
+        ('soft_failures: ' + $(if ($softFail.Count -gt 0) { $softFail -join ' | ' } else { 'none' })),
         ('data: ' + $csvPath)
     )
     [IO.File]::WriteAllLines((Join-Path $checkDir 'verdict.txt'), $verdict, $utf8Bom)
+    # Which core the samples came from, reported next to the data rather than used as a gate.
+    Out2 ('SOURCE  : {0}' -f $(if ($coreName) { $coreName } else { '(unknown core)' }))
     Out2 ('DATA    : {0}' -f $csvPath)
     Out2 ('VERDICT : {0}' -f (Join-Path $checkDir 'verdict.txt'))
-    Out2 ('VALUES  : {0}' -f $total)
+    Out2 ('VALUES  : {0} (requested {1})' -f $got, $total)
+    if ($softFail.Count -gt 0) {
+        # The samples are already on disk. Refusing them would only hide the thing the user
+        # asked for; instead say exactly which judgement failed.
+        if ($frameChanged) { Out2 'FAILURE: FRAME_CHANGED' }
+        else { Out2 'FAILURE: DATA_UNRELIABLE' }
+        Out2 'RESULT: FAIL'
+        foreach ($sf in $softFail) { Out2 ('REASON: ' + $sf) }
+        Out2 'HINT    : the samples were written anyway - array.csv contains exactly what was read'
+        exit 1
+    }
     Out2 'RESULT: OK'
     exit 0
 }
@@ -595,16 +653,20 @@ foreach ($l in $vout) {
     Out2 $s
 }
 
-$verdictResult = if ($vcode -eq 0 -and $hbOk -and $fwOk -and $rateOk) { 'OK' } else { 'FAIL' }
+$verdictResult = if ($vcode -eq 0 -and $hbOk -and $fwOk -and $rateOk -and -not $PreflightIssues) { 'OK' } else { 'FAIL' }
 $verdict = @(
     ('result: ' + $verdictResult), 'mode: live-service (no reload)', ('service_pid: ' + $svcPid),
     ('service_started: ' + $state.started), ('out: ' + $state.out), ('out_sha256: ' + $state.outSha256),
     ('rounds: {0} x {1} ms' -f $Rounds, $IntervalMs), ('variables: ' + ($names -join ', ')),
     ('heartbeat: ' + $(if ($heartbeats.Count -eq 0) { 'SKIPPED' } elseif ($hbOk) { 'OK' } else { 'FAIL' })),
+    ('preflight_issues: ' + $(if ($PreflightIssues) { $PreflightIssues } else { 'none' })),
     ('data: ' + $csvPath)
 )
 [IO.File]::WriteAllLines((Join-Path $checkDir 'verdict.txt'), $verdict, $utf8Bom)
 
+$coreNameOut = [string]$state.core
+if ($coreNameOut) { $coreNameOut = ($coreNameOut -split '/')[-1] }
+Out2 ('SOURCE  : {0}' -f $(if ($coreNameOut) { $coreNameOut } else { '(unknown core)' }))
 Out2 ('DATA    : {0}' -f $csvPath)
 Out2 ('VERDICT : {0}' -f (Join-Path $checkDir 'verdict.txt'))
 Out2 ('VALUES  : {0}' -f ($Rounds * $names.Count))
@@ -637,6 +699,11 @@ if (-not $rateOk) {
 if ($vcode -ne 0) {
     Out2 'FAILURE: VERDICT_FAILED'; Out2 'RESULT: FAIL'
     Out2 ('REASON: verdict on {0} failed' -f $csvPath); exit 1
+}
+if ($PreflightIssues) {
+    Out2 'FAILURE: DATA_UNRELIABLE'; Out2 'RESULT: FAIL'
+    Out2 ('REASON: source/identity evidence needs review: ' + $PreflightIssues)
+    exit 1
 }
 Out2 'RESULT: OK'
 exit 0

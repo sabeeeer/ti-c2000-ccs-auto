@@ -29,8 +29,10 @@ function Write-Marker([int]$holderPid) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marker) | Out-Null
     $o = [ordered]@{
         mode = 'Iterate'; pid = $holderPid; round = 2; maxLoads = 5
-        expect = @('gBufSeq>=3'); started = '2026-11-14 10:00:00'
+        expect = @('gBufSeq>=3'); started = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     }
+    $holder = Get-Process -Id $holderPid -ErrorAction SilentlyContinue
+    if ($holder) { $o.processStartUtc = $holder.StartTime.ToUniversalTime().ToString('o') }
     [IO.File]::WriteAllText($marker, ($o | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
 }
 
@@ -46,6 +48,8 @@ try {
     Copy-Item (Join-Path $root 'references/firmware-contract.json') (Join-Path $fixture 'skill/references')
     # stub only: every case below must stop before any probe/DSS work happens
     '# stub' | Set-Content (Join-Path $scripts 'ti_c2000_debug.ps1') -Encoding UTF8
+    'function Wait-ProbeUsable { param($ProjectPath,$ProbeCheck,$Ccxml,$MaxSeconds,$Quiet) return $false }' |
+        Set-Content (Join-Path $scripts 'ti_c2000_probe.ps1') -Encoding UTF8
     '<project/>' | Set-Content (Join-Path $project '.cproject') -Encoding UTF8
     '<projectDescription><name>DemoImage</name></projectDescription>' | Set-Content (Join-Path $project '.project') -Encoding UTF8
     '<config/>' | Set-Content (Join-Path $project 'targetConfigs/target.ccxml') -Encoding UTF8
@@ -118,6 +122,11 @@ try {
 
     # ---- 6. while Iterate runs, everything else is locked out ------------------
     Write-Marker $PID
+    . (Join-Path $scripts 'ti_c2000_readmode.ps1')
+    if (-not (Get-IterateMarker -ProjectPath $project)) {
+        $m = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+        throw ('live iterate marker rejected: saved=' + $m.processStartUtc + ' actual=' + (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o'))
+    }
 
     $r = Invoke-Script @('-NoProfile', '-File', $read, '-ProjectPath', $project, '-Variables', 'gMsTick')
     Expect 'ReadOnly while Iterate runs' $r 4 'READONLY_IN_ITERATE'
@@ -140,6 +149,12 @@ try {
     Write-Marker 999999
     $r = Invoke-Script @('-NoProfile', '-File', $read, '-ProjectPath', $project, '-Variables', 'gMsTick')
     Expect 'stale iterate marker is ignored' $r 4 'NO_SESSION'
+    Write-Marker $PID
+    $forged = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+    $forged.processStartUtc = '2000-01-01T00:00:00.0000000Z'
+    $forged | ConvertTo-Json | Set-Content -LiteralPath $marker -Encoding utf8
+    $r = Invoke-Script @('-NoProfile', '-File', $read, '-ProjectPath', $project, '-Variables', 'gMsTick')
+    Expect 'reused pid with different process start is ignored' $r 4 'NO_SESSION'
     Remove-Item -LiteralPath $marker -Force
 
     # ---- 8. with the user's yes, LoadRead gets as far as the probe ------------
@@ -147,7 +162,7 @@ try {
     if ($r.code -eq 4 -or $r.text -match 'LOAD_NOT_CONFIRMED|MUTUALLY_EXCLUSIVE|ITERATE_IN_PROGRESS') {
         throw "an approved LoadRead was refused before the probe check`n$($r.text)"
     }
-    Expect 'approved LoadRead reaches the probe check' $r 1 'probe pre-check did not return RESULT: OK'
+    Expect 'approved LoadRead reaches the probe check' $r 3 'PROBE_CHECK_FAILED'
     if (Test-Path -LiteralPath (Join-Path $svcDir 'target.lock')) { throw 'the target lock was left behind after a failed LoadRead' }
     if ((Get-Count $project) -ne $before) { throw 'a read that never reached the target counted a download' }
 
@@ -156,3 +171,6 @@ try {
 } finally {
     Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
 }
+# An explicit exit is required: without it the script returns the LASTEXITCODE left
+# by the last child process (a deliberate refusal = 3), so "RESULT: OK" lied.
+exit 0

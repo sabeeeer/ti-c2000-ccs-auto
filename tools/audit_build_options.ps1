@@ -29,7 +29,7 @@ function Info2($m) { if (-not $Quiet) { Write-Output $m } }
 
 $cproj = Join-Path $ProjectPath '.cproject'
 if (-not (Test-Path -LiteralPath $cproj)) {
-    Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
+    Out2 'USAGE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
 }
 
 # Options the build script really consumes (keep in sync with Get-OptionValue/Get-OptionList

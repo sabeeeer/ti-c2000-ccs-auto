@@ -34,7 +34,7 @@ $ccxml = Join-Path $targetDir 'TMS320F28335.ccxml'
 try {
     $before = [IO.File]::ReadAllText($ccxml)
     $failOut = & pwsh -NoProfile -File $scriptPath -ProjectPath $tempRoot -Probe v1 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 1 -or $failOut -notmatch 'SERIAL_REQUIRED' -or [IO.File]::ReadAllText($ccxml) -ne $before) { throw 'missing -Serial should fail without mutation' }
+    if ($LASTEXITCODE -ne 2 -or $failOut -notmatch 'USAGE: SERIAL_REQUIRED' -or [IO.File]::ReadAllText($ccxml) -ne $before) { throw 'missing -Serial should fail without mutation' }
 
     $dryOut = & pwsh -NoProfile -File $scriptPath -ProjectPath $tempRoot -Probe v1 -Serial TI1P9CM8 -DryRun 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or $dryOut -notmatch 'RESULT: OK' -or [IO.File]::ReadAllText($ccxml) -ne $before) { throw 'DryRun should preserve fixture' }

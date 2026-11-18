@@ -43,13 +43,13 @@ try {
     Write-Map '00008000' '.text.2'
     Check 'split text section in RAM' $true
     Write-Map '00010000'
-    Check 'Flash text refused' $false 'NOT_RAM_IMAGE'
+    Check 'Flash text reported, not refused' $true ''
     Write-Map '00008000'
     $script:updaterAddr = '0x00010010'
-    Check 'Flash updater refused' $false 'NOT_RAM_IMAGE'
+    Check 'Flash updater reported, not refused' $true ''
     $script:updaterAddr = '0x00008010'
     $script:advance = $false
-    Check 'frozen counter refused' $false 'RAM_PROOF_NOT_ADVANCING'
+    Check 'frozen counter reported, not refused' $true ''
     $script:advance = $true
     $state.mapSha256 = 'wrong'
     $r = Get-RamProofEvidence -ProjectPath $dir -OutFile $outPath -MapFile $mapPath -SessionState $state

@@ -54,7 +54,7 @@
 | `live_read.ps1 -Variables gMsTick,EPwm1Regs.TBPRD -Rounds 3` | `26705 → 27114 → 27540`，`RESULT: OK` |
 | 紧接着再读一次 | `44843 → 45256 → 45656`，**没有归零**，pid 未变 —— 证明没有重新加载 |
 | `run_read.ps1`（默认路径） | 附着同一 pid，`55750 → 56142 → 56537`，`RESULT: OK` |
-| `read_dma.ps1 -FrozenBufferReady` | `FAILURE: NO_FROZEN_FLAG`（本工程固件没有 `gBufFull`），单条结论 |
+| `read_dma.ps1 -FrozenBufferReady` | 当时因缺少 `gBufFull` 提前中止；当前版本会尽量交付数组并在判据中标记冻结证据缺失。历史结果不代表当前输出。 |
 | `service.ps1 -Stop` → 再 `run_read` | 自动重启新会话（新 pid），读成功 |
 
 `tests/test_single_session_generation.ps1` 增加两条断言：默认路径必须出现 `ti_c2000_live_read.ps1`、必须保留 `-Standalone`；脚本生成路径改用 `-Standalone` 覆盖。6 个测试全 PASS。

@@ -74,7 +74,7 @@ function Show-KeyLines($arr) {
 . (Join-Path $PSScriptRoot 'ti_c2000_readmode.ps1')
 
 if (-not (Test-Path (Join-Path $ProjectPath '.cproject'))) {
-    Out2 'FAILURE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
+    Out2 'USAGE: NO_PROJECT'; Out2 'RESULT: FAIL'; Out2 "REASON: no .cproject under '$ProjectPath'"; exit 2
 }
 $ProjectPath = (Get-Item -LiteralPath $ProjectPath).FullName
 
@@ -83,7 +83,7 @@ $runSpec = Resolve-RunModeSpec -RunMode 'Iterate' -ConfirmLoad -UserApproved:$Us
 
 $vars = @($Variables | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
 if ($vars.Count -eq 0) {
-    Out2 'FAILURE: NEED_VARIABLES'; Out2 'RESULT: FAIL'
+    Out2 'USAGE: NEED_VARIABLES'; Out2 'RESULT: FAIL'
     Out2 'REASON: -Variables is what each round reads; without it a round can prove nothing'
     Out2 'HINT    : e.g. -Variables "gBufSeq,gErr" -Expect "gBufSeq>=3","gErr==0"'
     exit 2
@@ -103,7 +103,7 @@ $svcScript = Join-Path $PSScriptRoot 'ti_c2000_service.ps1'
 $readScript = Join-Path $PSScriptRoot 'ti_c2000_run_read.ps1'
 foreach ($p in @($svcScript, $readScript)) {
     if (-not (Test-Path -LiteralPath $p)) {
-        Out2 'FAILURE: ENV_MISSING_SCRIPT'; Out2 'RESULT: FAIL'; Out2 "REASON: '$p' is missing from this skill installation"; exit 2
+        Out2 'FAILURE: ENV_MISSING_SCRIPT'; Out2 'RESULT: FAIL'; Out2 "REASON: '$p' is missing from this skill installation"; exit 1
     }
 }
 

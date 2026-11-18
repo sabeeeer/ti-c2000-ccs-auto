@@ -26,7 +26,7 @@
 
 `F:\c2000ware-core-sdk\README.md` 标明该下载为 Core SDK v26.00.00.00.STS；本机 `libraries\control` 有 DCL，没有 DMC。不能据此判定 GitHub 下载不完整；DMC 的旧版宏库本来从 controlSUITE 取，且不应把其中的器件驱动直接套到别的 C2000 型号。换电脑或 SDK 版本时重新核对实际安装路径。
 
-**包的边界**：`c2000ware-core-sdk` 是 TI 官方发布的 C2000Ware 基础包，不是全部 C2000 应用软件的合集。[TI 的软件指南](https://software-dl.ti.com/C2000/docs/software_guide/c2000ware/index.html)列出 Core 库；[MotorControl SDK](https://www.ti.com/tool/C2000WARE-MOTORCONTROL-SDK)则是另一个面向电机控制的包，内附一份 C2000Ware，不能倒推 Core 包也含全部电机库。旧 DMC 宏库以本机 controlSUITE 为准；不要仅凭“SDK”字样推断任意库必在 `libraries/` 下。
+**包的边界**：`c2000ware-core-sdk` 是 TI 官方发布的 C2000Ware 基础包，不是全部 C2000 应用软件的合集。[TI 的软件指南](https://software-dl.ti.com/C2000/docs/software_guide/c2000ware/index.html)列出 Core 库；[MotorControl SDK](https://www.ti.com/tool/C2000WARE-MOTORCONTROL-SDK)则是另一个面向电机控制的包，内附一份 C2000Ware，不能倒推 Core 包也含全部电机库。旧 DMC 宏库以本机 controlSUITE 为准；不要仅凭"SDK"字样推断任意库必在 `libraries/` 下。
 
 完整库名、实例和需求映射见 [C2000Ware 库索引](c2000ware-index.md) §3–4；每个库以本机 `docs/`、`examples/`、`include/`、`source/`、`lib/`、`cmd/` 的实际内容为准，不能假定每个库都有所有子目录。可用只读本地检索：
 
@@ -43,7 +43,40 @@ pwsh -NoProfile -File "<skill>\scripts\c2000ware_find.ps1" -SdkRoot "F:\c2000war
 
 **PLL 名称辨别**：本机 Core SDK 的 `libraries/` 清单中没有 SolarLib SPLL；处理电网 PLL、SOGI、SRF/DDSRF 时使用上面的 SolarLib 入口及 [SPLL 专题](spll-pll-algorithms.md)，核对实际 TI 源码与工程适配层；片内时钟 PLL 则按第一类查器件例程。
 
-## 正弦 / 波形生成：先看器件有没有 TMU
+## 正弦 / 波形生成：有 TMU 就默认用 TMU
+
+**默认规则（先执行这条，再往下看表格）**：
+
+> 目标器件带 TMU 时，**任何正弦 / 余弦 / 波形生成一律先写 `__sinpuf32()`**，不要默认离线查表。
+> 查表是降级方案，不是对等选项。
+
+**为什么把"优先"写成硬规则**：2026-11-18 的一次返工。DAC 正弦用离线表 + DMA 轮转实现，
+等需求变成"PI 在线调幅值"时才发现表里幅值写死、DMA 正在读表，改幅值只能推翻重写。
+如果一开始用 TMU 实时算，幅值、频率、相位都是运行时可改的量：
+
+```c
+/* 幅值随 PI 每拍可变，频率只改 phase 增量，都不要重建表 */
+code = offset + (int16)(amp * __sinpuf32(phase));
+phase += step;  if (phase >= 1.0F) { phase -= 1.0F; }
+```
+
+**器件速查**：
+
+| 器件 | TMU | 正弦首选 |
+|---|---|---|
+| **F2837xD / F28379D（本工程）** | ✅ | **`__sinpuf32()`** |
+| F2837xS / F2838x | ✅ | `__sinpuf32()` |
+| F2807x / F28004x / F28003x / F28002x | ✅ | `__sinpuf32()` |
+| F28P55x / F28P65x / F28E12x | ✅ | `__sinpuf32()` |
+| **F28335 / F28334 / F28035 / F28027** | ❌ | 查表（可选插值）/ IQmath |
+
+**只有三种情况才降级到查表**：
+
+1. 器件没有 TMU；
+2. 需要"某个值在任意时刻都可逐位复现"（例如必须与 PC 端参考表逐点对齐做校验）；
+3. 实测 `__sinpuf32()` 在本工程 ISR 预算内不够——**必须给反汇编和计时证据**，不能凭调用形式判断。
+
+**判断"是不是真的编译成 TMU 指令"**：用 `dis2000` 反汇编，看到 `SINPUF32` 才算；源码里写了 `__sinpuf32` 但没传 `--tmu_support=tmu0` 时，会退化成隐式声明 + 外部调用（见[坑表 §九](c28x-pitfalls.md)）。
 
 | 方案 | 适用器件 | 每次调用代价 | 说明 |
 |---|---|---|---|

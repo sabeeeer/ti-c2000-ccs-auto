@@ -1,4 +1,10 @@
 #requires -Version 7.0
+
+# Learned probe wait: reused by every entry point that has to wait for a probe to come back
+# after a DSS session released its USB handle. Kept in its own file so the wait cannot drift
+# between the read gate and the service (it did: the two copies disagreed on 2026-11-16).
+. (Join-Path $PSScriptRoot 'ti_c2000_probe.ps1')
+
 <#
 ti_c2000_readmode.ps1 -- the two orthogonal dimensions (RUN mode x READ mode) and the
 interlocks between them. Dot-source it in every entry point that touches the target:
@@ -35,7 +41,7 @@ and one exit code, it never crashes):
   ReadOnly  while Iterate runs                                    -> READONLY_IN_ITERATE  exit 4
   LoadRead  while Iterate runs                                    -> MUTUALLY_EXCLUSIVE   exit 2
   any Start/Stop/Iterate while Iterate runs                       -> ITERATE_IN_PROGRESS  exit 4
-  another script holds the target                                 -> TARGET_BUSY          exit 5
+  another script holds the target                                 -> TARGET_BUSY          exit 4
 
 Exit codes: 0 OK | 1 failure | 2 environment/argument | 3 no probe
             4 refused before downloading | 5 target held elsewhere
@@ -255,7 +261,18 @@ function Get-IterateMarker {
     $m = $null
     try { $m = Get-Content -LiteralPath $p -Raw -Encoding utf8 | ConvertFrom-Json } catch { return $null }
     if (-not $m) { return $null }
-    if (-not (Get-Process -Id ([int]$m.pid) -ErrorAction SilentlyContinue)) { return $null }
+    $owner = Get-Process -Id ([int]$m.pid) -ErrorAction SilentlyContinue
+    if (-not $owner) { return $null }
+    # A crashed loop's PID may later be reused. Match the process start, not merely
+    # the numeric PID, before allowing a disk marker to lock the target.
+    try {
+        if ($m.processStartUtc) {
+            if ($owner.StartTime.ToUniversalTime().Ticks -ne ([datetime]$m.processStartUtc).ToUniversalTime().Ticks) { return $null }
+        } elseif ($m.started) {
+            $marked = [datetime]::Parse([string]$m.started)
+            if ($owner.StartTime -gt $marked.AddSeconds(2)) { return $null }
+        }
+    } catch { return $null }
     return $m
 }
 
@@ -272,6 +289,7 @@ function Set-IterateMarker {
     $o = [ordered]@{
         mode     = 'Iterate'
         pid      = $PID
+        processStartUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
         round    = $Round
         maxLoads = $MaxLoads
         expect   = @($Expect)
@@ -348,7 +366,7 @@ function Assert-RunModeInterlock {
         exit 4
     }
     if ($ReadMode -eq 'LoadRead') {
-        Write-Output 'FAILURE: MUTUALLY_EXCLUSIVE'
+        Write-Output 'USAGE: MUTUALLY_EXCLUSIVE'
         Write-Output 'RESULT: FAIL'
         Write-Output ('REASON: ' + $who)
         Write-Output 'REASON: the continuous run already owns the download loop - one downloader at a time'
@@ -374,13 +392,13 @@ function Resolve-RunModeSpec {
 
     $norm = ([string]$RunMode).Trim()
     if (@($script:RunModeNames | Where-Object { $_ -eq $norm }).Count -eq 0) {
-        Write-Output 'FAILURE: INVALID_RUN_MODE'
+        Write-Output 'USAGE: INVALID_RUN_MODE'
         Write-Output 'RESULT: FAIL'
         Write-Output ("REASON: -RunMode must be SingleStep or Iterate, got '{0}'" -f $norm)
         exit 2
     }
     if ($MaxLoads -lt 1 -or $MaxLoads -gt 20) {
-        Write-Output 'FAILURE: INVALID_MAX_LOADS'
+        Write-Output 'USAGE: INVALID_MAX_LOADS'
         Write-Output 'RESULT: FAIL'
         Write-Output 'REASON: -MaxLoads must be 1..20'
         exit 2
@@ -418,13 +436,13 @@ function Resolve-ReadModeSpec {
 
     $norm = ([string]$Mode).Trim()
     if (@($script:ReadModeNames | Where-Object { $_ -eq $norm }).Count -eq 0) {
-        Write-Output 'FAILURE: INVALID_READ_MODE'
+        Write-Output 'USAGE: INVALID_READ_MODE'
         Write-Output 'RESULT: FAIL'
         Write-Output ("REASON: -Mode must be ReadOnly or LoadRead, got '{0}'" -f $norm)
         exit 2
     }
     if ($MaxLoads -lt 1 -or $MaxLoads -gt 20) {
-        Write-Output 'FAILURE: INVALID_MAX_LOADS'
+        Write-Output 'USAGE: INVALID_MAX_LOADS'
         Write-Output 'RESULT: FAIL'
         Write-Output 'REASON: -MaxLoads must be 1..20'
         exit 2
@@ -437,7 +455,7 @@ function Resolve-ReadModeSpec {
         if (@($Expect).Count -gt 0) { $clash += '-Expect' }
         if ($MaxLoads -gt 1) { $clash += '-MaxLoads' }
         if ($clash.Count -gt 0) {
-            Write-Output 'FAILURE: MUTUALLY_EXCLUSIVE'
+            Write-Output 'USAGE: MUTUALLY_EXCLUSIVE'
             Write-Output 'RESULT: FAIL'
             Write-Output ('REASON: ReadOnly never downloads, so ' + ($clash -join ' / ') + ' cannot be combined with it')
             Write-Output 'HINT    : drop them for a plain read, or use -Mode LoadRead -ConfirmLoad to download first'
@@ -449,7 +467,7 @@ function Resolve-ReadModeSpec {
         $which = @()
         if ($NoProbeCheck) { $which += '-NoProbeCheck' }
         if ($AllowUnverified) { $which += '-AllowUnverified' }
-        Write-Output 'FAILURE: MUTUALLY_EXCLUSIVE'
+        Write-Output 'USAGE: MUTUALLY_EXCLUSIVE'
         Write-Output 'RESULT: FAIL'
         Write-Output ('REASON: ' + ($which -join ' / ') + ' only applies to -Mode ReadOnly')
         Write-Output 'HINT    : LoadRead checks the probe and loads the image itself - drop the switch'
@@ -542,17 +560,19 @@ function Assert-ProbeOnline {
     # 2026-11-15: -Stop printed "PROBE : re-enumerated", the very next -Start still failed).
     $out = @()
     $code = 1
-    # Up to 12 s, because after a session exits the device is listed in PnP well before its
-    # driver can actually open it: measured 2026-11-15, -Stop reported "PROBE :
-    # re-enumerated" and the next -Start still failed NO_PROBE three times in a row
-    # (3.6 s). A probe that is genuinely absent still ends up as NO_PROBE, just later.
-    for ($try = 1; $try -le 6; $try++) {
-        $out = @(& $pwshExe @a 2>&1)
-        $code = $LASTEXITCODE
-        $text = (@($out | ForEach-Object { [string]$_ }) -join "`n")
-        if ($code -eq 0 -and $text -match 'RESULT: OK') { break }
-        if ($try -lt 6) { Start-Sleep -Milliseconds 2000 }
-    }
+    # Learned wait (ti_c2000_probe.ps1): 5 s first, +5 s per failure, bisected against the
+    # last remembered failure. This callback checks PnP enumeration only; DSS access
+    # still needs a retained-session response, so no hardware fault is inferred here.
+    $script:c2000ProbeOut2 = @()
+    $script:c2000ProbeCode2 = 1
+    $null = Wait-ProbeUsable -ProjectPath $ProjectPath -ProbeCheck {
+        $script:c2000ProbeOut2 = @(& $pwshExe @a 2>&1)
+        $script:c2000ProbeCode2 = $LASTEXITCODE
+        $t2 = (@($script:c2000ProbeOut2 | ForEach-Object { [string]$_ }) -join "`n")
+        return ($LASTEXITCODE -eq 0 -and $t2 -match 'RESULT: OK')
+    } -MaxSeconds 90
+    $out = @($script:c2000ProbeOut2)
+    $code = [int]$script:c2000ProbeCode2
     $text = (@($out | ForEach-Object { [string]$_ }) -join "`n")
     if ($code -eq 0 -and $text -match 'RESULT: OK') {
         if (-not $Quiet) {
@@ -566,14 +586,14 @@ function Assert-ProbeOnline {
     if ($code -eq 3 -or $text -match 'NO_PROBE') {
         Write-Output 'FAILURE: NO_PROBE'
         Write-Output 'RESULT: FAIL'
-        Write-Output 'REASON: no JTAG probe is enumerated by Windows, so the session this read would attach to cannot answer'
+        Write-Output 'REASON: no JTAG probe is enumerated by Windows; target access was not attempted'
         Write-Output 'HINT    : connect the probe and the board (check the USB light), then read again'
         exit 3
     }
     Write-Output 'FAILURE: PROBE_CHECK_FAILED'
     Write-Output 'RESULT: FAIL'
     Write-Output 'REASON: probe pre-check did not return RESULT: OK'
-    exit 2
+    exit 3
 }
 
 <#
@@ -641,7 +661,7 @@ file lists every MEMORY region with its name, origin and length:
       RAMLS0                00008000   00000800  000007fb  00000005  RWIX
       FLASHA                00080002   00001ffe  00000000  00001ffe  RWIX
 
-No PC or fixed device address is involved. Unknown region names fail closed.
+No PC or fixed device address is involved. Unknown region names yield UNKNOWN metadata.
 
 Returns @{ regions = @(@{name;start;end;isFlash}); source = <path> } or $null.
 #>
@@ -696,7 +716,11 @@ function Get-RamProofEvidence {
         [Parameter(Mandatory)]$SessionState,
         [string]$MapFile = ''
     )
-    $r = [ordered]@{ ok = $false; kind = 'UNKNOWN'; region = ''; code = 'RAM_PROOF_UNAVAILABLE'; text = ''; counter = ''; first = ''; last = ''; mapSha256 = '' }
+    # ok        = can this reader talk to the target at all (the only hard condition)
+    # ramLinked = is .text RAM-linked; a BOOLEAN RESULT, not a veto: running from Flash is a
+    #             legitimate state, it just changes what the addresses mean
+    # advancing = is the RAM counter moving; also a result, see ramProof below
+    $r = [ordered]@{ ok = $false; kind = 'UNKNOWN'; region = ''; code = 'RAM_PROOF_UNAVAILABLE'; text = ''; counter = ''; first = ''; last = ''; mapSha256 = ''; ramLinked = $null; advancing = $null }
     if (-not $MapFile) { $MapFile = [string]$SessionState.map }
     if (-not $MapFile -or -not (Test-Path -LiteralPath $MapFile)) {
         $r.text = 'the selected image has no linker map'; return $r
@@ -730,8 +754,13 @@ function Get-RamProofEvidence {
     if ($codeSections.Count -eq 0) { $r.text = 'no allocated .text section in the selected map'; return $r }
     $badText = @($codeSections | Where-Object { -not $_.region -or $_.region.kind -ne 'RAM' })
     if ($badText.Count -gt 0) {
+        # Result, not a veto: record where it runs and keep going. The data judgement below
+        # (identity, heartbeat, buffer freeze) is what decides whether the numbers are
+        # usable; refusing here only hid the data behind a location complaint.
         $r.kind = if (@($badText | Where-Object { $_.region -and $_.region.kind -eq 'FLASH' }).Count) { 'FLASH' } else { 'UNKNOWN' }
-        $r.code = 'NOT_RAM_IMAGE'; $r.text = '.text is not entirely RAM-linked'; return $r
+        $r.ramLinked = $false
+    } else {
+        $r.ramLinked = $true
     }
     $contract = Get-FwContract
     $symbols = @([string]$contract.ramProof.updater,[string]$contract.ramProof.counter)
@@ -748,21 +777,38 @@ function Get-RamProofEvidence {
         if ($v -gt 0) { $addresses[$m.Groups[1].Value] = $v }
     }
     foreach ($symbol in $symbols) {
-        if (-not $addresses.ContainsKey($symbol)) { $r.text = "symbol $symbol has no address in the loaded image"; return $r }
+        # A symbol with no address is a fact to report, not a reason to withhold everything:
+        # the caller still gets the map's verdict, and the data judgements downstream decide.
+        if (-not $addresses.ContainsKey($symbol)) { continue }
         $address = [long]$addresses[$symbol]
         $region = @($map.regions | Where-Object { $address -ge $_.start -and $address -lt $_.end }) | Select-Object -First 1
         if (-not $region -or $region.kind -ne 'RAM') {
-            $r.kind = if ($region -and $region.kind -eq 'FLASH') { 'FLASH' } else { 'UNKNOWN' }
-            $r.code = 'NOT_RAM_IMAGE'; $r.text = "$symbol is not in a RAM run region"; return $r
+            if ($null -eq $r.ramLinked) { $r.ramLinked = $false }
+            if ($r.kind -eq 'UNKNOWN') { $r.kind = if ($region -and $region.kind -eq 'FLASH') { 'FLASH' } else { 'UNKNOWN' } }
+        } elseif ($symbol -eq $contract.ramProof.updater) {
+            $r.region = [string]$region.name
+            if ($r.kind -eq 'UNKNOWN') { $r.kind = 'RAM' }
         }
-        if ($symbol -eq $contract.ramProof.updater) { $r.region = [string]$region.name }
     }
+    # Advancing is a boolean result: the caller may still want the address and the map even
+    # when the counter is frozen (that is exactly what a halted target looks like).
     $alive = Test-AliveNow -ProjectPath $ProjectPath -Candidates @([string]$contract.ramProof.counter)
-    if (-not $alive.ok) { $r.code = 'RAM_PROOF_NOT_ADVANCING'; $r.text = $alive.reason; return $r }
-    $r.ok = $true; $r.kind = 'RAM'; $r.code = ''; $r.counter = $alive.name
-    $r.first = $alive.first; $r.last = $alive.last
-    $r.text = ('RAM-linked .text and updater {0} in {1}; {2} advanced {3}->{4}; map SHA256 {5}' -f `
-        $contract.ramProof.updater,$r.region,$r.counter,$r.first,$r.last,$sha.Substring(0,16))
+    $r.advancing = [bool]$alive.ok
+    if ($alive.ok) {
+        $r.counter = $alive.name; $r.first = $alive.first; $r.last = $alive.last
+    }
+    if ($null -eq $r.ramLinked) { $r.ramLinked = $true }
+    # .text entirely in RAM means "runs from RAM" even when the updater symbol was not the
+    # one that set $r.kind (it may be absent from the image, as on this project).
+    if ($r.ramLinked -and $r.kind -eq 'UNKNOWN') { $r.kind = 'RAM' }
+    $r.ok = $true; $r.code = ''
+    # Say WHY advancing is false: "counter not in this build" and "counter frozen" are very
+    # different situations and used to render identically as "advancing=False".
+    $aliveNote = if ($alive.ok) { '' } else { ' (' + $alive.reason + ')' }
+    $regionText = if ($r.region) { $r.region } else { 'not-in-map' }
+    $counterText = if ($r.counter) { $r.counter } else { [string]$contract.ramProof.counter }
+    $r.text = ('ramLinked={0} advancing={1}{2}; updater {3} in {4}; counter {5} {6}->{7}; map SHA256 {8}' -f `
+        $r.ramLinked,$r.advancing,$aliveNote,$contract.ramProof.updater,$regionText,$counterText,$r.first,$r.last,$sha.Substring(0,16))
     return $r
 }
 
@@ -858,9 +904,11 @@ function Invoke-RetainedLoadRead {
         $stopArgs = @('-NoProfile','-File',$service,'-ProjectPath',$ProjectPath,'-Stop')
         if ($Bound.ContainsKey('CcsRoot') -and [string]$Bound['CcsRoot']) { $stopArgs += @('-CcsRoot',[string]$Bound['CcsRoot']) }
         $stop = @(& $pwshExe @stopArgs 2>&1)
-        if ($LASTEXITCODE -ne 0 -or -not @($stop | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
-            foreach ($line in $stop) { if ([string]$line -notmatch '^(RESULT|FAILURE):') { Write-Output ([string]$line) } }
-            Write-Output 'FAILURE: STOP_FAILED'; Write-Output 'RESULT: FAIL'; exit 1
+        $stopCode = $LASTEXITCODE
+        if ($stopCode -ne 0 -or -not @($stop | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
+            foreach ($line in $stop) { if ([string]$line -notmatch '^RESULT:') { Write-Output ([string]$line) } }
+            if (-not @($stop | Where-Object { $_ -match '^(?:FAILURE|USAGE):' }).Count) { Write-Output 'FAILURE: STOP_FAILED' }
+            Write-Output 'RESULT: FAIL'; exit $(if ($stopCode -ne 0) { $stopCode } else { 1 })
         }
     }
     $startArgs = @('-NoProfile','-File',$service,'-ProjectPath',$ProjectPath,'-Start','-ConfirmLoad')
@@ -870,9 +918,11 @@ function Invoke-RetainedLoadRead {
     if ($Bound.ContainsKey('Build') -and $Bound['Build']) { $startArgs += '-Build' }
     if ($Quiet) { $startArgs += '-Quiet' }
     $start = @(& $pwshExe @startArgs 2>&1)
-    if ($LASTEXITCODE -ne 0 -or -not @($start | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
-        foreach ($line in $start) { if ([string]$line -notmatch '^(RESULT|FAILURE):') { Write-Output ([string]$line) } }
-        Write-Output 'FAILURE: LOAD_FAILED'; Write-Output 'RESULT: FAIL'; exit 1
+    $startCode = $LASTEXITCODE
+    if ($startCode -ne 0 -or -not @($start | Where-Object { $_ -match '^RESULT: OK\s*$' }).Count) {
+        foreach ($line in $start) { if ([string]$line -notmatch '^RESULT:') { Write-Output ([string]$line) } }
+        if (-not @($start | Where-Object { $_ -match '^(?:FAILURE|USAGE):' }).Count) { Write-Output 'FAILURE: SERVICE_PROTOCOL' }
+        Write-Output 'RESULT: FAIL'; exit $(if ($startCode -ne 0) { $startCode } else { 1 })
     }
     foreach ($line in $start) { if ([string]$line -match '^(LOAD|LOADS|IMAGE|SERVICE|PROBE)') { Write-Output ([string]$line) } }
     $readArgs = @('-NoProfile','-File',$ScriptPath,'-ProjectPath',$ProjectPath,'-Mode','ReadOnly')
@@ -1003,7 +1053,7 @@ function Initialize-SkillRun {
             }
             Write-Output 'HINT    : delete them (they are superseded by this skill), then re-run'
             Write-Output ('HINT    : verify with check_project_entry.ps1 -ProjectPath ' + $ProjectPath)
-            exit 2
+            exit 4
         }
         Write-Output ('WARN    : {0} copy/copies of skill scripts in this project - reads may follow stale logic' -f $copies.Count)
         foreach ($c in $copies | Select-Object -First 3) {

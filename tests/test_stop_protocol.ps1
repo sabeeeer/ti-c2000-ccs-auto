@@ -9,7 +9,7 @@ $project = Join-Path $fixture 'project'
 $serviceDir = Join-Path $project 'readout/.service'
 try {
     New-Item -ItemType Directory -Force -Path $scripts,$refs,$serviceDir | Out-Null
-    foreach ($name in @('ti_c2000_service.ps1','ti_c2000_readmode.ps1','ti_c2000_loadcount.ps1','ti_c2000_fwcontract.ps1')) {
+    foreach ($name in @('ti_c2000_service.ps1','ti_c2000_readmode.ps1','ti_c2000_probe.ps1','ti_c2000_loadcount.ps1','ti_c2000_fwcontract.ps1')) {
         Copy-Item -LiteralPath (Join-Path $root "scripts/$name") -Destination $scripts
     }
     Copy-Item -LiteralPath (Join-Path $root 'references/firmware-contract.json') -Destination $refs

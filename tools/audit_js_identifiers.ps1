@@ -149,7 +149,7 @@ if ($SelfTest) {
 # ------------------------------------------------------------------- audit -----
 if (-not $Scripts) { $Scripts = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts' }
 if (-not (Test-Path -LiteralPath $Scripts)) {
-    Out2 'FAILURE: NO_SCRIPT_DIR'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $Scripts); exit 2
+    Out2 'USAGE: NO_SCRIPT_DIR'; Out2 'RESULT: FAIL'; Out2 ('REASON: ' + $Scripts); exit 2
 }
 
 $problems = Get-UndefinedConstants -Directory $Scripts
