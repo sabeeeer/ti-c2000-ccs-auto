@@ -383,18 +383,48 @@ if ($ArrayName -or $LatestFrame) {
 
     $got = $arr.arr.Count
     $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('index,value')
-    for ($i = 0; $i -lt $got; $i++) { $lines.Add(('{0},{1}' -f $i, $arr.arr[$i])) }
+    # Columns > 1 = 每个点是一个多字段结构体（如 CtrlLog_t{ia,dac}）。
+    # 扁平写成 index,value 会让使用者自己猜字段边界（偶数 ia / 奇数 dac），
+    # 这里按点拆成多列：index,c1,c2,...（2026-11-18 实测需求）。
+    if ($Columns -gt 1) {
+        $hdr = @('index')
+        for ($c = 1; $c -le $Columns; $c++) { $hdr += ('c{0}' -f $c) }
+        $lines.Add(($hdr -join ','))
+        for ($i = 0; $i -lt $Rows; $i++) {
+            $cells = @(('{0}' -f $i))
+            for ($c = 0; $c -lt $Columns; $c++) {
+                $idx = $i * $Columns + $c
+                $cells += $(if ($idx -lt $got) { [string]$arr.arr[$idx] } else { '' })
+            }
+            $lines.Add(($cells -join ','))
+        }
+        Out2 ('LAYOUT  : {0} rows x {1} columns -> index,c1..c{1} (each row is one element of the struct)' -f $Rows, $Columns)
+    } else {
+        $lines.Add('index,value')
+        for ($i = 0; $i -lt $got; $i++) { $lines.Add(('{0},{1}' -f $i, $arr.arr[$i])) }
+    }
     $csvPath = Join-Path $dataDir 'array.csv'
 
-    # anchor: the first element must read the same both ways while the buffer is frozen
+    # anchor: the first element must read the same both ways while the buffer is frozen.
+    # 多字段数组（结构体，Columns > 1）的 [0] 是 struct，DSS 的 evaluate 不支持结构体表达式，
+    # 这里降级为"跳过锚点、只保留点数判据"，并明确打印 SKIPPED，
+    # 而不是记成 soft_failures 让整次读变成 FAIL（2026-11-18 实测：gCtrlLog 1000x2 每次必 FAIL，
+    # 而同一份数据和 13:55 的成功记录逐值一致）。
     if ($got -gt 0) {
         $anchor = Request-Soft ('VARS ' + $ArrayName + '[0]')
         $anchorVal = if ($anchor -and $anchor.errors.Count -eq 0) { [string]$anchor.vars[($ArrayName + '[0]')] } else { '' }
-        if (-not $anchorVal) { $softFail.Add(('anchor {0}[0] could not be evaluated' -f $ArrayName)) }
-        elseif ($anchorVal -match '^-?\d+$' -and ([int64]$arr.arr[0]) -ne ([int64]$anchorVal)) {
-            Out2 ('CHECK anchor: FAILED - {0}[0] evaluate={1} readData={2}' -f $ArrayName, $anchorVal, $arr.arr[0])
+        if (-not $anchorVal) {
+            if ($Columns -gt 1) {
+                Out2 ('CHECK anchor : SKIPPED - {0}[0] is a multi-field element (columns={1}); count is the structural check here' -f $ArrayName, $Columns)
+            } else {
+                Out2 ('CHECK anchor : FAILED - {0}[0] could not be evaluated' -f $ArrayName)
+                $softFail.Add(('anchor {0}[0] could not be evaluated' -f $ArrayName))
+            }
+        } elseif ($anchorVal -match '^-?\d+$' -and ([int64]$arr.arr[0]) -ne ([int64]$anchorVal)) {
+            Out2 ('CHECK anchor : FAILED - {0}[0] evaluate={1} readData={2}' -f $ArrayName, $anchorVal, $arr.arr[0])
             $softFail.Add(('{0}[0] reads {1} by evaluate but {2} by readData: the array layout may not match' -f $ArrayName, $anchorVal, $arr.arr[0]))
+        } else {
+            Out2 ('CHECK anchor : OK - {0}[0] = {1} both ways' -f $ArrayName, $arr.arr[0])
         }
     }
     $fwAfter = if ($FwIdVar) { Request-Soft ('VARS ' + $FwIdVar) } else { $null }
@@ -427,9 +457,16 @@ if ($ArrayName -or $LatestFrame) {
     if ($SeqVar) { $mapLines.Add(('sequence,{0},{1},{2},,OK' -f $SeqVar, $pre.vars[$SeqVar], $post.vars[$SeqVar])) }
     [IO.File]::WriteAllLines((Join-Path $checkDir 'variables.csv'), $mapLines, $utf8Bom)
 
+    # 多列 CSV 的行数是"点数"而不是 Rows×Columns；范围变量也从 value 换成 c1..
+    # 不这样同步，check_read 会按 2000 行去数 1000 行的文件，报行数不符。
+    $expectedRows = if ($Columns -gt 1) { $Rows } else { $total }
     $arrayVerdictArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $verdictScript,
-        '-CsvPath', $csvPath, '-AllowNoHeartbeat', '-ExpectedRows', [string]$total,
-        '-RangeVars', 'value')
+        '-CsvPath', $csvPath, '-AllowNoHeartbeat', '-ExpectedRows', [string]$expectedRows)
+    if ($Columns -gt 1) {
+        $arrayVerdictArgs += @('-RangeVars', (@(1..$Columns | ForEach-Object { 'c' + $_ }) -join ','))
+    } else {
+        $arrayVerdictArgs += @('-RangeVars', 'value')
+    }
     if ($null -ne $ValueMin) { $arrayVerdictArgs += @('-ValueMin',([double]$ValueMin).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
     if ($null -ne $ValueMax) { $arrayVerdictArgs += @('-ValueMax',([double]$ValueMax).ToString('R',[Globalization.CultureInfo]::InvariantCulture)) }
     $vout = & $pwshExe @arrayVerdictArgs 2>&1
@@ -458,6 +495,11 @@ if ($ArrayName -or $LatestFrame) {
         ('data: ' + $csvPath)
     )
     [IO.File]::WriteAllLines((Join-Path $checkDir 'verdict.txt'), $verdict, $utf8Bom)
+    # 逐项打印四级判据（2026-11-18）：此前只打一句 DATA_UNRELIABLE，
+    # 使用者看不到"点数/冻结/心跳过了、只有锚点没过"，只能看到失败。
+    Out2 ('CHECK count    : {0} ({1} rows x {2} cols = {3}, got {4})' -f $(if ($got -eq $total) { 'OK' } else { 'FAILED' }), $Rows, $Columns, $total, $got)
+    Out2 ('CHECK frozen   : {0} ({1} = {2})' -f $(if ($LatestFrame -or (Test-FlagEquals $preFlag $FrozenValue)) { 'OK' } else { 'FAILED' }), $FrozenFlag, $preFlag)
+    Out2 ('CHECK heartbeat: {0} ({1} {2}->{3})' -f $(if ($appAliveAfter.ok) { 'OK' } else { 'FAILED' }), $appAliveAfter.name, $appAliveAfter.first, $appAliveAfter.last)
     # Which core the samples came from, reported next to the data rather than used as a gate.
     Out2 ('SOURCE  : {0}' -f $(if ($coreName) { $coreName } else { '(unknown core)' }))
     Out2 ('DATA    : {0}' -f $csvPath)
