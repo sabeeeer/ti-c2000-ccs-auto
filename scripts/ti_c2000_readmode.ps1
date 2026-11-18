@@ -915,9 +915,9 @@ function Invoke-RetainedLoadRead {
     foreach ($key in @('Ccxml','OutFile','MapFile','CcsRoot','CorePattern')) {
         if ($Bound.ContainsKey($key) -and [string]$Bound[$key]) {
             # 必须分两次 += 追加。写成 `$startArgs += @('-' + $key, [string]$Bound[$key])` 时，
-            # 实测被求值成**一个**字符串 `'-CcsRoot F:\ccs'`（数组只剩 8 个元素而不是 9 个），
-            # 于是 `pwsh -File` 收到一个名为 `CcsRoot F` 的参数 → `SERVICE_PROTOCOL` (exit 1)。
-            # 2026-11-18 实测：不带 -CcsRoot 时正常（LOAD #129），带上必失败。
+            # 实测被求值成**一个**字符串（开关与取值被空格连在一起，数组只剩 8 个元素而不是 9 个），
+            # 于是 `pwsh -File` 收到一个把两者连在一起的参数名 → `SERVICE_PROTOCOL` (exit 1)。
+            # 2026-11-18 实测：不传 -CcsRoot 时正常（LOAD #129），带上该参数必失败。
             $startArgs += ('-' + $key)
             $startArgs += [string]$Bound[$key]
         }
