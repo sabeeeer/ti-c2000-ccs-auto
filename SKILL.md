@@ -311,7 +311,11 @@ XDS100；XDS200 没有串号工具；`dbgjtag` 只吃 CCS 生成的 `.dat`）。
 CCS 实际读取字数 = Acquisition Buffer Size × Index Increment   ≤  数组字数
 ```
 
-结构体数组 `{Uint16 ia; Uint16 dac;}[1000]`（2000 字）对应 **`Acquisition=1000` + `Index=2`**；
+结构体数组 `{Uint16 ia; Uint16 dac;}[1000]`（2000 字）对应 **`Index=2`**，
+`Start Address` 用**变量名** `gCtrlFrozen`（静止一帧）/ `gCtrlLog`（实时环形），符号解析失败才填 `0x00D000` / `0x00C000`。
+控制链 10 kHz → 每点 100 µs，所以 `Sampling Rate=10000`、`Time Display=ms`，
+且 **`Display Data Size` 直接决定时间刻度**：`200` = 20 ms（1 个 50 Hz 周期），`1000` = 100 ms（5 个周期）；
+`Acquisition Buffer Size` 填同样的点数（200 / 1000，**不是字数**，20 ms 填 200 不是 400）。
 填 2000 就是 4000 字，越界后 CCS 不报错、只画一张空图（X 轴缩到 1e-5）。
 注意这里的 `Acquisition Buffer Size` 是**采样点数**，与 `read_continuous.ps1 -Rows` 的**字数**语义不同，不要互相套用。
 

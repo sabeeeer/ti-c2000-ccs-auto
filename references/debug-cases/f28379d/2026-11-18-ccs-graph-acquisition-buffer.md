@@ -18,7 +18,7 @@ Acquisition Buffer Size、Index Increment、Display Data Size、16 bit unsigned�
 - 现象：程序在跑（`gMsTick` 持续增长，Memory Browser 里数组有数据），但 Graph 窗口一条曲线都没有；
   Y 轴自动缩到 0~0.9，X 轴缩到 `-0.00001 ~ +0.00007`（单位 ms）。反复 Refresh 无变化，
   另有一次只在某个时刻看到过一帧正弦，之后一直是空图。
-- 复现条件（错误参数）：Start Address `0x00D000`、Dsp Data Type `16 bit unsigned`、
+- 复现条件（错误参数）：Start Address `gCtrlFrozen`（即 `0x00D000`）、Dsp Data Type `16 bit unsigned`、
   Index Increment `2`、**Acquisition Buffer Size `2000`**、Display Data Size `1000`、
   Sampling Rate `10000`、Time Display `ms`、Auto Scale `true`
 - 期望值与实测值：期望 1000 点 / 100 ms（5 个 50 Hz 周期）；实测 0 个有效点
@@ -42,20 +42,37 @@ Acquisition Buffer Size、Index Increment、Display Data Size、16 bit unsigned�
   是"16 位字数"，结构体数组正好 2000 字；Graph 的 `Acquisition Buffer Size` 是"点数"，
   两者语义不同，混用就会越界
 
-## 正确参数（本工程可直接照抄）
+## 与控制周期对齐：10 kHz → 20 ms / 100 ms
 
-| 字段 | 看 `gCtrlFrozen`（0x00D000）| 看 `gCtrlLog`（0x00C000）|
+控制链 ISR 是 **10 kHz，每点 100 µs**。`Sampling Rate` 必须填 **10000**，
+X 轴才会按 ms 正确换算；**`Display Data Size` 决定一屏显示多长**：
+
+| 想看的时间 | Display Data Size | 50 Hz 周期数 | Acquisition Buffer Size | 实际读取字数 |
+|---|---|---|---|---|
+| **20 ms** | **200** | 1 个周期 | **200** | 400 |
+| 100 ms | **1000** | 5 个周期 | **1000** | 2000 |
+
+> **Acquisition 填的是采样点数，不是字数。** 只看 200 点时填 **200**（不是 400）；
+> 400 是 `200 点 × 2 字` 的读取字数，把它填进 Acquisition 就会变成 800 字，仍然越界。
+> 判据永远是 `Acquisition × Index ≤ 数组字数（本工程 2000）`。
+
+## 正确参数（用变量名，可直接照抄）
+
+| 字段 | 看冻结副本 | 看实时环形 |
 |---|---|---|
-| Start Address | `0x00D000` | `0x00C000` |
-| **Acquisition Buffer Size** | **1000** | **1000** |
+| **Start Address** | **`gCtrlFrozen`** | **`gCtrlLog`** |
+| 符号解析失败时的备选 | `0x00D000` | `0x00C000` |
+| **Acquisition Buffer Size** | **200**（20 ms）/ **1000**（100 ms）| 同 |
 | Index Increment | **2** | **2** |
-| Display Data Size | 1000（想看 20 ms 改 200）| 1000 |
-| Dsp Data Type | 16 Bit Unsigned Integer | 同 |
-| Sampling Rate | 10000 | 同 |
-| Time Display | ms | 同 |
+| Display Data Size | **200** / **1000**（与 Acquisition 一致）| 同 |
+| Dsp Data Type | **16 Bit Unsigned Integer** | 同 |
+| Sampling Rate | **10000** | 同 |
+| Time Display | **ms** | 同 |
 | Auto Scale | true | 同 |
 
-看 dac 列把 Start 改成 `0x00D001` / `0x00C001`，其余不变。
+看 dac 列把 Start 地址 **+1**（冻结 `0x00D001` / 环形 `0x00C001`），其余不变。
+`gCtrlFrozen` 是 3 s 时冻结的快照，要看新一帧就往 `gCtrlFrozenReq` 写 1；
+`gCtrlLog` 是一直写的环形，配 `Continuous Refresh` 才能滚动。
 
 ## 通用换算规则
 
