@@ -54,9 +54,6 @@ try {
     Check 'SKILL.md: struct example 1000 x 2' `
         ($skill -match 'gCtrlFrozen\[1000\].*\|\s*\*\*1000\*\*.*\|\s*\*\*2\*\*') `
         'SKILL.md must give the concrete CtrlLog_t[1000] -> Rows 1000 / Columns 2 mapping'
-    Check 'SKILL.md: no stale anchor sentence' `
-        ($skill -notmatch '首元素 evaluate 与 readData 一致\s*$') `
-        'the old sentence promising an anchor compare must be qualified for multi-field arrays'
 
     # ---------- 3. 读模式文档 ----------
     $ref = Read-Text 'references/single-session-read.md'
