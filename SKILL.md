@@ -91,8 +91,21 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 
 | 点数 | 入口 | 用途 | 时长（10 kHz 控制）|
 |---|---|---|---|
-| **200** | `ti_c2000_read_continuous.ps1 -FrozenBufferReady -ArrayName <小数组> -Rows 200` | **快速验证**：参数是否收敛、运行变量是否在预期范围 | **20 ms = 1 个工频周期**（改完参数立刻能验）|
-| **1000~5000** | 同上，`-Rows <点数>` | **取波形**：周期、相位、频率、THD、看瞬态 | 100~500 ms = 5~25 个周期（不超单个 RAMGS 块）|
+| **200** | `ti_c2000_read_continuous.ps1 -FrozenBufferReady -ArrayName <数组> -Rows 200 -Columns <字段数>` | **快速验证**：参数是否收敛、运行变量是否在预期范围 | **20 ms = 1 个工频周期**（改完参数立刻能验）|
+| **1000~5000** | 同上，`-Rows <元素数> -Columns <字段数>` | **取波形**：周期、相位、频率、THD、看瞬态 | 100~500 ms = 5~25 个周期（不超单个 RAMGS 块）|
+
+**`-Rows` 是元素个数，`-Columns` 是每个元素的字段数**（实际读取字数 = `Rows × Columns`）：
+
+| 固件里的数组 | `-Rows` | `-Columns` |
+|---|---|---|
+| `Uint16 BuffA[5000]` | 5000 | 1（可省略）|
+| `CtrlLog_t { Uint16 ia; Uint16 dac; } gCtrlFrozen[1000]` | **1000**（不是 2000）| **2** |
+
+结构体数组必须传 `-Columns 2`：此时 anchor 无法 evaluate 结构体，脚本打
+`CHECK anchor : SKIPPED (multi-field element)`，**count 是结构判据、不算失败**，
+CSV 输出 `index,c1,c2`（每行一个元素，`c1=ia`、`c2=dac`，不用自己按奇偶拆）。
+传 `-Columns 1`（默认）会退回单列严格路径 → `anchor ... could not be evaluated` → `DATA_UNRELIABLE`，
+数据其实完整，是参数语义用错了。
 
 **机制始终是「ISR 采满 → 置冻结标志 → ISR 停止写入 → JTAG 读静态数组」，只差点数。**
 JTAG 在 DMA/ISR 持续覆写内存的同时直读，实测会读到接缝甚至掉链路（见
@@ -122,9 +135,14 @@ ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,gAmpFb,gCtrlLogFr
 #       正例：-Variables gAmpFb -ValueMin 1000 -ValueMax 2200 → RANGE: OK
 
 # 第 2 步：取数（只有冻结数组可信）
-ti_c2000_read_continuous.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName <数组> -Rows <点数> -Mode ReadOnly
+ti_c2000_read_continuous.ps1 -ProjectPath <工程> -FrozenBufferReady `
+  -ArrayName <数组> -Rows <元素数> -Columns <字段数> -Mode ReadOnly
 #   数组读要过四级判据的第 3 级：完成标志等于指定值（默认 1）、
 #   复制前后标志及序号不变、返回点数 = Rows×Columns、首元素 evaluate 与 readData 一致
+#   ⚠ 结构体数组（CtrlLog_t{Uint16 ia; Uint16 dac;} a[1000]）：Rows=1000（元素数）、Columns=2（字段数）。
+#     此时 anchor 无法 evaluate 结构体，输出 "CHECK anchor : SKIPPED (multi-field element)"，
+#     count 是结构判据，不算失败；CSV 为 index,c1..cN，每行一个元素。
+#     传默认 Columns=1 会退回严格路径，报 "could not be evaluated" → DATA_UNRELIABLE（数据其实完整）。
 ```
 
 **为什么它是前提而不是可选项**：不先过这一步，第 2 步读到的数字可能来自
@@ -214,7 +232,7 @@ pwsh -NoProfile -File scripts\ti_c2000_service.ps1 -ProjectPath <工程> -Start 
 
 # 3) 只读验活（零下载）
 pwsh -NoProfile -File scripts\ti_c2000_run_read.ps1 -ProjectPath <工程> -Variables gMsTick,usMainLoop -Mode ReadOnly
-pwsh -NoProfile -File scripts\ti_c2000_read_continuous.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName BuffA -Rows 5000 -Mode ReadOnly
+pwsh -NoProfile -File scripts\ti_c2000_read_continuous.ps1 -ProjectPath <工程> -FrozenBufferReady -ArrayName BuffA -Rows 5000 -Columns 1 -Mode ReadOnly
 ```
 
 实测成功记录：**LOAD #103/#104/#105 连续三次 `RESULT: OK`**，`gFwId=65537`，`gMsTick` 跨轮递增，

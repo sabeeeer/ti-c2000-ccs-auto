@@ -60,6 +60,40 @@ JTAG 读静态数组」，**点数按用途选**（10 kHz 控制下）：
 小数组的意义是"够快就能多验几次"：200 点只要 20 ms 就采满，参数一改就能立刻验证；
 大数组是为了一次看清波形形状。
 
+### 结构体数组（多字段）：`-Rows` 是元素数，`-Columns` 是字段数
+
+固件常把一组量打包成结构体数组，例如
+`CtrlLog_t { Uint16 ia; Uint16 dac; } gCtrlFrozen[1000]`，**内存里是 `ia0,dac0,ia1,dac1,…` 交错排布**。
+
+| 参数 | 填什么 | 该例 |
+|---|---|---|
+| `-Rows` | **元素个数**（不是总字数）| `1000` |
+| `-Columns` | **每个元素的字段数** | `2` |
+| 实际读取字数 | `Rows × Columns` | `2000` |
+
+```powershell
+pwsh -NoProfile -File <skill>\scripts\ti_c2000_read_continuous.ps1 -ProjectPath <工程> `
+  -FrozenBufferReady -FrozenFlag gCtrlFrozenReady `
+  -ArrayName gCtrlFrozen -Rows 1000 -Columns 2 -Mode ReadOnly
+```
+
+正确输出（2026-11-19 实测）：
+
+```
+LAYOUT  : 1000 rows x 2 columns -> index,c1..c2 (each row is one element of the struct)
+CHECK anchor : SKIPPED - gCtrlFrozen[0] is a multi-field element (columns=2); count is the structural check here
+CHECK count  : OK (1000 rows x 2 cols = 2000, got 2000)
+CHECK frozen : OK (gCtrlFrozenReady = 1)
+RESULT: OK
+```
+
+CSV 是 `index,c1,c2`，**每行一个元素**（`c1=ia`、`c2=dac`），不需要再按奇偶拆列。
+
+> **最常见的误用**：按字数写 `-Rows 2000` 且不传 `-Columns`（默认 1）。这样走单列严格路径：
+> `CHECK anchor : FAILED - gCtrlFrozen[0] could not be evaluated` → `FAILURE: DATA_UNRELIABLE`。
+> **数据是完整的**，只是参数语义用错。判别：输出里有没有 `LAYOUT` 行、anchor 是 `SKIPPED` 还是 `FAILED`。
+> 修复见 commit `1491c4f`（2026-11-18）：`Columns>1` 时 anchor 降级为跳过，`count` 承担结构判据。
+
 DMA 双缓冲、ping-pong、bank 选择那一套已于 2026-11-18 从本 skill 移除——它要求 JTAG 在 DMA 持续覆写内存的同时去读，实测结果是：
 
 ```
