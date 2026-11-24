@@ -74,6 +74,17 @@ X 轴才会按 ms 正确换算；**`Display Data Size` 决定一屏显示多长*
 `gCtrlFrozen` 是 3 s 时冻结的快照，要看新一帧就往 `gCtrlFrozenReq` 写 1；
 `gCtrlLog` 是一直写的环形，配 `Continuous Refresh` 才能滚动。
 
+### 实时滚动 vs 冻结快照（2026-11-24 补）
+
+| 用途 | 源数组行为 | Graph 设置 |
+|---|---|---|
+| **实时看波形** | **环形**：写满回卷、不置 Full、不停写 | **Continuous Refresh** |
+| 一次性快照 / 故障捕获 | 采满置 Full 后停写 | 单次 Refresh / 冻结后读 |
+
+**关键**：`Continuous Refresh` 只重复读同一段内存，冻结数组不会自己更新；
+要实时必须改固件为环形缓冲（或用乒乓双缓冲 + 发布标志）。
+不要为了“实时”去反复清 `Full`/重启数组，那会在 Graph 上看到清空瞬间的零值。
+
 ## 通用换算规则
 
 | 数组形态 | Index Increment | Acquisition Buffer Size |
