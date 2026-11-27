@@ -6,7 +6,7 @@
 
 | 操作 | 行为 |
 |---|---|
-| `ti_c2000_service.ps1 -Start -ConfirmLoad [-Build]` | 用户同意后选择精确 `.out`、连接、验证连接、复位或有效链路上 halt 兜底、加载、运行，DSS 常驻。 |
+| `ti_c2000_service.ps1 -Start -ConfirmLoad [-Build]` | 用户同意后选择精确 `.out`、连接、验证连接、复位或有效链路上 halt 兜底、加载、运行，DSS 常驻。在反重力（Antigravity）等会回收非守护终端子进程的环境下，需以守护命令（`IsDaemon: true`）启动并 `Wait-Process` 守住返回的 `SERVICE : RUNNING (pid ...)`，避免后续 `ReadOnly` 触发 `NO_SESSION`。 |
 | `ti_c2000_run_read.ps1 -Mode ReadOnly` | 读慢变量；不编译、不下载、不连接、不 halt。 |
 | `ti_c2000_read_continuous.ps1 -Mode ReadOnly -FrozenBufferReady` | 读固件冻结的**连续录波数组**——这是本 skill 唯一的数组读法，见下文「连续录波」。（点数按用途选：200 点约 20 ms，用于快速验证参数；1000~5000 点用于看波形。）DMA 双缓冲与 bank 选择已于 2026-11-18 移除。 |
 | 两个读入口的 `-Mode LoadRead -ConfirmLoad` | 必要时停止旧会话，调用常驻服务加载一次，再经相同 ReadOnly 判据读取；读完保留服务。`-Standalone` 仅是此路径的旧别名。 |
