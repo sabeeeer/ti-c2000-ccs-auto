@@ -59,12 +59,26 @@ $notes = New-Object System.Collections.Generic.List[string]
 $chgLog = Join-Path $root 'BUILD_VERIFICATION.txt'
 if (-not (Test-Path -LiteralPath $chgLog)) {
     $head = @(
-        '工程改动留痕（BUILD_VERIFICATION.txt）',
+        '# 工程记录与改动留痕（BUILD_VERIFICATION.txt）',
         '',
-        '规则（工程 AGENTS.md 硬性规则⑤）：每次改代码 / 配置 / 构建参数 / skill 相关设置，',
-        '追加一条：日期 | 改了什么 | 为什么 | 编译或上板结果。只追加，不覆盖。',
+        ('> 首次创建：{0}，由 check_project_entry.ps1 生成' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+        '> 规则：第一部分记录系统配置（首次接入时填写，配置变更时同步更新）；第二部分每次修改程序/配置/构建参数时在末尾追加一条（只追加不覆盖）。',
         '',
-        ('首次创建：{0}，由 check_project_entry.ps1 生成' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+        '# 第一部分 · 系统配置说明',
+        '',
+        '- 目标器件 / 核：<待填写，如 TMS320F28335 / C28xx>',
+        '- 探针与 ccxml：<待填写，如 XDS100v2 / targetConfigs/TMS320F28335.ccxml>',
+        '- 编译器与构建配置：<待填写，如 ti-cgt-c2000_15.12.1.LTS / Debug>',
+        '- 系统时钟 / 载波 / 采样频率：<待填写，如 150 MHz / 10 kHz / 10 kHz>',
+        '- 关键外设与引脚分配：<待填写，如 EPWM1~3 / ADCINA0~A5 / GPIO52~55>',
+        '- 核心模块与运行模式：<待填写，如 开环/闭环、主要模块清单>',
+        '',
+        '---',
+        '',
+        '# 第二部分 · 改动留痕',
+        '',
+        '格式：日期 | 改了什么 | 为什么 | 验证结果（编译/上板/未上板）。只追加，不覆盖。',
+        '（build.ps1 / service.ps1 成功时会自动追加 build / load 记录。）',
         '--------------------------------------------------------------------------------'
     ) -join "`r`n"
     try {

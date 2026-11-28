@@ -751,7 +751,30 @@ if ($ok) {
     try {
         $chgLog = Join-Path $ProjectPath 'BUILD_VERIFICATION.txt'
         if (-not (Test-Path -LiteralPath $chgLog)) {
-            [IO.File]::WriteAllText($chgLog, ("工程改动留痕（BUILD_VERIFICATION.txt）`r`n`r`n只追加，不覆盖。`r`n--------------------------------------------------------------------------------`r`n"), (New-Object Text.UTF8Encoding($false)))
+            $initHead = @(
+                '# 工程记录与改动留痕（BUILD_VERIFICATION.txt）',
+                '',
+                ('> 首次创建：{0}，由 ti_c2000_build.ps1 生成' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
+                '> 规则：第一部分记录系统配置（首次接入时填写，配置变更时同步更新）；第二部分每次修改程序/配置/构建参数时在末尾追加一条（只追加不覆盖）。',
+                '',
+                '# 第一部分 · 系统配置说明',
+                '',
+                '- 目标器件 / 核：<待填写>',
+                '- 探针与 ccxml：<待填写>',
+                '- 编译器与构建配置：<待填写>',
+                '- 系统时钟 / 载波 / 采样频率：<待填写>',
+                '- 关键外设与引脚分配：<待填写>',
+                '- 核心模块与运行模式：<待填写>',
+                '',
+                '---',
+                '',
+                '# 第二部分 · 改动留痕',
+                '',
+                '格式：日期 | 改了什么 | 为什么 | 验证结果（编译/上板/未上板）。只追加，不覆盖。',
+                '（build.ps1 / service.ps1 成功时会自动追加 build / load 记录。）',
+                '--------------------------------------------------------------------------------'
+            ) -join "`r`n"
+            [IO.File]::WriteAllText($chgLog, $initHead + "`r`n", (New-Object Text.UTF8Encoding($false)))
         }
         $oe = Join-Path $OutputDir "$projName.out"
         $oLen = if (Test-Path -LiteralPath $oe) { (Get-Item -LiteralPath $oe).Length } else { 0 }

@@ -14,6 +14,10 @@ try {
     if ($contents.Count -ne 3 -or @($contents | Sort-Object -Unique).Count -ne 1) { throw 'AI entry files differ' }
     $c = @(& pwsh -NoProfile -File $check -ProjectPath $fixture 2>&1)
     if ($LASTEXITCODE -ne 0 -or ($c -join "`n") -notmatch 'RESULT: OK') { throw "entry audit failed: $($c -join '; ')" }
+    $bvPath = Join-Path $fixture 'BUILD_VERIFICATION.txt'
+    if (-not (Test-Path -LiteralPath $bvPath)) { throw 'BUILD_VERIFICATION.txt was not created' }
+    $bvText = [IO.File]::ReadAllText($bvPath)
+    if ($bvText -notmatch '第一部分 · 系统配置说明' -or $bvText -notmatch '第二部分 · 改动留痕') { throw 'BUILD_VERIFICATION.txt missing two-part template sections' }
     $e = @(& pwsh -NoProfile -File $err -Code RESET_FAILED 2>&1)
     if ($LASTEXITCODE -ne 0 -or ($e -join "`n") -notmatch 'RESULT: OK' -or ($e -join "`n") -notmatch 'halt') { throw "error lookup failed: $($e -join '; ')" }
     foreach ($pair in @(@('COMPILER_VERSION_MISSING','validation'),@('NO_PROBE','download_probe'),@('FRAME_CHANGED','data_verdict'))) {

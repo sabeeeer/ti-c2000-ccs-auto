@@ -109,21 +109,26 @@ CodeBuddy 源目录 `~/.codebuddy/skills/ti-c2000-ccs-auto` 是唯一维护源�
 
 | 缺失项 | 自动动作 | 输出里能看到 |
 |---|---|---|
-| `BUILD_VERIFICATION.txt` | 创建（带表头，只追加不覆盖）| `CHECK : created BUILD_VERIFICATION.txt` |
+| `BUILD_VERIFICATION.txt` | 创建（两段式模板：系统配置说明 + 改动留痕，只追加不覆盖）| `CHECK : created BUILD_VERIFICATION.txt` |
 | `AGENTS.md` / `CODEBUDDY.md` / `CLAUDE.md` | 调 `tools\init_project_entry.ps1` 生成三份**内容一致**的入口文档 | `CHECK : init: CREATED : ...\AGENTS.md` |
 | 三份已存在但内容不同 | **不自动覆盖**（可能有人手写了规则）→ 报 VIOLATION 让人合并 | `VIOLATION: ... differ` |
 
 > `init_project_entry.ps1` 要求目录里有 `.cproject`；没有就 `USAGE: NO_PROJECT`（不是工程，不生成入口文档）。
 
-**且 `build.ps1` / `service.ps1` 成功后会各追加一条**（输出里出现 `chglog :` / `CHGLOG  :`）：
+**`BUILD_VERIFICATION.txt` 是工程统一记录文件（不只是编译/下载日志），固定分两部分**：
 
-```
-2026-11-18 20:35:01 | build | config CPU1_RAM, compile OK, link OK, 0 warning(s), 25 source(s) | out 592,642 B, entry=code_start
-2026-11-18 20:35:33 | load  | LOAD #139 OK, SingleStep | out 592,642 B sha 625DD203DC0A
-```
+1. **第一部分 · 系统配置说明**：首次接入工程时填写并随系统配置变更同步更新——包括目标器件/核、探针与 `.ccxml`、编译器与构建配置、系统时钟/载波/采样频率、关键外设与引脚分配、核心模块与运行模式。
+2. **第二部分 · 改动留痕**：**每次更改程序代码、配置或构建参数时**，AI 须在文件末尾追加一条简明记录，说明改了什么、为什么改及验证结果（只追加，不覆盖）：
+   ```text
+   日期 | 改了什么 | 为什么 | 验证结果（编译/上板/未上板）
+   ```
+   同时，`build.ps1` / `service.ps1` 成功后仍会自动追加一条 `build` / `load` 记录（输出里出现 `chglog :` / `CHGLOG  :`）：
+   ```text
+   2026-11-18 20:35:01 | build | config CPU1_RAM, compile OK, link OK, 0 warning(s), 25 source(s) | out 592,642 B, entry=code_start
+   2026-11-18 20:35:33 | load  | LOAD #139 OK, SingleStep | out 592,642 B sha 625DD203DC0A
+   ```
 
-**工程改动留痕不再依赖 AI 自觉**——2026-11-18 实测过：同一工程两个会话，一个写了 5 条、另一个 0 条。
-
+> 该规范为可见协作约定，**不新增阻断下载或编译的硬门禁**（遵守硬约束 ③）。
 > **留痕文件位置**：写在 `-ProjectPath` 所指目录下的 `BUILD_VERIFICATION.txt`。
 > 若工程有父目录（例如 `1-1DMA_Ping-Pong\F28379D_CPU1_Template`），父目录可能另有一份历史记录，
 > **以 `-ProjectPath` 下的为准**；要合并就人工合并，脚本不跨目录写。

@@ -18,6 +18,7 @@ This project uses `ti-c2000-ccs-auto`. Before changing code or reading target da
 4. For data reads, use `-Mode ReadOnly`: zero builds, zero loads, retained live DSS session. Report the probe, connection, source image, RAM/Flash location (or UNKNOWN), firmware identity, application heartbeat and cumulative download count. Deliver any values actually read with a same-run `OK/FAIL` data verdict; location alone never blocks a read or download.
 5. A download requires the user's explicit approval and `-ConfirmLoad`. Read data while the program runs; do not halt/reset/reconnect merely to read. Continuous runs require explicit user request, at least 5 seconds between load attempts and at least 400 ms between reads.
 6. On an error, first use the skill's offline `scripts\ti_c2000_error.ps1 -Code <code>` and inspect `references\error-index.json` before retrying.
+7. Maintain `BUILD_VERIFICATION.txt` in the project root: fill in Part 1 (system configuration: device/core, probe, compiler, clocks/carrier/sampling rate, peripherals/pins, active modules) when first onboarding or when system config changes; on every code/config/build change, append a brief entry to Part 2 (`date | what changed | why | verification result`), append-only without overwriting.
 
 Every skill command must print `SKILL   : ti-c2000-ccs-auto@<version>`; trust success only when exit code is zero and `RESULT: OK` appears.
 '@
